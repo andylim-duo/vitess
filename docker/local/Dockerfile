@@ -8,7 +8,7 @@ RUN apt-get install -y sudo curl vim jq
 
 # Install dependencies
 COPY docker/lite/install_dependencies.sh /vt/dist/install_dependencies.sh
-RUN /vt/dist/install_dependencies.sh mysql57
+RUN /vt/dist/install_dependencies.sh mysql80
 
 COPY docker/local/install_local_dependencies.sh /vt/dist/install_local_dependencies.sh
 RUN /vt/dist/install_local_dependencies.sh
@@ -41,4 +41,4 @@ RUN npm install /web/vtadmin
 RUN mkdir /vt/common
 COPY examples/common /vt/common
 
-CMD cd /vt/local && ./101_initial_cluster.sh && /bin/bash
+CMD cd /vt/local && ./101_init_duo_cluster.sh && /bin/bash

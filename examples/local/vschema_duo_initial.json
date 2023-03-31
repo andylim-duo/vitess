@@ -1,0 +1,9 @@
+{
+    "tables": {
+        "customers": {},
+        "users": {},
+        "users_attributes": {},
+        "users_names": {},
+        "users_status": {}
+    }
+}
