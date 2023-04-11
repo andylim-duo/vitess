@@ -1,0 +1,11 @@
+{
+    "workflow": "customer_reference_replication",
+    "source_keyspace": "duo_unsharded",
+    "target_keyspace": "duo",
+    "table_settings": [{
+        "target_table": "customers",
+        "source_expression": "SELECT * FROM customers",
+        "create_ddl": "copy"
+    }],
+    "cell": "zone1"
+}

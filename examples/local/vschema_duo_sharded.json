@@ -1,0 +1,56 @@
+{
+    "sharded": true,
+
+    "vindexes": {
+        "hash": {
+            "type": "hash"
+        }
+    },
+
+    "tables": {
+        "customers": {
+            "type": "reference",
+            "source": "duo_unsharded.customers"
+        },
+
+        "users": {
+            "column_vindexes": [
+                {
+                    "column": "user_id",
+                    "name": "hash"
+                }
+            ],
+            "auto_increment": {
+                "column": "user_id",
+                "sequence": "duo_unsharded.user_seq"
+            }
+        },
+
+        "users_attributes": {
+            "column_vindexes": [
+                {
+                    "column": "user_id",
+                    "name": "hash"
+                }
+            ]
+        },
+
+        "users_names": {
+            "column_vindexes": [
+                {
+                    "column": "user_id",
+                    "name": "hash"
+                }
+            ]
+        },
+
+        "users_status": {
+            "column_vindexes": [
+                {
+                    "column": "user_id",
+                    "name": "hash"
+                }
+            ]
+        }
+    }
+}
