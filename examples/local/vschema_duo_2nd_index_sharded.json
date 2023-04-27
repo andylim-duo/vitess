@@ -1,0 +1,69 @@
+{
+    "sharded": true,
+
+    "vindexes": {
+        "hash": {
+            "type": "hash"
+        },
+        "user_name_index": {
+            "type": "lookup",
+            "params": {
+              "table": "duo_unsharded.user_name_lookup",
+              "from": "name",
+              "to": "keyspace"
+            },
+            "owner": "users_names"
+        }
+    },
+
+    "tables": {
+        "customers": {
+            "type": "reference",
+            "source": "duo_unsharded.customers"
+        },
+
+        "users": {
+            "column_vindexes": [
+                {
+                    "column": "user_id",
+                    "name": "hash"
+                }
+            ],
+            "auto_increment": {
+                "column": "user_id",
+                "sequence": "duo_unsharded.user_seq"
+            }
+        },
+
+        "users_attributes": {
+            "column_vindexes": [
+                {
+                    "column": "user_id",
+                    "name": "hash"
+                }
+            ]
+        },
+
+        "users_names": {
+            "column_vindexes": [
+                {
+                    "column": "user_id",
+                    "name": "hash"
+                },
+                {
+                    "column": "name",
+                    "name": "user_name_index"
+                }
+            ]
+        },
+
+        "users_status": {
+            "column_vindexes": [
+                {
+                    "column": "user_id",
+                    "name": "hash"
+                }
+            ]
+        }
+    }
+}

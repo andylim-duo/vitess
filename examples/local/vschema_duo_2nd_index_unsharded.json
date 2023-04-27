@@ -1,0 +1,11 @@
+{
+    "sharded": false,
+
+    "tables": {
+        "user_seq": {
+            "type": "sequence"
+        },
+        "customers": {},
+        "user_name_lookup": {}
+    }
+}
