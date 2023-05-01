@@ -1,0 +1,12 @@
+{
+    "sharded": false,
+
+    "tables": {
+        "user_seq": {
+            "type": "sequence"
+        },
+        "cust_seq": {
+            "type": "sequence"
+        }
+    }
+}
