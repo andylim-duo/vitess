@@ -1,0 +1,73 @@
+{
+    "sharded": true,
+
+    "vindexes": {
+        "multicol_vdx": {
+            "type": "multicol",
+            "params": {
+              "column_count": "2",
+              "column_bytes": "3,5",
+              "column_vindex": "hash,hash"
+            }
+        },
+        "cust_vdx": {
+            "type": "hash"
+        }
+    },
+
+    "tables": {
+        "customers": {
+            "column_vindexes": [
+                {
+                    "column": "customer_id",
+                    "name": "cust_vdx"
+                }
+            ],
+
+            "auto_increment": {
+                "column": "customer_id",
+                "sequence": "duo_unsharded.cust_seq"
+            }
+        },
+
+        "users": {
+            "column_vindexes": [
+                {
+                    "columns": ["customer_id", "user_id"],
+                    "name": "multicol_vdx"
+                }
+            ],
+            "auto_increment": {
+                "column": "user_id",
+                "sequence": "duo_unsharded.user_seq"
+            }
+        },
+
+        "users_attributes": {
+            "column_vindexes": [
+                {
+                    "columns": ["customer_id", "user_id"],
+                    "name": "multicol_vdx"
+                }
+            ]
+        },
+
+        "users_names": {
+            "column_vindexes": [
+                {
+                    "columns": ["customer_id", "user_id"],
+                    "name": "multicol_vdx"
+               }
+            ]
+        },
+
+        "users_status": {
+            "column_vindexes": [
+                {
+                    "columns": ["customer_id", "user_id"],
+                    "name": "multicol_vdx"
+                }
+            ]
+        }
+    }
+}
