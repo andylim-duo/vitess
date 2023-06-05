@@ -84,3 +84,17 @@ ALTER TABLE users
 ALTER TABLE users
     ADD COLUMN `last_main_update_was_put` tinyint(1) NOT NULL DEFAULT 1,
     ALGORITHM=INSTANT;
+
+-- Schema 7 Update
+ALTER TABLE users
+    DROP COLUMN `last_main_update_was_put`,
+    ALGORITHM=INSTANT;
+
+-- Schema 8 Update
+CREATE TABLE IF NOT EXISTS `user_graveyard` (
+    `ukey` varchar(20) NOT NULL,
+    `akey` varchar(20) NOT NULL,
+    `deleted_time` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`ukey`),
+    KEY (`deleted_time`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
