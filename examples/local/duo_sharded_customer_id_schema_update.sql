@@ -88,3 +88,8 @@ ALTER TABLE users
 ALTER TABLE users
     ADD COLUMN `last_main_update_was_put` tinyint(1) NOT NULL DEFAULT 1,
     ALGORITHM=INSTANT;
+
+-- Schema 7 Update
+ALTER TABLE users
+    DROP COLUMN `last_main_update_was_put`,
+    ALGORITHM=INSTANT;
