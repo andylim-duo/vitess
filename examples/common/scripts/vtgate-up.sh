@@ -41,6 +41,7 @@ vtgate \
   --pid_file $VTDATAROOT/tmp/vtgate.pid \
   --enable_buffer \
   --mysql_auth_server_impl none \
+  --tracer opentracing-jaeger --jaeger-agent-host jaeger:6831 --tracing-sampling-rate 0.0 \
   > $VTDATAROOT/tmp/vtgate.out 2>&1 &
 
 # Block waiting for vtgate to be listening

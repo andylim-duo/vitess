@@ -33,6 +33,7 @@ vtctld \
  --port $vtctld_web_port \
  --grpc_port $grpc_port \
  --pid_file $VTDATAROOT/tmp/vtctld.pid \
+ --tracer opentracing-jaeger --jaeger-agent-host jaeger:6831 --tracing-sampling-rate 0.0 \
   > $VTDATAROOT/tmp/vtctld.out 2>&1 &
 
 for _ in {0..300}; do
