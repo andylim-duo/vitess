@@ -86,6 +86,12 @@ func (vtgate *VtgateProcess) Setup() (err error) {
 		"--service_map", vtgate.ServiceMap,
 		"--mysql_auth_server_impl", vtgate.MySQLAuthServerImpl,
 	}
+	if v, err := GetMajorVersion("vtgate"); err != nil {
+		return err
+	} else if v >= 18 {
+		args = append(args, "--bind-address", "127.0.0.1")
+		args = append(args, "--grpc_bind_address", "127.0.0.1")
+	}
 	// If no explicit mysql_server_version has been specified then we autodetect
 	// the MySQL version that will be used for the test and base the vtgate's
 	// mysql server version on that.
@@ -124,7 +130,11 @@ func (vtgate *VtgateProcess) Setup() (err error) {
 
 	vtgate.proc.Args = append(vtgate.proc.Args, vtgate.ExtraArgs...)
 
-	errFile, _ := os.Create(path.Join(vtgate.LogDir, "vtgate-stderr.txt"))
+	errFile, err := os.Create(path.Join(vtgate.LogDir, "vtgate-stderr.txt"))
+	if err != nil {
+		log.Errorf("cannot create error log file for vtgate: %v", err)
+		return err
+	}
 	vtgate.proc.Stderr = errFile
 
 	vtgate.proc.Env = append(vtgate.proc.Env, os.Environ()...)

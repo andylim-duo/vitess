@@ -52,6 +52,8 @@ func VisitSQLNode(in SQLNode, f Visit) error {
 		return VisitRefOfAlterView(in, f)
 	case *AlterVschema:
 		return VisitRefOfAlterVschema(in, f)
+	case *Analyze:
+		return VisitRefOfAnalyze(in, f)
 	case *AndExpr:
 		return VisitRefOfAndExpr(in, f)
 	case *AnyValue:
@@ -164,8 +166,6 @@ func VisitSQLNode(in SQLNode, f Visit) error {
 		return VisitRefOfExtractFuncExpr(in, f)
 	case *ExtractValueExpr:
 		return VisitRefOfExtractValueExpr(in, f)
-	case *ExtractedSubquery:
-		return VisitRefOfExtractedSubquery(in, f)
 	case *FirstOrLastValueExpr:
 		return VisitRefOfFirstOrLastValueExpr(in, f)
 	case *Flush:
@@ -360,8 +360,6 @@ func VisitSQLNode(in SQLNode, f Visit) error {
 		return VisitRefOfOrderByOption(in, f)
 	case *OtherAdmin:
 		return VisitRefOfOtherAdmin(in, f)
-	case *OtherRead:
-		return VisitRefOfOtherRead(in, f)
 	case *OverClause:
 		return VisitRefOfOverClause(in, f)
 	case *ParenTableExpr:
@@ -786,6 +784,18 @@ func VisitRefOfAlterVschema(in *AlterVschema, f Visit) error {
 	}
 	return nil
 }
+func VisitRefOfAnalyze(in *Analyze, f Visit) error {
+	if in == nil {
+		return nil
+	}
+	if cont, err := f(in); err != nil || !cont {
+		return err
+	}
+	if err := VisitTableName(in.Table, f); err != nil {
+		return err
+	}
+	return nil
+}
 func VisitRefOfAndExpr(in *AndExpr, f Visit) error {
 	if in == nil {
 		return nil
@@ -1095,12 +1105,6 @@ func VisitRefOfColumnType(in *ColumnType, f Visit) error {
 	if cont, err := f(in); err != nil || !cont {
 		return err
 	}
-	if err := VisitRefOfLiteral(in.Length, f); err != nil {
-		return err
-	}
-	if err := VisitRefOfLiteral(in.Scale, f); err != nil {
-		return err
-	}
 	return nil
 }
 func VisitColumns(in Columns, f Visit) error {
@@ -1206,12 +1210,6 @@ func VisitRefOfConvertType(in *ConvertType, f Visit) error {
 		return nil
 	}
 	if cont, err := f(in); err != nil || !cont {
-		return err
-	}
-	if err := VisitRefOfLiteral(in.Length, f); err != nil {
-		return err
-	}
-	if err := VisitRefOfLiteral(in.Scale, f); err != nil {
 		return err
 	}
 	return nil
@@ -1367,10 +1365,12 @@ func VisitRefOfDelete(in *Delete, f Visit) error {
 	if err := VisitRefOfParsedComments(in.Comments, f); err != nil {
 		return err
 	}
-	if err := VisitTableNames(in.Targets, f); err != nil {
-		return err
+	for _, el := range in.TableExprs {
+		if err := VisitTableExpr(el, f); err != nil {
+			return err
+		}
 	}
-	if err := VisitTableExprs(in.TableExprs, f); err != nil {
+	if err := VisitTableNames(in.Targets, f); err != nil {
 		return err
 	}
 	if err := VisitPartitions(in.Partitions, f); err != nil {
@@ -1568,27 +1568,6 @@ func VisitRefOfExtractValueExpr(in *ExtractValueExpr, f Visit) error {
 	}
 	return nil
 }
-func VisitRefOfExtractedSubquery(in *ExtractedSubquery, f Visit) error {
-	if in == nil {
-		return nil
-	}
-	if cont, err := f(in); err != nil || !cont {
-		return err
-	}
-	if err := VisitExpr(in.Original, f); err != nil {
-		return err
-	}
-	if err := VisitRefOfSubquery(in.Subquery, f); err != nil {
-		return err
-	}
-	if err := VisitExpr(in.OtherSide, f); err != nil {
-		return err
-	}
-	if err := VisitExpr(in.alternative, f); err != nil {
-		return err
-	}
-	return nil
-}
 func VisitRefOfFirstOrLastValueExpr(in *FirstOrLastValueExpr, f Visit) error {
 	if in == nil {
 		return nil
@@ -1695,7 +1674,7 @@ func VisitRefOfFuncExpr(in *FuncExpr, f Visit) error {
 	if err := VisitIdentifierCI(in.Name, f); err != nil {
 		return err
 	}
-	if err := VisitSelectExprs(in.Exprs, f); err != nil {
+	if err := VisitExprs(in.Exprs, f); err != nil {
 		return err
 	}
 	return nil
@@ -2958,15 +2937,6 @@ func VisitRefOfOtherAdmin(in *OtherAdmin, f Visit) error {
 	}
 	return nil
 }
-func VisitRefOfOtherRead(in *OtherRead, f Visit) error {
-	if in == nil {
-		return nil
-	}
-	if cont, err := f(in); err != nil || !cont {
-		return err
-	}
-	return nil
-}
 func VisitRefOfOverClause(in *OverClause, f Visit) error {
 	if in == nil {
 		return nil
@@ -3466,6 +3436,9 @@ func VisitRefOfSelect(in *Select, f Visit) error {
 	if cont, err := f(in); err != nil || !cont {
 		return err
 	}
+	if err := VisitRefOfWith(in.With, f); err != nil {
+		return err
+	}
 	for _, el := range in.From {
 		if err := VisitTableExpr(el, f); err != nil {
 			return err
@@ -3478,9 +3451,6 @@ func VisitRefOfSelect(in *Select, f Visit) error {
 		return err
 	}
 	if err := VisitRefOfWhere(in.Where, f); err != nil {
-		return err
-	}
-	if err := VisitRefOfWith(in.With, f); err != nil {
 		return err
 	}
 	if err := VisitGroupBy(in.GroupBy, f); err != nil {
@@ -3992,6 +3962,9 @@ func VisitRefOfUnion(in *Union, f Visit) error {
 	if cont, err := f(in); err != nil || !cont {
 		return err
 	}
+	if err := VisitRefOfWith(in.With, f); err != nil {
+		return err
+	}
 	if err := VisitSelectStatement(in.Left, f); err != nil {
 		return err
 	}
@@ -3999,9 +3972,6 @@ func VisitRefOfUnion(in *Union, f Visit) error {
 		return err
 	}
 	if err := VisitOrderBy(in.OrderBy, f); err != nil {
-		return err
-	}
-	if err := VisitRefOfWith(in.With, f); err != nil {
 		return err
 	}
 	if err := VisitRefOfLimit(in.Limit, f); err != nil {
@@ -4034,8 +4004,10 @@ func VisitRefOfUpdate(in *Update, f Visit) error {
 	if err := VisitRefOfParsedComments(in.Comments, f); err != nil {
 		return err
 	}
-	if err := VisitTableExprs(in.TableExprs, f); err != nil {
-		return err
+	for _, el := range in.TableExprs {
+		if err := VisitTableExpr(el, f); err != nil {
+			return err
+		}
 	}
 	if err := VisitUpdateExprs(in.Exprs, f); err != nil {
 		return err
@@ -4374,7 +4346,7 @@ func VisitRefOfWith(in *With, f Visit) error {
 	if cont, err := f(in); err != nil || !cont {
 		return err
 	}
-	for _, el := range in.ctes {
+	for _, el := range in.CTEs {
 		if err := VisitRefOfCommonTableExpr(el, f); err != nil {
 			return err
 		}
@@ -4807,8 +4779,6 @@ func VisitExpr(in Expr, f Visit) error {
 		return VisitRefOfExtractFuncExpr(in, f)
 	case *ExtractValueExpr:
 		return VisitRefOfExtractValueExpr(in, f)
-	case *ExtractedSubquery:
-		return VisitRefOfExtractedSubquery(in, f)
 	case *FirstOrLastValueExpr:
 		return VisitRefOfFirstOrLastValueExpr(in, f)
 	case *FuncExpr:
@@ -5081,6 +5051,8 @@ func VisitStatement(in Statement, f Visit) error {
 		return VisitRefOfAlterView(in, f)
 	case *AlterVschema:
 		return VisitRefOfAlterVschema(in, f)
+	case *Analyze:
+		return VisitRefOfAnalyze(in, f)
 	case *Begin:
 		return VisitRefOfBegin(in, f)
 	case *CallProc:
@@ -5123,8 +5095,6 @@ func VisitStatement(in Statement, f Visit) error {
 		return VisitRefOfLockTables(in, f)
 	case *OtherAdmin:
 		return VisitRefOfOtherAdmin(in, f)
-	case *OtherRead:
-		return VisitRefOfOtherRead(in, f)
 	case *PrepareStmt:
 		return VisitRefOfPrepareStmt(in, f)
 	case *PurgeBinaryLogs:

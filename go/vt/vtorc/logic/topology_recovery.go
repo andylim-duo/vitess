@@ -35,7 +35,6 @@ import (
 	"vitess.io/vitess/go/vt/vtorc/config"
 	"vitess.io/vitess/go/vt/vtorc/inst"
 	"vitess.io/vitess/go/vt/vtorc/util"
-	"vitess.io/vitess/go/vt/vttablet/tmclient"
 )
 
 type RecoveryType string
@@ -62,6 +61,17 @@ var (
 	}
 
 	countPendingRecoveries = stats.NewGauge("PendingRecoveries", "Count of the number of pending recoveries")
+
+	// detectedProblems is used to track the number of detected problems.
+	//
+	// When an issue is active it will be set to 1, when it is no longer active
+	// it will be reset back to 0.
+	detectedProblems = stats.NewGaugesWithMultiLabels("DetectedProblems", "Count of the different detected problems", []string{
+		"Analysis",
+		"TabletAlias",
+		"Keyspace",
+		"Shard",
+	})
 
 	// recoveriesCounter counts the number of recoveries that VTOrc has performed
 	recoveriesCounter = stats.NewCountersWithSingleLabel("RecoveriesCount", "Count of the different recoveries performed", "RecoveryType", actionableRecoveriesNames...)
@@ -199,12 +209,15 @@ func recoverPrimaryHasPrimary(ctx context.Context, analysisEntry *inst.Replicati
 		_ = resolveRecovery(topologyRecovery, nil)
 	}()
 
-	// Reset replication on current primary.
-	err = inst.ResetReplicationParameters(analysisEntry.AnalyzedInstanceAlias)
+	// Read the tablet information from the database to find the shard and keyspace of the tablet
+	analyzedTablet, err := inst.ReadTablet(analysisEntry.AnalyzedInstanceAlias)
 	if err != nil {
-		return false, topologyRecovery, err
+		return false, nil, err
 	}
-	return true, topologyRecovery, nil
+
+	// Reset replication on current primary.
+	err = resetReplicationParameters(ctx, analyzedTablet)
+	return true, topologyRecovery, err
 }
 
 // runEmergencyReparentOp runs a recovery for which we have to run ERS. Here waitForAllTablets is a boolean telling ERS whether it should wait for all the tablets
@@ -233,7 +246,7 @@ func runEmergencyReparentOp(ctx context.Context, analysisEntry *inst.Replication
 		_ = resolveRecovery(topologyRecovery, promotedReplica)
 	}()
 
-	ev, err := reparentutil.NewEmergencyReparenter(ts, tmclient.NewTabletManagerClient(), logutil.NewCallbackLogger(func(event *logutilpb.Event) {
+	ev, err := reparentutil.NewEmergencyReparenter(ts, tmc, logutil.NewCallbackLogger(func(event *logutilpb.Event) {
 		level := event.GetLevel()
 		value := event.GetValue()
 		// we only log the warnings and errors explicitly, everything gets logged as an information message anyways in auditing topology recovery
@@ -573,7 +586,7 @@ func runEmergentOperations(analysisEntry *inst.ReplicationAnalysis) {
 }
 
 // executeCheckAndRecoverFunction will choose the correct check & recovery function based on analysis.
-// It executes the function synchronuously
+// It executes the function synchronously
 func executeCheckAndRecoverFunction(analysisEntry *inst.ReplicationAnalysis) (err error) {
 	countPendingRecoveries.Add(1)
 	defer countPendingRecoveries.Add(-1)
@@ -755,17 +768,42 @@ func CheckAndRecover() {
 		log.Error(err)
 		return
 	}
+
+	// Regardless of if the problem is solved or not we want to monitor active
+	// issues, we use a map of labels and set a counter to `1` for each problem
+	// then we reset any counter that is not present in the current analysis.
+	active := make(map[string]struct{})
+	for _, e := range replicationAnalysis {
+		if e.Analysis != inst.NoProblem {
+			names := [...]string{
+				string(e.Analysis),
+				e.AnalyzedInstanceAlias,
+				e.AnalyzedKeyspace,
+				e.AnalyzedShard,
+			}
+
+			key := detectedProblems.GetLabelName(names[:]...)
+			active[key] = struct{}{}
+			detectedProblems.Set(names[:], 1)
+		}
+	}
+
+	// Reset any non-active problems.
+	for key := range detectedProblems.Counts() {
+		if _, ok := active[key]; !ok {
+			detectedProblems.ResetKey(key)
+		}
+	}
+
 	// intentionally iterating entries in random order
 	for _, j := range rand.Perm(len(replicationAnalysis)) {
 		analysisEntry := replicationAnalysis[j]
 
 		go func() {
-			err = executeCheckAndRecoverFunction(analysisEntry)
-			if err != nil {
+			if err := executeCheckAndRecoverFunction(analysisEntry); err != nil {
 				log.Error(err)
 			}
 		}()
-
 	}
 }
 
@@ -800,7 +838,7 @@ func electNewPrimary(ctx context.Context, analysisEntry *inst.ReplicationAnalysi
 	}
 	_ = AuditTopologyRecovery(topologyRecovery, "starting PlannedReparentShard for electing new primary.")
 
-	ev, err := reparentutil.NewPlannedReparenter(ts, tmclient.NewTabletManagerClient(), logutil.NewCallbackLogger(func(event *logutilpb.Event) {
+	ev, err := reparentutil.NewPlannedReparenter(ts, tmc, logutil.NewCallbackLogger(func(event *logutilpb.Event) {
 		level := event.GetLevel()
 		value := event.GetValue()
 		// we only log the warnings and errors explicitly, everything gets logged as an information message anyways in auditing topology recovery
@@ -816,6 +854,7 @@ func electNewPrimary(ctx context.Context, analysisEntry *inst.ReplicationAnalysi
 		analyzedTablet.Shard,
 		reparentutil.PlannedReparentOptions{
 			WaitReplicasTimeout: time.Duration(config.Config.WaitReplicasTimeoutSeconds) * time.Second,
+			TolerableReplLag:    time.Duration(config.Config.TolerableReplicationLagSeconds) * time.Second,
 		},
 	)
 

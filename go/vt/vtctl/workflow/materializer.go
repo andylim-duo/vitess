@@ -29,9 +29,11 @@ import (
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
+	"vitess.io/vitess/go/vt/schemadiff"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/vtctl/schematools"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
 	"vitess.io/vitess/go/vt/vttablet/tabletmanager/vreplication"
@@ -61,6 +63,9 @@ type materializer struct {
 	targetShards          []*topo.ShardInfo
 	isPartial             bool
 	primaryVindexesDiffer bool
+	workflowType          binlogdatapb.VReplicationWorkflowType
+
+	env *vtenv.Environment
 }
 
 func (mz *materializer) getWorkflowSubType() (binlogdatapb.VReplicationWorkflowSubType, error) {
@@ -77,7 +82,7 @@ func (mz *materializer) getWorkflowSubType() (binlogdatapb.VReplicationWorkflowS
 	}
 }
 
-func (mz *materializer) prepareMaterializerStreams(req *vtctldatapb.MoveTablesCreateRequest) error {
+func (mz *materializer) createMoveTablesStreams(req *vtctldatapb.MoveTablesCreateRequest) error {
 	if err := validateNewWorkflow(mz.ctx, mz.ts, mz.tmc, mz.ms.TargetKeyspace, mz.ms.Workflow); err != nil {
 		return err
 	}
@@ -102,7 +107,17 @@ func (mz *materializer) prepareMaterializerStreams(req *vtctldatapb.MoveTablesCr
 		}
 
 		sourceShards := mz.filterSourceShards(target)
-		blses, err := mz.generateBinlogSources(mz.ctx, target, sourceShards)
+		// streamKeyRangesEqual allows us to optimize the stream for the cases
+		// where while the target keyspace may be sharded, the target shard has
+		// a single source shard to stream data from and the target and source
+		// shard have equal key ranges. This can be done, for example, when doing
+		// shard by shard migrations -- migrating a single shard at a time between
+		// sharded source and sharded target keyspaces.
+		streamKeyRangesEqual := false
+		if len(sourceShards) == 1 && key.KeyRangeEqual(sourceShards[0].KeyRange, target.KeyRange) {
+			streamKeyRangesEqual = true
+		}
+		blses, err := mz.generateBinlogSources(mz.ctx, target, sourceShards, streamKeyRangesEqual)
 		if err != nil {
 			return err
 		}
@@ -112,7 +127,7 @@ func (mz *materializer) prepareMaterializerStreams(req *vtctldatapb.MoveTablesCr
 			Cells:                     req.Cells,
 			TabletTypes:               req.TabletTypes,
 			TabletSelectionPreference: req.TabletSelectionPreference,
-			WorkflowType:              binlogdatapb.VReplicationWorkflowType_MoveTables,
+			WorkflowType:              mz.workflowType,
 			WorkflowSubType:           workflowSubType,
 			DeferSecondaryKeys:        req.DeferSecondaryKeys,
 			AutoStart:                 req.AutoStart,
@@ -122,6 +137,8 @@ func (mz *materializer) prepareMaterializerStreams(req *vtctldatapb.MoveTablesCr
 	})
 }
 
+// createMaterializerStreams creates the vreplication streams for Materialize
+// and LookupVindex workflows.
 func (mz *materializer) createMaterializerStreams() error {
 	if err := validateNewWorkflow(mz.ctx, mz.ts, mz.tmc, mz.ms.TargetKeyspace, mz.ms.Workflow); err != nil {
 		return err
@@ -130,18 +147,23 @@ func (mz *materializer) createMaterializerStreams() error {
 	if err != nil {
 		return err
 	}
-	if mz.isPartial {
-		if err := createDefaultShardRoutingRules(mz.ctx, mz.ms, mz.ts); err != nil {
-			return err
-		}
-	}
 	if err := mz.deploySchema(); err != nil {
 		return err
 	}
 	insertMap := make(map[string]string, len(mz.targetShards))
 	for _, targetShard := range mz.targetShards {
 		sourceShards := mz.filterSourceShards(targetShard)
-		inserts, err := mz.generateInserts(mz.ctx, sourceShards)
+		// streamKeyRangesEqual allows us to optimize the stream for the cases
+		// where while the target keyspace may be sharded, the target shard has
+		// a single source shard to stream data from and the target and source
+		// shard have equal key ranges. This can be done, for example, when doing
+		// shard by shard migrations -- migrating a single shard at a time between
+		// sharded source and sharded target keyspaces.
+		streamKeyRangesEqual := false
+		if len(sourceShards) == 1 && key.KeyRangeEqual(sourceShards[0].KeyRange, targetShard.KeyRange) {
+			streamKeyRangesEqual = true
+		}
+		inserts, err := mz.generateInserts(mz.ctx, sourceShards, streamKeyRangesEqual)
 		if err != nil {
 			return err
 		}
@@ -153,7 +175,7 @@ func (mz *materializer) createMaterializerStreams() error {
 	return nil
 }
 
-func (mz *materializer) generateInserts(ctx context.Context, sourceShards []*topo.ShardInfo) (string, error) {
+func (mz *materializer) generateInserts(ctx context.Context, sourceShards []*topo.ShardInfo, keyRangesEqual bool) (string, error) {
 	ig := vreplication.NewInsertGenerator(binlogdatapb.VReplicationWorkflowState_Stopped, "{{.dbname}}")
 
 	for _, sourceShard := range sourceShards {
@@ -178,7 +200,7 @@ func (mz *materializer) generateInserts(ctx context.Context, sourceShards []*top
 			}
 
 			// Validate non-empty query.
-			stmt, err := sqlparser.Parse(ts.SourceExpression)
+			stmt, err := mz.env.Parser().Parse(ts.SourceExpression)
 			if err != nil {
 				return "", err
 			}
@@ -187,7 +209,7 @@ func (mz *materializer) generateInserts(ctx context.Context, sourceShards []*top
 				return "", fmt.Errorf("unrecognized statement: %s", ts.SourceExpression)
 			}
 			filter := ts.SourceExpression
-			if mz.targetVSchema.Keyspace.Sharded && mz.targetVSchema.Tables[ts.TargetTable].Type != vindexes.TypeReference {
+			if !keyRangesEqual && mz.targetVSchema.Keyspace.Sharded && mz.targetVSchema.Tables[ts.TargetTable].Type != vindexes.TypeReference {
 				cv, err := vindexes.FindBestColVindex(mz.targetVSchema.Tables[ts.TargetTable])
 				if err != nil {
 					return "", err
@@ -200,13 +222,13 @@ func (mz *materializer) generateInserts(ctx context.Context, sourceShards []*top
 					}
 					mappedCols = append(mappedCols, colName)
 				}
-				subExprs := make(sqlparser.SelectExprs, 0, len(mappedCols)+2)
+				subExprs := make(sqlparser.Exprs, 0, len(mappedCols)+2)
 				for _, mappedCol := range mappedCols {
-					subExprs = append(subExprs, &sqlparser.AliasedExpr{Expr: mappedCol})
+					subExprs = append(subExprs, mappedCol)
 				}
 				vindexName := fmt.Sprintf("%s.%s", mz.ms.TargetKeyspace, cv.Name)
-				subExprs = append(subExprs, &sqlparser.AliasedExpr{Expr: sqlparser.NewStrLiteral(vindexName)})
-				subExprs = append(subExprs, &sqlparser.AliasedExpr{Expr: sqlparser.NewStrLiteral("{{.keyrange}}")})
+				subExprs = append(subExprs, sqlparser.NewStrLiteral(vindexName))
+				subExprs = append(subExprs, sqlparser.NewStrLiteral("{{.keyrange}}"))
 				inKeyRange := &sqlparser.FuncExpr{
 					Name:  sqlparser.NewIdentifierCI("in_keyrange"),
 					Exprs: subExprs,
@@ -253,7 +275,7 @@ func (mz *materializer) generateInserts(ctx context.Context, sourceShards []*top
 	return ig.String(), nil
 }
 
-func (mz *materializer) generateBinlogSources(ctx context.Context, targetShard *topo.ShardInfo, sourceShards []*topo.ShardInfo) ([]*binlogdatapb.BinlogSource, error) {
+func (mz *materializer) generateBinlogSources(ctx context.Context, targetShard *topo.ShardInfo, sourceShards []*topo.ShardInfo, keyRangesEqual bool) ([]*binlogdatapb.BinlogSource, error) {
 	blses := make([]*binlogdatapb.BinlogSource, 0, len(mz.sourceShards))
 	for _, sourceShard := range sourceShards {
 		bls := &binlogdatapb.BinlogSource{
@@ -277,7 +299,7 @@ func (mz *materializer) generateBinlogSources(ctx context.Context, targetShard *
 			}
 
 			// Validate non-empty query.
-			stmt, err := sqlparser.Parse(ts.SourceExpression)
+			stmt, err := mz.env.Parser().Parse(ts.SourceExpression)
 			if err != nil {
 				return nil, err
 			}
@@ -286,7 +308,7 @@ func (mz *materializer) generateBinlogSources(ctx context.Context, targetShard *
 				return nil, fmt.Errorf("unrecognized statement: %s", ts.SourceExpression)
 			}
 			filter := ts.SourceExpression
-			if mz.targetVSchema.Keyspace.Sharded && mz.targetVSchema.Tables[ts.TargetTable].Type != vindexes.TypeReference {
+			if !keyRangesEqual && mz.targetVSchema.Keyspace.Sharded && mz.targetVSchema.Tables[ts.TargetTable].Type != vindexes.TypeReference {
 				cv, err := vindexes.FindBestColVindex(mz.targetVSchema.Tables[ts.TargetTable])
 				if err != nil {
 					return nil, err
@@ -299,13 +321,13 @@ func (mz *materializer) generateBinlogSources(ctx context.Context, targetShard *
 					}
 					mappedCols = append(mappedCols, colName)
 				}
-				subExprs := make(sqlparser.SelectExprs, 0, len(mappedCols)+2)
+				subExprs := make(sqlparser.Exprs, 0, len(mappedCols)+2)
 				for _, mappedCol := range mappedCols {
-					subExprs = append(subExprs, &sqlparser.AliasedExpr{Expr: mappedCol})
+					subExprs = append(subExprs, mappedCol)
 				}
 				vindexName := fmt.Sprintf("%s.%s", mz.ms.TargetKeyspace, cv.Name)
-				subExprs = append(subExprs, &sqlparser.AliasedExpr{Expr: sqlparser.NewStrLiteral(vindexName)})
-				subExprs = append(subExprs, &sqlparser.AliasedExpr{Expr: sqlparser.NewStrLiteral(key.KeyRangeString(targetShard.KeyRange))})
+				subExprs = append(subExprs, sqlparser.NewStrLiteral(vindexName))
+				subExprs = append(subExprs, sqlparser.NewStrLiteral(key.KeyRangeString(targetShard.KeyRange)))
 				inKeyRange := &sqlparser.FuncExpr{
 					Name:  sqlparser.NewIdentifierCI("in_keyrange"),
 					Exprs: subExprs,
@@ -387,7 +409,7 @@ func (mz *materializer) deploySchema() error {
 			if createDDL == createDDLAsCopy || createDDL == createDDLAsCopyDropConstraint || createDDL == createDDLAsCopyDropForeignKeys {
 				if ts.SourceExpression != "" {
 					// Check for table if non-empty SourceExpression.
-					sourceTableName, err := sqlparser.TableFromStatement(ts.SourceExpression)
+					sourceTableName, err := mz.env.Parser().TableFromStatement(ts.SourceExpression)
 					if err != nil {
 						return err
 					}
@@ -403,7 +425,7 @@ func (mz *materializer) deploySchema() error {
 				}
 
 				if createDDL == createDDLAsCopyDropConstraint {
-					strippedDDL, err := stripTableConstraints(ddl)
+					strippedDDL, err := stripTableConstraints(ddl, mz.env.Parser())
 					if err != nil {
 						return err
 					}
@@ -412,7 +434,7 @@ func (mz *materializer) deploySchema() error {
 				}
 
 				if createDDL == createDDLAsCopyDropForeignKeys {
-					strippedDDL, err := stripTableForeignKeys(ddl)
+					strippedDDL, err := stripTableForeignKeys(ddl, mz.env.Parser())
 					if err != nil {
 						return err
 					}
@@ -426,6 +448,22 @@ func (mz *materializer) deploySchema() error {
 		}
 
 		if len(applyDDLs) > 0 {
+			if mz.ms.AtomicCopy {
+				// AtomicCopy suggests we may be interested in Foreign Key support. As such, we want to
+				// normalize the source schema: ensure the order of table definitions is compatible with
+				// the constraints graph. We want to first create the parents, then the children.
+				// We use schemadiff to normalize the schema.
+				// For now, and because this is could have wider implications, we ignore any errors in
+				// reading the source schema.
+				env := schemadiff.NewEnv(mz.env, mz.env.CollationEnv().DefaultConnectionCharset())
+				schema, err := schemadiff.NewSchemaFromQueries(env, applyDDLs)
+				if err != nil {
+					log.Error(vterrors.Wrapf(err, "AtomicCopy: failed to normalize schema via schemadiff"))
+				} else {
+					applyDDLs = schema.ToQueries()
+					log.Infof("AtomicCopy used, and schema was normalized via schemadiff. %v queries normalized", len(applyDDLs))
+				}
+			}
 			sql := strings.Join(applyDDLs, ";\n")
 
 			_, err = mz.tmc.ApplySchema(mz.ctx, targetTablet.Tablet, &tmutils.SchemaChange{
@@ -450,7 +488,7 @@ func (mz *materializer) buildMaterializer() error {
 	if err != nil {
 		return err
 	}
-	targetVSchema, err := vindexes.BuildKeyspaceSchema(vschema, ms.TargetKeyspace)
+	targetVSchema, err := vindexes.BuildKeyspaceSchema(vschema, ms.TargetKeyspace, mz.env.Parser())
 	if err != nil {
 		return err
 	}
@@ -562,22 +600,6 @@ func (mz *materializer) startStreams(ctx context.Context) error {
 		}
 		return nil
 	})
-}
-
-func Materialize(ctx context.Context, ts *topo.Server, tmc tmclient.TabletManagerClient, ms *vtctldatapb.MaterializeSettings) error {
-	mz := &materializer{
-		ctx:      ctx,
-		ts:       ts,
-		sourceTs: ts,
-		tmc:      tmc,
-		ms:       ms,
-	}
-
-	err := mz.createMaterializerStreams()
-	if err != nil {
-		return err
-	}
-	return mz.startStreams(ctx)
 }
 
 func (mz *materializer) forAllTargets(f func(*topo.ShardInfo) error) error {

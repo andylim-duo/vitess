@@ -48,7 +48,7 @@ var (
 	}
 	OnlineDDLCancel = &cobra.Command{
 		Use:                   "cancel <keyspace> <uuid|all>",
-		Short:                 "cancel one or all migrations, terminating any running ones as needed.",
+		Short:                 "Cancel one or all migrations, terminating any running ones as needed.",
 		Example:               "OnlineDDL cancel test_keyspace 82fa54ac_e83e_11ea_96b7_f875a4d24e90",
 		DisableFlagsInUseLine: true,
 		Args:                  cobra.ExactArgs(2),
@@ -64,7 +64,7 @@ var (
 	}
 	OnlineDDLComplete = &cobra.Command{
 		Use:                   "complete <keyspace> <uuid|all>",
-		Short:                 "complete one or all migrations executed with --postpone-completion",
+		Short:                 "Complete one or all migrations executed with --postpone-completion",
 		Example:               "OnlineDDL complete test_keyspace 82fa54ac_e83e_11ea_96b7_f875a4d24e90",
 		DisableFlagsInUseLine: true,
 		Args:                  cobra.ExactArgs(2),
@@ -72,7 +72,7 @@ var (
 	}
 	OnlineDDLLaunch = &cobra.Command{
 		Use:                   "launch <keyspace> <uuid|all>",
-		Short:                 "launch one or all migrations executed with --postpone-launch",
+		Short:                 "Launch one or all migrations executed with --postpone-launch",
 		Example:               "OnlineDDL launch test_keyspace 82fa54ac_e83e_11ea_96b7_f875a4d24e90",
 		DisableFlagsInUseLine: true,
 		Args:                  cobra.ExactArgs(2),
@@ -101,6 +101,14 @@ var (
 		DisableFlagsInUseLine: true,
 		Args:                  cobra.ExactArgs(2),
 		RunE:                  commandOnlineDDLUnthrottle,
+	}
+	OnlineDDLForceCutOver = &cobra.Command{
+		Use:                   "force-cutover <keyspace> <uuid|all>",
+		Short:                 "Mark a given schema migration, or all pending migrations, for forced cut over.",
+		Example:               "OnlineDDL force-cutover test_keyspace 82fa54ac_e83e_11ea_96b7_f875a4d24e90",
+		DisableFlagsInUseLine: true,
+		Args:                  cobra.ExactArgs(2),
+		RunE:                  commandOnlineDDLForceCutOver,
 	}
 	OnlineDDLShow = &cobra.Command{
 		Use:   "show",
@@ -168,6 +176,30 @@ func commandOnlineDDLCleanup(cmd *cobra.Command, args []string) error {
 	cli.FinishedParsing(cmd)
 
 	resp, err := client.CleanupSchemaMigration(commandCtx, &vtctldatapb.CleanupSchemaMigrationRequest{
+		Keyspace: keyspace,
+		Uuid:     uuid,
+	})
+	if err != nil {
+		return err
+	}
+
+	data, err := cli.MarshalJSON(resp)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("%s\n", data)
+	return nil
+}
+
+func commandOnlineDDLForceCutOver(cmd *cobra.Command, args []string) error {
+	keyspace, uuid, err := analyzeOnlineDDLCommandWithUuidOrAllArgument(cmd)
+	if err != nil {
+		return err
+	}
+	cli.FinishedParsing(cmd)
+
+	resp, err := client.ForceCutOverSchemaMigration(commandCtx, &vtctldatapb.ForceCutOverSchemaMigrationRequest{
 		Keyspace: keyspace,
 		Uuid:     uuid,
 	})
@@ -393,6 +425,7 @@ func init() {
 	OnlineDDL.AddCommand(OnlineDDLRetry)
 	OnlineDDL.AddCommand(OnlineDDLThrottle)
 	OnlineDDL.AddCommand(OnlineDDLUnthrottle)
+	OnlineDDL.AddCommand(OnlineDDLForceCutOver)
 
 	OnlineDDLShow.Flags().BoolVar(&onlineDDLShowArgs.JSON, "json", false, "Output JSON instead of human-readable table.")
 	OnlineDDLShow.Flags().StringVar(&onlineDDLShowArgs.OrderStr, "order", "asc", "Sort the results by `id` property of the Schema migration.")

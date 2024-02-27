@@ -35,8 +35,8 @@ var (
 	// reshardCreate makes a ReshardCreate gRPC call to a vtctld.
 	reshardCreate = &cobra.Command{
 		Use:                   "create",
-		Short:                 "Create and optionally run a reshard VReplication workflow.",
-		Example:               `vtctldclient --server localhost:15999 reshard --workflow customer2customer --target-keyspace customer create --source_shards="0" --target_shards="-80,80-" --cells zone1 --cells zone2 --tablet-types replica`,
+		Short:                 "Create and optionally run a Reshard VReplication workflow.",
+		Example:               `vtctldclient --server localhost:15999 reshard --workflow customer2customer --target-keyspace customer create --source-shards="0" --target-shards="-80,80-" --cells zone1 --cells zone2 --tablet-types replica`,
 		SilenceUsage:          true,
 		DisableFlagsInUseLine: true,
 		Aliases:               []string{"Create"},
@@ -60,9 +60,8 @@ func commandReshardCreate(cmd *cobra.Command, args []string) error {
 	cli.FinishedParsing(cmd)
 
 	req := &vtctldatapb.ReshardCreateRequest{
-		Workflow: common.BaseOptions.Workflow,
-		Keyspace: common.BaseOptions.TargetKeyspace,
-
+		Workflow:                  common.BaseOptions.Workflow,
+		Keyspace:                  common.BaseOptions.TargetKeyspace,
 		TabletTypes:               common.CreateOptions.TabletTypes,
 		TabletSelectionPreference: tsp,
 		Cells:                     common.CreateOptions.Cells,
@@ -70,10 +69,9 @@ func commandReshardCreate(cmd *cobra.Command, args []string) error {
 		DeferSecondaryKeys:        common.CreateOptions.DeferSecondaryKeys,
 		AutoStart:                 common.CreateOptions.AutoStart,
 		StopAfterCopy:             common.CreateOptions.StopAfterCopy,
-
-		SourceShards:   reshardCreateOptions.sourceShards,
-		TargetShards:   reshardCreateOptions.targetShards,
-		SkipSchemaCopy: reshardCreateOptions.skipSchemaCopy,
+		SourceShards:              reshardCreateOptions.sourceShards,
+		TargetShards:              reshardCreateOptions.targetShards,
+		SkipSchemaCopy:            reshardCreateOptions.skipSchemaCopy,
 	}
 	resp, err := common.GetClient().ReshardCreate(common.GetCommandCtx(), req)
 	if err != nil {

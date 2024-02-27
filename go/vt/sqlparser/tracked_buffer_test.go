@@ -270,7 +270,7 @@ func TestCanonicalOutput(t *testing.T) {
 		},
 		{
 			"create table t (id int, info JSON, INDEX zips((CAST(info->'$.field' AS unsigned array))))",
-			"CREATE TABLE `t` (\n\t`id` int,\n\t`info` JSON,\n\tINDEX `zips` ((CAST(`info` -> '$.field' AS unsigned array)))\n)",
+			"CREATE TABLE `t` (\n\t`id` int,\n\t`info` JSON,\n\tKEY `zips` ((CAST(`info` -> '$.field' AS unsigned array)))\n)",
 		},
 		{
 			"select 1 from t1 into outfile 'test/t1.txt'",
@@ -278,16 +278,17 @@ func TestCanonicalOutput(t *testing.T) {
 		},
 	}
 
+	parser := NewTestParser()
 	for _, tc := range testcases {
 		t.Run(tc.input, func(t *testing.T) {
-			tree, err := Parse(tc.input)
+			tree, err := parser.Parse(tc.input)
 			require.NoError(t, err, tc.input)
 
 			out := CanonicalString(tree)
 			require.Equal(t, tc.canonical, out, "bad serialization")
 
 			// Make sure we've generated a valid query!
-			rereadStmt, err := Parse(out)
+			rereadStmt, err := parser.Parse(out)
 			require.NoError(t, err, out)
 			out = CanonicalString(rereadStmt)
 			require.Equal(t, tc.canonical, out, "bad serialization")

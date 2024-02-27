@@ -25,6 +25,7 @@ import (
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/srvtopo"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
@@ -87,7 +88,9 @@ type (
 		Session() SessionActions
 
 		ConnCollation() collations.ID
+		Environment() *vtenv.Environment
 		TimeZone() *time.Location
+		SQLMode() string
 
 		ExecuteLock(ctx context.Context, rs *srvtopo.ResolvedShard, query *querypb.BoundQuery, lockFuncType sqlparser.LockingFuncType) (*sqltypes.Result, error)
 
@@ -119,6 +122,15 @@ type (
 
 		// ReleaseLock releases all the held advisory locks.
 		ReleaseLock(ctx context.Context) error
+
+		// GetWarmingReadsPercent gets the percentage of queries to clone to replicas for bufferpool warming
+		GetWarmingReadsPercent() int
+
+		// GetWarmingReadsChannel returns the channel for executing warming reads against replicas
+		GetWarmingReadsChannel() chan bool
+
+		// CloneForReplicaWarming clones the VCursor for re-use in warming queries to replicas
+		CloneForReplicaWarming(ctx context.Context) VCursor
 	}
 
 	// SessionActions gives primitives ability to interact with the session state
@@ -203,6 +215,8 @@ type (
 		// InTransaction returns true if the session has already opened transaction or
 		// will start a transaction on the query execution.
 		InTransaction() bool
+
+		Commit(ctx context.Context) error
 	}
 
 	// Match is used to check if a Primitive matches

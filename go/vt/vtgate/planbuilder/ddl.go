@@ -2,6 +2,7 @@ package planbuilder
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"vitess.io/vitess/go/vt/key"
@@ -44,7 +45,7 @@ func (fk *fkContraint) FkWalk(node sqlparser.SQLNode) (kontinue bool, err error)
 // and which chooses which of the two to invoke at runtime.
 func buildGeneralDDLPlan(ctx context.Context, sql string, ddlStatement sqlparser.DDLStatement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema, enableOnlineDDL, enableDirectDDL bool) (*planResult, error) {
 	if vschema.Destination() != nil {
-		return buildByPassDDLPlan(sql, vschema)
+		return buildByPassPlan(sql, vschema)
 	}
 	normalDDLPlan, onlineDDLPlan, err := buildDDLPlans(ctx, sql, ddlStatement, reservedVars, vschema, enableOnlineDDL, enableDirectDDL)
 	if err != nil {
@@ -79,7 +80,7 @@ func buildGeneralDDLPlan(ctx context.Context, sql string, ddlStatement sqlparser
 	return newPlanResult(eddl, tc.getTables()...), nil
 }
 
-func buildByPassDDLPlan(sql string, vschema plancontext.VSchema) (*planResult, error) {
+func buildByPassPlan(sql string, vschema plancontext.VSchema) (*planResult, error) {
 	keyspace, err := vschema.DefaultKeyspace()
 	if err != nil {
 		return nil, err
@@ -155,7 +156,7 @@ func checkFKError(vschema plancontext.VSchema, ddlStatement sqlparser.DDLStateme
 	if err != nil {
 		return err
 	}
-	if fkMode == vschemapb.Keyspace_FK_DISALLOW {
+	if fkMode == vschemapb.Keyspace_disallow {
 		fk := &fkContraint{}
 		_ = sqlparser.Walk(fk.FkWalk, ddlStatement)
 		if fk.found {
@@ -172,7 +173,8 @@ func findTableDestinationAndKeyspace(vschema plancontext.VSchema, ddlStatement s
 	var err error
 	table, _, _, _, destination, err = vschema.FindTableOrVindex(ddlStatement.GetTable())
 	if err != nil {
-		_, isNotFound := err.(vindexes.NotFoundError)
+		var notFoundError vindexes.NotFoundError
+		isNotFound := errors.As(err, &notFoundError)
 		if !isNotFound {
 			return nil, nil, err
 		}
@@ -312,7 +314,8 @@ func buildDropTable(vschema plancontext.VSchema, ddlStatement sqlparser.DDLState
 		table, _, _, _, destinationTab, err = vschema.FindTableOrVindex(tab)
 
 		if err != nil {
-			_, isNotFound := err.(vindexes.NotFoundError)
+			var notFoundError vindexes.NotFoundError
+			isNotFound := errors.As(err, &notFoundError)
 			if !isNotFound {
 				return nil, nil, err
 			}
@@ -355,7 +358,8 @@ func buildRenameTable(vschema plancontext.VSchema, renameTable *sqlparser.Rename
 		table, _, _, _, destinationFrom, err = vschema.FindTableOrVindex(tabPair.FromTable)
 
 		if err != nil {
-			_, isNotFound := err.(vindexes.NotFoundError)
+			var notFoundError vindexes.NotFoundError
+			isNotFound := errors.As(err, &notFoundError)
 			if !isNotFound {
 				return nil, nil, err
 			}

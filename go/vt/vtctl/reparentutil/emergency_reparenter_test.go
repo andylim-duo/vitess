@@ -60,8 +60,6 @@ func TestNewEmergencyReparenter(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -100,8 +98,6 @@ func TestEmergencyReparenter_getLockAction(t *testing.T) {
 	erp := &EmergencyReparenter{}
 
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -1900,8 +1896,6 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 
 			ctx, cancel := context.WithCancel(context.Background())
@@ -2428,8 +2422,6 @@ func TestEmergencyReparenter_promoteNewPrimary(t *testing.T) {
 
 	durability, _ := GetDurabilityPolicy("none")
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -2716,8 +2708,6 @@ func TestEmergencyReparenter_waitForAllRelayLogsToApply(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -2733,10 +2723,12 @@ func TestEmergencyReparenter_waitForAllRelayLogsToApply(t *testing.T) {
 	}
 }
 
-func TestEmergencyReparenterCounters(t *testing.T) {
-	ersCounter.Set(0)
-	ersSuccessCounter.Set(0)
-	ersFailureCounter.Set(0)
+func TestEmergencyReparenterStats(t *testing.T) {
+	ersCounter.ResetAll()
+	legacyERSCounter.Reset()
+	legacyERSSuccessCounter.Reset()
+	legacyERSFailureCounter.Reset()
+	reparentShardOpTimings.Reset()
 
 	emergencyReparentOps := EmergencyReparentOptions{}
 	tmc := &testutil.TabletManagerClient{
@@ -2865,9 +2857,13 @@ func TestEmergencyReparenterCounters(t *testing.T) {
 	require.NoError(t, err)
 
 	// check the counter values
-	require.EqualValues(t, 1, ersCounter.Get())
-	require.EqualValues(t, 1, ersSuccessCounter.Get())
-	require.EqualValues(t, 0, ersFailureCounter.Get())
+	require.EqualValues(t, map[string]int64{"testkeyspace.-.success": 1}, ersCounter.Counts())
+	require.EqualValues(t, map[string]int64{"All": 1, "EmergencyReparentShard": 1}, reparentShardOpTimings.Counts())
+
+	// check the legacy counter values
+	require.EqualValues(t, 1, legacyERSCounter.Get())
+	require.EqualValues(t, 1, legacyERSSuccessCounter.Get())
+	require.EqualValues(t, 0, legacyERSFailureCounter.Get())
 
 	// set emergencyReparentOps to request a non existent tablet
 	emergencyReparentOps.NewPrimaryAlias = &topodatapb.TabletAlias{
@@ -2880,9 +2876,13 @@ func TestEmergencyReparenterCounters(t *testing.T) {
 	require.Error(t, err)
 
 	// check the counter values
-	require.EqualValues(t, 2, ersCounter.Get())
-	require.EqualValues(t, 1, ersSuccessCounter.Get())
-	require.EqualValues(t, 1, ersFailureCounter.Get())
+	require.EqualValues(t, map[string]int64{"testkeyspace.-.success": 1, "testkeyspace.-.failure": 1}, ersCounter.Counts())
+	require.EqualValues(t, map[string]int64{"All": 2, "EmergencyReparentShard": 2}, reparentShardOpTimings.Counts())
+
+	// check the legacy counter values
+	require.EqualValues(t, 2, legacyERSCounter.Get())
+	require.EqualValues(t, 1, legacyERSSuccessCounter.Get())
+	require.EqualValues(t, 1, legacyERSFailureCounter.Get())
 }
 
 func TestEmergencyReparenter_findMostAdvanced(t *testing.T) {
@@ -3532,8 +3532,6 @@ func TestEmergencyReparenter_reparentReplicas(t *testing.T) {
 
 	durability, _ := GetDurabilityPolicy("none")
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -3980,8 +3978,6 @@ func TestEmergencyReparenter_promoteIntermediateSource(t *testing.T) {
 
 	durability, _ := GetDurabilityPolicy("none")
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 

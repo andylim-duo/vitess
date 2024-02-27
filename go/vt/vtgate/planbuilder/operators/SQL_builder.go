@@ -21,9 +21,9 @@ import (
 	"slices"
 	"sort"
 
+	"vitess.io/vitess/go/slice"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
-	"vitess.io/vitess/go/vt/vtgate/planbuilder/operators/ops"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 	"vitess.io/vitess/go/vt/vtgate/semantics"
 )
@@ -33,20 +33,22 @@ type (
 		ctx         *plancontext.PlanningContext
 		stmt        sqlparser.Statement
 		tableNames  []string
-		dmlOperator ops.Operator
+		dmlOperator Operator
 	}
 )
 
 func (qb *queryBuilder) asSelectStatement() sqlparser.SelectStatement {
 	return qb.stmt.(sqlparser.SelectStatement)
 }
+func (qb *queryBuilder) asOrderAndLimit() sqlparser.OrderAndLimit {
+	return qb.stmt.(sqlparser.OrderAndLimit)
+}
 
-func ToSQL(ctx *plancontext.PlanningContext, op ops.Operator) (sqlparser.Statement, ops.Operator, error) {
+func ToSQL(ctx *plancontext.PlanningContext, op Operator) (_ sqlparser.Statement, _ Operator, err error) {
+	defer PanicHandler(&err)
+
 	q := &queryBuilder{ctx: ctx}
-	err := buildQuery(op, q)
-	if err != nil {
-		return nil, nil, err
-	}
+	buildQuery(op, q)
 	if ctx.SemTable != nil {
 		q.sortTables()
 	}
@@ -71,33 +73,30 @@ func (qb *queryBuilder) addTableExpr(
 	if qb.stmt == nil {
 		qb.stmt = &sqlparser.Select{}
 	}
-	sel := qb.stmt.(*sqlparser.Select)
-	elems := &sqlparser.AliasedTableExpr{
+	tbl := &sqlparser.AliasedTableExpr{
 		Expr:       tblExpr,
 		Partitions: nil,
 		As:         sqlparser.NewIdentifierCS(alias),
 		Hints:      hints,
 		Columns:    columnAliases,
 	}
-	qb.ctx.SemTable.ReplaceTableSetFor(tableID, elems)
-	sel.From = append(sel.From, elems)
-	qb.stmt = sel
+	qb.ctx.SemTable.ReplaceTableSetFor(tableID, tbl)
+	qb.stmt.(FromStatement).SetFrom(append(qb.stmt.(FromStatement).GetFrom(), tbl))
 	qb.tableNames = append(qb.tableNames, tableName)
 }
 
 func (qb *queryBuilder) addPredicate(expr sqlparser.Expr) {
-	if _, toBeSkipped := qb.ctx.SkipPredicates[expr]; toBeSkipped {
+	if qb.ctx.ShouldSkip(expr) {
 		// This is a predicate that was added to the RHS of an ApplyJoin.
 		// The original predicate will be added, so we don't have to add this here
 		return
 	}
 
-	_, isSubQuery := expr.(*sqlparser.ExtractedSubquery)
 	var addPred func(sqlparser.Expr)
 
 	switch stmt := qb.stmt.(type) {
 	case *sqlparser.Select:
-		if sqlparser.ContainsAggregation(expr) && !isSubQuery {
+		if containsAggr(expr) {
 			addPred = stmt.AddHaving
 		} else {
 			addPred = stmt.AddWhere
@@ -120,24 +119,24 @@ func (qb *queryBuilder) addGroupBy(original sqlparser.Expr) {
 	sel.GroupBy = append(sel.GroupBy, original)
 }
 
-func (qb *queryBuilder) addProjection(projection *sqlparser.AliasedExpr) error {
+func (qb *queryBuilder) addProjection(projection sqlparser.SelectExpr) {
 	switch stmt := qb.stmt.(type) {
 	case *sqlparser.Select:
 		stmt.SelectExprs = append(stmt.SelectExprs, projection)
-		return nil
+		return
 	case *sqlparser.Union:
-		switch expr := projection.Expr.(type) {
-		case *sqlparser.ColName:
-			return checkUnionColumnByName(expr, stmt)
-		default:
-			// if there is more than just column names, we'll just push the UNION
-			// inside a derived table and then recurse into this method again
-			qb.pushUnionInsideDerived()
-			return qb.addProjection(projection)
+		if ae, ok := projection.(*sqlparser.AliasedExpr); ok {
+			if col, ok := ae.Expr.(*sqlparser.ColName); ok {
+				checkUnionColumnByName(col, stmt)
+				return
+			}
 		}
 
+		qb.pushUnionInsideDerived()
+		qb.addProjection(projection)
+		return
 	}
-	return vterrors.VT13001(fmt.Sprintf("unknown select statement type: %T", qb.stmt))
+	panic(vterrors.VT13001(fmt.Sprintf("unknown select statement type: %T", qb.stmt)))
 }
 
 func (qb *queryBuilder) pushUnionInsideDerived() {
@@ -169,7 +168,7 @@ func unionSelects(exprs sqlparser.SelectExprs) (selectExprs sqlparser.SelectExpr
 	return
 }
 
-func checkUnionColumnByName(column *sqlparser.ColName, sel sqlparser.SelectStatement) error {
+func checkUnionColumnByName(column *sqlparser.ColName, sel sqlparser.SelectStatement) {
 	colName := column.Name.String()
 	exprs := sqlparser.GetFirstSelect(sel).SelectExprs
 	offset := slices.IndexFunc(exprs, func(expr sqlparser.SelectExpr) bool {
@@ -183,9 +182,8 @@ func checkUnionColumnByName(column *sqlparser.ColName, sel sqlparser.SelectState
 		return false
 	})
 	if offset == -1 {
-		return vterrors.VT12001(fmt.Sprintf("did not find column [%s] on UNION", sqlparser.String(column)))
+		panic(vterrors.VT12001(fmt.Sprintf("did not find column [%s] on UNION", sqlparser.String(column))))
 	}
-	return nil
 }
 
 func (qb *queryBuilder) clearProjections() {
@@ -204,62 +202,81 @@ func (qb *queryBuilder) unionWith(other *queryBuilder, distinct bool) {
 	}
 }
 
+type FromStatement interface {
+	GetFrom() []sqlparser.TableExpr
+	SetFrom([]sqlparser.TableExpr)
+	GetWherePredicate() sqlparser.Expr
+	SetWherePredicate(sqlparser.Expr)
+}
+
+var _ FromStatement = (*sqlparser.Select)(nil)
+var _ FromStatement = (*sqlparser.Update)(nil)
+var _ FromStatement = (*sqlparser.Delete)(nil)
+
 func (qb *queryBuilder) joinInnerWith(other *queryBuilder, onCondition sqlparser.Expr) {
-	sel := qb.stmt.(*sqlparser.Select)
-	otherSel := other.stmt.(*sqlparser.Select)
-	sel.From = append(sel.From, otherSel.From...)
-	sel.SelectExprs = append(sel.SelectExprs, otherSel.SelectExprs...)
+	stmt := qb.stmt.(FromStatement)
+	otherStmt := other.stmt.(FromStatement)
 
-	var predicate sqlparser.Expr
-	if sel.Where != nil {
-		predicate = sel.Where.Expr
-	}
-	if otherSel.Where != nil {
-		predExprs := sqlparser.SplitAndExpression(nil, predicate)
-		otherExprs := sqlparser.SplitAndExpression(nil, otherSel.Where.Expr)
-		predicate = qb.ctx.SemTable.AndExpressions(append(predExprs, otherExprs...)...)
-	}
-	if predicate != nil {
-		sel.Where = &sqlparser.Where{Type: sqlparser.WhereClause, Expr: predicate}
+	if sel, isSel := stmt.(*sqlparser.Select); isSel {
+		otherSel := otherStmt.(*sqlparser.Select)
+		sel.SelectExprs = append(sel.SelectExprs, otherSel.SelectExprs...)
 	}
 
+	newFromClause := append(stmt.GetFrom(), otherStmt.GetFrom()...)
+	stmt.SetFrom(newFromClause)
+	qb.mergeWhereClauses(stmt, otherStmt)
 	qb.addPredicate(onCondition)
 }
 
 func (qb *queryBuilder) joinOuterWith(other *queryBuilder, onCondition sqlparser.Expr) {
-	sel := qb.stmt.(*sqlparser.Select)
-	otherSel := other.stmt.(*sqlparser.Select)
+	stmt := qb.stmt.(FromStatement)
+	otherStmt := other.stmt.(FromStatement)
+
+	if sel, isSel := stmt.(*sqlparser.Select); isSel {
+		otherSel := otherStmt.(*sqlparser.Select)
+		sel.SelectExprs = append(sel.SelectExprs, otherSel.SelectExprs...)
+	}
+
+	newFromClause := []sqlparser.TableExpr{buildOuterJoin(stmt, otherStmt, onCondition)}
+	stmt.SetFrom(newFromClause)
+	qb.mergeWhereClauses(stmt, otherStmt)
+}
+
+func (qb *queryBuilder) mergeWhereClauses(stmt, otherStmt FromStatement) {
+	predicate := stmt.GetWherePredicate()
+	if otherPredicate := otherStmt.GetWherePredicate(); otherPredicate != nil {
+		predExprs := sqlparser.SplitAndExpression(nil, predicate)
+		otherExprs := sqlparser.SplitAndExpression(nil, otherPredicate)
+		predicate = qb.ctx.SemTable.AndExpressions(append(predExprs, otherExprs...)...)
+	}
+	if predicate != nil {
+		stmt.SetWherePredicate(predicate)
+	}
+}
+
+func buildOuterJoin(stmt FromStatement, otherStmt FromStatement, onCondition sqlparser.Expr) *sqlparser.JoinTableExpr {
 	var lhs sqlparser.TableExpr
-	if len(sel.From) == 1 {
-		lhs = sel.From[0]
+	fromClause := stmt.GetFrom()
+	if len(fromClause) == 1 {
+		lhs = fromClause[0]
 	} else {
-		lhs = &sqlparser.ParenTableExpr{Exprs: sel.From}
+		lhs = &sqlparser.ParenTableExpr{Exprs: fromClause}
 	}
 	var rhs sqlparser.TableExpr
-	if len(otherSel.From) == 1 {
-		rhs = otherSel.From[0]
+	otherFromClause := otherStmt.GetFrom()
+	if len(otherFromClause) == 1 {
+		rhs = otherFromClause[0]
 	} else {
-		rhs = &sqlparser.ParenTableExpr{Exprs: otherSel.From}
+		rhs = &sqlparser.ParenTableExpr{Exprs: otherFromClause}
 	}
-	sel.From = []sqlparser.TableExpr{&sqlparser.JoinTableExpr{
+
+	return &sqlparser.JoinTableExpr{
 		LeftExpr:  lhs,
 		RightExpr: rhs,
 		Join:      sqlparser.LeftJoinType,
 		Condition: &sqlparser.JoinCondition{
 			On: onCondition,
 		},
-	}}
-
-	sel.SelectExprs = append(sel.SelectExprs, otherSel.SelectExprs...)
-	var predicate sqlparser.Expr
-	if sel.Where != nil {
-		predicate = sel.Where.Expr
-	}
-	if otherSel.Where != nil {
-		predicate = qb.ctx.SemTable.AndExpressions(predicate, otherSel.Where.Expr)
-	}
-	if predicate != nil {
-		sel.Where = &sqlparser.Where{Type: sqlparser.WhereClause, Expr: predicate}
 	}
 }
 
@@ -313,20 +330,18 @@ func (ts *tableSorter) Swap(i, j int) {
 func removeKeyspaceFromSelectExpr(expr sqlparser.SelectExpr) {
 	switch expr := expr.(type) {
 	case *sqlparser.AliasedExpr:
-		sqlparser.RemoveKeyspaceFromColName(expr.Expr)
+		sqlparser.RemoveKeyspaceInCol(expr.Expr)
 	case *sqlparser.StarExpr:
 		expr.TableName.Qualifier = sqlparser.NewIdentifierCS("")
 	}
 }
 
-func stripDownQuery(from, to sqlparser.SelectStatement) error {
-	var err error
-
+func stripDownQuery(from, to sqlparser.SelectStatement) {
 	switch node := from.(type) {
 	case *sqlparser.Select:
 		toNode, ok := to.(*sqlparser.Select)
 		if !ok {
-			return vterrors.VT13001("AST did not match")
+			panic(vterrors.VT13001("AST did not match"))
 		}
 		toNode.Distinct = node.Distinct
 		toNode.GroupBy = node.GroupBy
@@ -341,67 +356,89 @@ func stripDownQuery(from, to sqlparser.SelectStatement) error {
 	case *sqlparser.Union:
 		toNode, ok := to.(*sqlparser.Union)
 		if !ok {
-			return vterrors.VT13001("AST did not match")
+			panic(vterrors.VT13001("AST did not match"))
 		}
-		err = stripDownQuery(node.Left, toNode.Left)
-		if err != nil {
-			return err
-		}
-		err = stripDownQuery(node.Right, toNode.Right)
-		if err != nil {
-			return err
-		}
+		stripDownQuery(node.Left, toNode.Left)
+		stripDownQuery(node.Right, toNode.Right)
 		toNode.OrderBy = node.OrderBy
 	default:
-		return vterrors.VT13001(fmt.Sprintf("this should not happen - we have covered all implementations of SelectStatement %T", from))
+		panic(vterrors.VT13001(fmt.Sprintf("this should not happen - we have covered all implementations of SelectStatement %T", from)))
 	}
-	return nil
 }
 
 // buildQuery recursively builds the query into an AST, from an operator tree
-func buildQuery(op ops.Operator, qb *queryBuilder) error {
+func buildQuery(op Operator, qb *queryBuilder) {
 	switch op := op.(type) {
 	case *Table:
 		buildTable(op, qb)
 	case *Projection:
-		return buildProjection(op, qb)
+		buildProjection(op, qb)
 	case *ApplyJoin:
-		return buildApplyJoin(op, qb)
+		buildApplyJoin(op, qb)
 	case *Filter:
-		return buildFilter(op, qb)
+		buildFilter(op, qb)
 	case *Horizon:
 		if op.TableId != nil {
-			return buildDerived(op, qb)
+			buildDerived(op, qb)
+			return
 		}
-		return buildHorizon(op, qb)
+		buildHorizon(op, qb)
 	case *Limit:
-		return buildLimit(op, qb)
+		buildLimit(op, qb)
 	case *Ordering:
-		return buildOrdering(op, qb)
+		buildOrdering(op, qb)
 	case *Aggregator:
-		return buildAggregation(op, qb)
+		buildAggregation(op, qb)
 	case *Union:
-		return buildUnion(op, qb)
+		buildUnion(op, qb)
 	case *Distinct:
-		err := buildQuery(op.Source, qb)
-		if err != nil {
-			return err
-		}
+		buildQuery(op.Source, qb)
 		qb.asSelectStatement().MakeDistinct()
 	case *Update:
-		buildDML(op, qb)
+		buildUpdate(op, qb)
 	case *Delete:
-		buildDML(op, qb)
+		buildDelete(op, qb)
 	case *Insert:
 		buildDML(op, qb)
 	default:
-		return vterrors.VT13001(fmt.Sprintf("unknown operator to convert to SQL: %T", op))
+		panic(vterrors.VT13001(fmt.Sprintf("unknown operator to convert to SQL: %T", op)))
 	}
-	return nil
+}
+
+func buildDelete(op *Delete, qb *queryBuilder) {
+	qb.stmt = &sqlparser.Delete{
+		Ignore:  op.Ignore,
+		Targets: sqlparser.TableNames{op.Target.Name},
+	}
+	buildQuery(op.Source, qb)
+
+	qb.dmlOperator = op
+}
+
+func buildUpdate(op *Update, qb *queryBuilder) {
+	updExprs := getUpdateExprs(op)
+	upd := &sqlparser.Update{
+		Ignore: op.Ignore,
+		Exprs:  updExprs,
+	}
+	qb.stmt = upd
+	qb.dmlOperator = op
+	buildQuery(op.Source, qb)
+}
+
+func getUpdateExprs(op *Update) sqlparser.UpdateExprs {
+	updExprs := make(sqlparser.UpdateExprs, 0, len(op.Assignments))
+	for _, se := range op.Assignments {
+		updExprs = append(updExprs, &sqlparser.UpdateExpr{
+			Name: se.Name,
+			Expr: se.Expr.EvalExpr,
+		})
+	}
+	return updExprs
 }
 
 type OpWithAST interface {
-	ops.Operator
+	Operator
 	Statement() sqlparser.Statement
 }
 
@@ -410,55 +447,36 @@ func buildDML(op OpWithAST, qb *queryBuilder) {
 	qb.dmlOperator = op
 }
 
-func buildAggregation(op *Aggregator, qb *queryBuilder) error {
-	err := buildQuery(op.Source, qb)
-	if err != nil {
-		return err
-	}
+func buildAggregation(op *Aggregator, qb *queryBuilder) {
+	buildQuery(op.Source, qb)
 
 	qb.clearProjections()
 
-	cols, err := op.GetColumns(qb.ctx)
-	if err != nil {
-		return err
-	}
+	cols := op.GetColumns(qb.ctx)
 	for _, column := range cols {
-		err := qb.addProjection(column)
-		if err != nil {
-			return err
-		}
+		qb.addProjection(column)
 	}
 
 	for _, by := range op.Grouping {
 		qb.addGroupBy(by.Inner)
-		simplified := by.SimplifiedExpr
+		simplified := by.Inner
 		if by.WSOffset != -1 {
 			qb.addGroupBy(weightStringFor(simplified))
 		}
 	}
-
-	return nil
 }
 
-func buildOrdering(op *Ordering, qb *queryBuilder) error {
-	err := buildQuery(op.Source, qb)
-	if err != nil {
-		return err
-	}
+func buildOrdering(op *Ordering, qb *queryBuilder) {
+	buildQuery(op.Source, qb)
 
 	for _, order := range op.Order {
-		qb.asSelectStatement().AddOrder(order.Inner)
+		qb.asOrderAndLimit().AddOrder(order.Inner)
 	}
-	return nil
 }
 
-func buildLimit(op *Limit, qb *queryBuilder) error {
-	err := buildQuery(op.Source, qb)
-	if err != nil {
-		return err
-	}
-	qb.asSelectStatement().SetLimit(op.AST)
-	return nil
+func buildLimit(op *Limit, qb *queryBuilder) {
+	buildQuery(op.Source, qb)
+	qb.asOrderAndLimit().SetLimit(op.AST)
 }
 
 func buildTable(op *Table, qb *queryBuilder) {
@@ -472,83 +490,65 @@ func buildTable(op *Table, qb *queryBuilder) {
 		qb.addPredicate(pred)
 	}
 	for _, name := range op.Columns {
-		err := qb.addProjection(&sqlparser.AliasedExpr{Expr: name})
-		if err != nil {
-			return
-		}
+		qb.addProjection(&sqlparser.AliasedExpr{Expr: name})
 	}
 }
 
-func buildProjection(op *Projection, qb *queryBuilder) error {
-	err := buildQuery(op.Source, qb)
-	if err != nil {
-		return err
-	}
+func buildProjection(op *Projection, qb *queryBuilder) {
+	buildQuery(op.Source, qb)
 
 	_, isSel := qb.stmt.(*sqlparser.Select)
 	if isSel {
 		qb.clearProjections()
-
-		for _, column := range op.Columns {
-			err := qb.addProjection(column)
-			if err != nil {
-				return err
-			}
+		cols := op.GetSelectExprs(qb.ctx)
+		for _, column := range cols {
+			qb.addProjection(column)
 		}
 	}
 
 	// if the projection is on derived table, we use the select we have
 	// created above and transform it into a derived table
-	if op.TableID != nil {
+	if op.DT != nil {
 		sel := qb.asSelectStatement()
 		qb.stmt = nil
-		qb.addTableExpr(op.Alias, op.Alias, TableID(op), &sqlparser.DerivedTable{
+		qb.addTableExpr(op.DT.Alias, op.DT.Alias, TableID(op), &sqlparser.DerivedTable{
 			Select: sel,
-		}, nil, nil)
+		}, nil, op.DT.Columns)
 	}
 
 	if !isSel {
-		for _, column := range op.Columns {
-			err := qb.addProjection(column)
-			if err != nil {
-				return err
-			}
+		cols := op.GetSelectExprs(qb.ctx)
+		for _, column := range cols {
+			qb.addProjection(column)
 		}
 	}
-
-	return nil
 }
 
-func buildApplyJoin(op *ApplyJoin, qb *queryBuilder) error {
-	err := buildQuery(op.LHS, qb)
-	if err != nil {
-		return err
-	}
-	// If we are going to add the predicate used in join here
-	// We should not add the predicate's copy of when it was split into
-	// two parts. To avoid this, we use the SkipPredicates map.
-	for _, expr := range qb.ctx.JoinPredicates[op.Predicate] {
-		qb.ctx.SkipPredicates[expr] = nil
-	}
+func buildApplyJoin(op *ApplyJoin, qb *queryBuilder) {
+	predicates := slice.Map(op.JoinPredicates.columns, func(jc applyJoinColumn) sqlparser.Expr {
+		// since we are adding these join predicates, we need to mark to broken up version (RHSExpr) of it as done
+		err := qb.ctx.SkipJoinPredicates(jc.Original)
+		if err != nil {
+			panic(err)
+		}
+		return jc.Original
+	})
+	pred := sqlparser.AndExpressions(predicates...)
+
+	buildQuery(op.LHS, qb)
+
 	qbR := &queryBuilder{ctx: qb.ctx}
-	err = buildQuery(op.RHS, qbR)
-	if err != nil {
-		return err
-	}
+	buildQuery(op.RHS, qbR)
 	if op.LeftJoin {
-		qb.joinOuterWith(qbR, op.Predicate)
+		qb.joinOuterWith(qbR, pred)
 	} else {
-		qb.joinInnerWith(qbR, op.Predicate)
+		qb.joinInnerWith(qbR, pred)
 	}
-	return nil
 }
 
-func buildUnion(op *Union, qb *queryBuilder) error {
+func buildUnion(op *Union, qb *queryBuilder) {
 	// the first input is built first
-	err := buildQuery(op.Sources[0], qb)
-	if err != nil {
-		return err
-	}
+	buildQuery(op.Sources[0], qb)
 
 	for i, src := range op.Sources {
 		if i == 0 {
@@ -557,49 +557,41 @@ func buildUnion(op *Union, qb *queryBuilder) error {
 
 		// now we can go over the remaining inputs and UNION them together
 		qbOther := &queryBuilder{ctx: qb.ctx}
-		err = buildQuery(src, qbOther)
-		if err != nil {
-			return err
-		}
+		buildQuery(src, qbOther)
 		qb.unionWith(qbOther, op.distinct)
 	}
-
-	return nil
 }
 
-func buildFilter(op *Filter, qb *queryBuilder) error {
-	err := buildQuery(op.Source, qb)
-	if err != nil {
-		return err
-	}
+func buildFilter(op *Filter, qb *queryBuilder) {
+	buildQuery(op.Source, qb)
+
 	for _, pred := range op.Predicates {
 		qb.addPredicate(pred)
 	}
-	return nil
 }
 
-func buildDerived(op *Horizon, qb *queryBuilder) error {
-	err := buildQuery(op.Source, qb)
-	if err != nil {
-		return err
-	}
-	sqlparser.RemoveKeyspace(op.Query)
+func buildDerived(op *Horizon, qb *queryBuilder) {
+	buildQuery(op.Source, qb)
+
+	sqlparser.RemoveKeyspaceInCol(op.Query)
 
 	stmt := qb.stmt
 	qb.stmt = nil
 	switch sel := stmt.(type) {
 	case *sqlparser.Select:
-		return buildDerivedSelect(op, qb, sel)
+		buildDerivedSelect(op, qb, sel)
+		return
 	case *sqlparser.Union:
-		return buildDerivedUnion(op, qb, sel)
+		buildDerivedUnion(op, qb, sel)
+		return
 	}
 	panic(fmt.Sprintf("unknown select statement type: %T", stmt))
 }
 
-func buildDerivedUnion(op *Horizon, qb *queryBuilder, union *sqlparser.Union) error {
+func buildDerivedUnion(op *Horizon, qb *queryBuilder, union *sqlparser.Union) {
 	opQuery, ok := op.Query.(*sqlparser.Union)
 	if !ok {
-		return vterrors.VT12001("Horizon contained SELECT but statement was UNION")
+		panic(vterrors.VT12001("Horizon contained SELECT but statement was UNION"))
 	}
 
 	union.Limit = opQuery.Limit
@@ -609,14 +601,12 @@ func buildDerivedUnion(op *Horizon, qb *queryBuilder, union *sqlparser.Union) er
 	qb.addTableExpr(op.Alias, op.Alias, TableID(op), &sqlparser.DerivedTable{
 		Select: union,
 	}, nil, op.ColumnAliases)
-
-	return nil
 }
 
-func buildDerivedSelect(op *Horizon, qb *queryBuilder, sel *sqlparser.Select) error {
+func buildDerivedSelect(op *Horizon, qb *queryBuilder, sel *sqlparser.Select) {
 	opQuery, ok := op.Query.(*sqlparser.Select)
 	if !ok {
-		return vterrors.VT12001("Horizon contained UNION but statement was SELECT")
+		panic(vterrors.VT12001("Horizon contained UNION but statement was SELECT"))
 	}
 	sel.Limit = opQuery.Limit
 	sel.OrderBy = opQuery.OrderBy
@@ -627,32 +617,21 @@ func buildDerivedSelect(op *Horizon, qb *queryBuilder, sel *sqlparser.Select) er
 		Select: sel,
 	}, nil, op.ColumnAliases)
 	for _, col := range op.Columns {
-		err := qb.addProjection(&sqlparser.AliasedExpr{Expr: col})
-		if err != nil {
-			return err
-		}
+		qb.addProjection(&sqlparser.AliasedExpr{Expr: col})
 	}
-	return nil
-
 }
 
-func buildHorizon(op *Horizon, qb *queryBuilder) error {
-	err := buildQuery(op.Source, qb)
-	if err != nil {
-		return err
-	}
+func buildHorizon(op *Horizon, qb *queryBuilder) {
+	buildQuery(op.Source, qb)
 
-	err = stripDownQuery(op.Query, qb.asSelectStatement())
-	if err != nil {
-		return err
-	}
+	stripDownQuery(op.Query, qb.asSelectStatement())
+
 	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
 		if aliasedExpr, ok := node.(sqlparser.SelectExpr); ok {
 			removeKeyspaceFromSelectExpr(aliasedExpr)
 		}
 		return true, nil
 	}, qb.stmt)
-	return nil
 }
 
 func mergeHaving(h1, h2 *sqlparser.Where) *sqlparser.Where {

@@ -124,7 +124,7 @@
       "Original": "select a, b, count(*) k from user group by a order by k desc limit 10",
       "Instructions": {
         "OperatorType": "Limit",
-        "Count": "INT64(10)",
+        "Count": "10",
         "Inputs": [
           {
             "OperatorType": "Sort",
@@ -313,7 +313,7 @@
                 "Query": "select `user`.col1 as a, `user`.col2 as b, `user`.id from `user` where `user`.id = 1",
                 "Table": "`user`",
                 "Values": [
-                  "INT64(1)"
+                  "1"
                 ],
                 "Vindex": "user_index"
               },
@@ -374,7 +374,7 @@
                 "Query": "select `user`.col1 as a, `user`.col2, weight_string(`user`.col1), weight_string(`user`.col2), `user`.id from `user` where `user`.id = 1",
                 "Table": "`user`",
                 "Values": [
-                  "INT64(1)"
+                  "1"
                 ],
                 "Vindex": "user_index"
               },
@@ -585,9 +585,9 @@
               "Name": "user",
               "Sharded": true
             },
-            "FieldQuery": "select u.a, convert(a, binary), weight_string(convert(a, binary)) from `user` as u where 1 != 1",
+            "FieldQuery": "select u.a, convert(u.a, binary), weight_string(convert(u.a, binary)) from `user` as u where 1 != 1",
             "OrderBy": "(1|2) DESC",
-            "Query": "select u.a, convert(a, binary), weight_string(convert(a, binary)) from `user` as u order by convert(a, binary) desc",
+            "Query": "select u.a, convert(u.a, binary), weight_string(convert(u.a, binary)) from `user` as u order by convert(u.a, binary) desc",
             "Table": "`user`"
           },
           {

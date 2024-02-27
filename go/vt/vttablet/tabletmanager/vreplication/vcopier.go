@@ -21,10 +21,12 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"golang.org/x/exp/maps"
 	"google.golang.org/protobuf/encoding/prototext"
 
 	"vitess.io/vitess/go/bytes2"
@@ -33,12 +35,14 @@ import (
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/binlog/binlogplayer"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vttablet"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
+
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
-	"vitess.io/vitess/go/vt/sqlparser"
-	"vitess.io/vitess/go/vt/vterrors"
-	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 )
 
 type vcopier struct {
@@ -217,7 +221,7 @@ func newVCopierCopyWorker(
 func (vc *vcopier) initTablesForCopy(ctx context.Context) error {
 	defer vc.vr.dbClient.Rollback()
 
-	plan, err := buildReplicatorPlan(vc.vr.source, vc.vr.colInfoMap, nil, vc.vr.stats)
+	plan, err := buildReplicatorPlan(vc.vr.source, vc.vr.colInfoMap, nil, vc.vr.stats, vc.vr.vre.env.CollationEnv(), vc.vr.vre.env.Parser())
 	if err != nil {
 		return err
 	}
@@ -228,9 +232,12 @@ func (vc *vcopier) initTablesForCopy(ctx context.Context) error {
 	if len(plan.TargetTables) != 0 {
 		var buf strings.Builder
 		buf.WriteString("insert into _vt.copy_state(vrepl_id, table_name) values ")
+		// Sort the tables by name to ensure a consistent order.
+		tableNames := maps.Keys(plan.TargetTables)
+		slices.Sort(tableNames)
 		prefix := ""
-		for name := range plan.TargetTables {
-			fmt.Fprintf(&buf, "%s(%d, %s)", prefix, vc.vr.id, encodeString(name))
+		for _, tableName := range tableNames {
+			fmt.Fprintf(&buf, "%s(%d, %s)", prefix, vc.vr.id, encodeString(tableName))
 			prefix = ", "
 		}
 		if _, err := vc.vr.dbClient.Execute(buf.String()); err != nil {
@@ -254,8 +261,8 @@ func (vc *vcopier) initTablesForCopy(ctx context.Context) error {
 					len(plan.TargetTables))); err != nil {
 					return err
 				}
-				for name := range plan.TargetTables {
-					if err := vc.vr.stashSecondaryKeys(ctx, name); err != nil {
+				for _, tableName := range tableNames {
+					if err := vc.vr.stashSecondaryKeys(ctx, tableName); err != nil {
 						return err
 					}
 				}
@@ -292,7 +299,7 @@ func (vc *vcopier) initTablesForCopy(ctx context.Context) error {
 // primary key that was copied. A nil Result means that nothing has been copied.
 // A table that was fully copied is removed from copyState.
 func (vc *vcopier) copyNext(ctx context.Context, settings binlogplayer.VRSettings) error {
-	qr, err := vc.vr.dbClient.Execute(fmt.Sprintf("select table_name, lastpk from _vt.copy_state where vrepl_id = %d and id in (select max(id) from _vt.copy_state group by vrepl_id, table_name)", vc.vr.id))
+	qr, err := vc.vr.dbClient.Execute(fmt.Sprintf("select table_name, lastpk from _vt.copy_state where vrepl_id = %d and id in (select max(id) from _vt.copy_state group by vrepl_id, table_name) order by table_name", vc.vr.id))
 	if err != nil {
 		return err
 	}
@@ -383,7 +390,7 @@ func (vc *vcopier) copyTable(ctx context.Context, tableName string, copyState ma
 
 	log.Infof("Copying table %s, lastpk: %v", tableName, copyState[tableName])
 
-	plan, err := buildReplicatorPlan(vc.vr.source, vc.vr.colInfoMap, nil, vc.vr.stats)
+	plan, err := buildReplicatorPlan(vc.vr.source, vc.vr.colInfoMap, nil, vc.vr.stats, vc.vr.vre.env.CollationEnv(), vc.vr.vre.env.Parser())
 	if err != nil {
 		return err
 	}
@@ -393,7 +400,7 @@ func (vc *vcopier) copyTable(ctx context.Context, tableName string, copyState ma
 		return fmt.Errorf("plan not found for table: %s, current plans are: %#v", tableName, plan.TargetTables)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, copyPhaseDuration)
+	ctx, cancel := context.WithTimeout(ctx, vttablet.CopyPhaseDuration)
 	defer cancel()
 
 	var lastpkpb *querypb.QueryResult
@@ -610,7 +617,7 @@ func (vc *vcopier) copyTable(ctx context.Context, tableName string, copyState ma
 		case result := <-resultCh:
 			switch result.state {
 			case vcopierCopyTaskCancel:
-				// A task cancelation probably indicates an expired context due
+				// A task cancellation probably indicates an expired context due
 				// to a PlannedReparentShard or elapsed copy phase duration,
 				// neither of which are error conditions.
 			case vcopierCopyTaskComplete:
@@ -756,7 +763,7 @@ func (vcq *vcopierCopyWorkQueue) enqueue(ctx context.Context, currT *vcopierCopy
 	}
 
 	// Get a handle on an unused worker.
-	poolH, err := vcq.workerPool.Get(ctx, nil)
+	poolH, err := vcq.workerPool.Get(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get a worker from pool: %s", err.Error())
 	}
@@ -1016,11 +1023,6 @@ func (vts vcopierCopyTaskState) String() string {
 	return fmt.Sprintf("undefined(%d)", int(vts))
 }
 
-// ApplySetting implements pools.Resource.
-func (vbc *vcopierCopyWorker) ApplySetting(context.Context, *pools.Setting) error {
-	return vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "[BUG] vcopierCopyWorker does not implement ApplySetting")
-}
-
 // Close implements pool.Resource.
 func (vbc *vcopierCopyWorker) Close() {
 	if !vbc.isOpen {
@@ -1036,21 +1038,6 @@ func (vbc *vcopierCopyWorker) Close() {
 // Expired implements pools.Resource.
 func (vbc *vcopierCopyWorker) Expired(time.Duration) bool {
 	return false
-}
-
-// IsSameSetting implements pools.Resource.
-func (vbc *vcopierCopyWorker) IsSameSetting(string) bool {
-	return true
-}
-
-// IsSettingApplied implements pools.Resource.
-func (vbc *vcopierCopyWorker) IsSettingApplied() bool {
-	return false
-}
-
-// ResetSetting implements pools.Resource.
-func (vbc *vcopierCopyWorker) ResetSetting(context.Context) error {
-	return vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "[BUG] vcopierCopyWorker does not implement ResetSetting")
 }
 
 // execute advances a task through each state until it is done (= canceled,
@@ -1105,7 +1092,7 @@ func (vbc *vcopierCopyWorker) execute(ctx context.Context, task *vcopierCopyTask
 			advanceFn = func(context.Context, *vcopierCopyTaskArgs) error {
 				// Commit.
 				if err := vbc.vdbClient.Commit(); err != nil {
-					return vterrors.Wrapf(err, "error commiting transaction")
+					return vterrors.Wrapf(err, "error committing transaction")
 				}
 				return nil
 			}

@@ -52,6 +52,8 @@ func (a *application) rewriteSQLNode(parent SQLNode, node SQLNode, replacer repl
 		return a.rewriteRefOfAlterView(parent, node, replacer)
 	case *AlterVschema:
 		return a.rewriteRefOfAlterVschema(parent, node, replacer)
+	case *Analyze:
+		return a.rewriteRefOfAnalyze(parent, node, replacer)
 	case *AndExpr:
 		return a.rewriteRefOfAndExpr(parent, node, replacer)
 	case *AnyValue:
@@ -164,8 +166,6 @@ func (a *application) rewriteSQLNode(parent SQLNode, node SQLNode, replacer repl
 		return a.rewriteRefOfExtractFuncExpr(parent, node, replacer)
 	case *ExtractValueExpr:
 		return a.rewriteRefOfExtractValueExpr(parent, node, replacer)
-	case *ExtractedSubquery:
-		return a.rewriteRefOfExtractedSubquery(parent, node, replacer)
 	case *FirstOrLastValueExpr:
 		return a.rewriteRefOfFirstOrLastValueExpr(parent, node, replacer)
 	case *Flush:
@@ -360,8 +360,6 @@ func (a *application) rewriteSQLNode(parent SQLNode, node SQLNode, replacer repl
 		return a.rewriteRefOfOrderByOption(parent, node, replacer)
 	case *OtherAdmin:
 		return a.rewriteRefOfOtherAdmin(parent, node, replacer)
-	case *OtherRead:
-		return a.rewriteRefOfOtherRead(parent, node, replacer)
 	case *OverClause:
 		return a.rewriteRefOfOverClause(parent, node, replacer)
 	case *ParenTableExpr:
@@ -1025,6 +1023,33 @@ func (a *application) rewriteRefOfAlterVschema(parent SQLNode, node *AlterVschem
 	}
 	if !a.rewriteRefOfAutoIncSpec(node, node.AutoIncSpec, func(newNode, parent SQLNode) {
 		parent.(*AlterVschema).AutoIncSpec = newNode.(*AutoIncSpec)
+	}) {
+		return false
+	}
+	if a.post != nil {
+		a.cur.replacer = replacer
+		a.cur.parent = parent
+		a.cur.node = node
+		if !a.post(&a.cur) {
+			return false
+		}
+	}
+	return true
+}
+func (a *application) rewriteRefOfAnalyze(parent SQLNode, node *Analyze, replacer replacerFunc) bool {
+	if node == nil {
+		return true
+	}
+	if a.pre != nil {
+		a.cur.replacer = replacer
+		a.cur.parent = parent
+		a.cur.node = node
+		if !a.pre(&a.cur) {
+			return true
+		}
+	}
+	if !a.rewriteTableName(node, node.Table, func(newNode, parent SQLNode) {
+		parent.(*Analyze).Table = newNode.(TableName)
 	}) {
 		return false
 	}
@@ -1792,20 +1817,12 @@ func (a *application) rewriteRefOfColumnType(parent SQLNode, node *ColumnType, r
 			return true
 		}
 	}
-	if !a.rewriteRefOfLiteral(node, node.Length, func(newNode, parent SQLNode) {
-		parent.(*ColumnType).Length = newNode.(*Literal)
-	}) {
-		return false
-	}
-	if !a.rewriteRefOfLiteral(node, node.Scale, func(newNode, parent SQLNode) {
-		parent.(*ColumnType).Scale = newNode.(*Literal)
-	}) {
-		return false
-	}
 	if a.post != nil {
-		a.cur.replacer = replacer
-		a.cur.parent = parent
-		a.cur.node = node
+		if a.pre == nil {
+			a.cur.replacer = replacer
+			a.cur.parent = parent
+			a.cur.node = node
+		}
 		if !a.post(&a.cur) {
 			return false
 		}
@@ -2057,20 +2074,12 @@ func (a *application) rewriteRefOfConvertType(parent SQLNode, node *ConvertType,
 			return true
 		}
 	}
-	if !a.rewriteRefOfLiteral(node, node.Length, func(newNode, parent SQLNode) {
-		parent.(*ConvertType).Length = newNode.(*Literal)
-	}) {
-		return false
-	}
-	if !a.rewriteRefOfLiteral(node, node.Scale, func(newNode, parent SQLNode) {
-		parent.(*ConvertType).Scale = newNode.(*Literal)
-	}) {
-		return false
-	}
 	if a.post != nil {
-		a.cur.replacer = replacer
-		a.cur.parent = parent
-		a.cur.node = node
+		if a.pre == nil {
+			a.cur.replacer = replacer
+			a.cur.parent = parent
+			a.cur.node = node
+		}
 		if !a.post(&a.cur) {
 			return false
 		}
@@ -2430,13 +2439,17 @@ func (a *application) rewriteRefOfDelete(parent SQLNode, node *Delete, replacer 
 	}) {
 		return false
 	}
+	for x, el := range node.TableExprs {
+		if !a.rewriteTableExpr(node, el, func(idx int) replacerFunc {
+			return func(newNode, parent SQLNode) {
+				parent.(*Delete).TableExprs[idx] = newNode.(TableExpr)
+			}
+		}(x)) {
+			return false
+		}
+	}
 	if !a.rewriteTableNames(node, node.Targets, func(newNode, parent SQLNode) {
 		parent.(*Delete).Targets = newNode.(TableNames)
-	}) {
-		return false
-	}
-	if !a.rewriteTableExprs(node, node.TableExprs, func(newNode, parent SQLNode) {
-		parent.(*Delete).TableExprs = newNode.(TableExprs)
 	}) {
 		return false
 	}
@@ -2885,53 +2898,6 @@ func (a *application) rewriteRefOfExtractValueExpr(parent SQLNode, node *Extract
 	}
 	return true
 }
-func (a *application) rewriteRefOfExtractedSubquery(parent SQLNode, node *ExtractedSubquery, replacer replacerFunc) bool {
-	if node == nil {
-		return true
-	}
-	if a.pre != nil {
-		a.cur.replacer = replacer
-		a.cur.parent = parent
-		a.cur.node = node
-		kontinue := !a.pre(&a.cur)
-		if a.cur.revisit {
-			a.cur.revisit = false
-			return a.rewriteExpr(parent, a.cur.node.(Expr), replacer)
-		}
-		if kontinue {
-			return true
-		}
-	}
-	if !a.rewriteExpr(node, node.Original, func(newNode, parent SQLNode) {
-		parent.(*ExtractedSubquery).Original = newNode.(Expr)
-	}) {
-		return false
-	}
-	if !a.rewriteRefOfSubquery(node, node.Subquery, func(newNode, parent SQLNode) {
-		parent.(*ExtractedSubquery).Subquery = newNode.(*Subquery)
-	}) {
-		return false
-	}
-	if !a.rewriteExpr(node, node.OtherSide, func(newNode, parent SQLNode) {
-		parent.(*ExtractedSubquery).OtherSide = newNode.(Expr)
-	}) {
-		return false
-	}
-	if !a.rewriteExpr(node, node.alternative, func(newNode, parent SQLNode) {
-		parent.(*ExtractedSubquery).alternative = newNode.(Expr)
-	}) {
-		return false
-	}
-	if a.post != nil {
-		a.cur.replacer = replacer
-		a.cur.parent = parent
-		a.cur.node = node
-		if !a.post(&a.cur) {
-			return false
-		}
-	}
-	return true
-}
 func (a *application) rewriteRefOfFirstOrLastValueExpr(parent SQLNode, node *FirstOrLastValueExpr, replacer replacerFunc) bool {
 	if node == nil {
 		return true
@@ -3172,8 +3138,8 @@ func (a *application) rewriteRefOfFuncExpr(parent SQLNode, node *FuncExpr, repla
 	}) {
 		return false
 	}
-	if !a.rewriteSelectExprs(node, node.Exprs, func(newNode, parent SQLNode) {
-		parent.(*FuncExpr).Exprs = newNode.(SelectExprs)
+	if !a.rewriteExprs(node, node.Exprs, func(newNode, parent SQLNode) {
+		parent.(*FuncExpr).Exprs = newNode.(Exprs)
 	}) {
 		return false
 	}
@@ -6245,30 +6211,6 @@ func (a *application) rewriteRefOfOtherAdmin(parent SQLNode, node *OtherAdmin, r
 	}
 	return true
 }
-func (a *application) rewriteRefOfOtherRead(parent SQLNode, node *OtherRead, replacer replacerFunc) bool {
-	if node == nil {
-		return true
-	}
-	if a.pre != nil {
-		a.cur.replacer = replacer
-		a.cur.parent = parent
-		a.cur.node = node
-		if !a.pre(&a.cur) {
-			return true
-		}
-	}
-	if a.post != nil {
-		if a.pre == nil {
-			a.cur.replacer = replacer
-			a.cur.parent = parent
-			a.cur.node = node
-		}
-		if !a.post(&a.cur) {
-			return false
-		}
-	}
-	return true
-}
 func (a *application) rewriteRefOfOverClause(parent SQLNode, node *OverClause, replacer replacerFunc) bool {
 	if node == nil {
 		return true
@@ -7390,6 +7332,11 @@ func (a *application) rewriteRefOfSelect(parent SQLNode, node *Select, replacer 
 			return true
 		}
 	}
+	if !a.rewriteRefOfWith(node, node.With, func(newNode, parent SQLNode) {
+		parent.(*Select).With = newNode.(*With)
+	}) {
+		return false
+	}
 	for x, el := range node.From {
 		if !a.rewriteTableExpr(node, el, func(idx int) replacerFunc {
 			return func(newNode, parent SQLNode) {
@@ -7411,11 +7358,6 @@ func (a *application) rewriteRefOfSelect(parent SQLNode, node *Select, replacer 
 	}
 	if !a.rewriteRefOfWhere(node, node.Where, func(newNode, parent SQLNode) {
 		parent.(*Select).Where = newNode.(*Where)
-	}) {
-		return false
-	}
-	if !a.rewriteRefOfWith(node, node.With, func(newNode, parent SQLNode) {
-		parent.(*Select).With = newNode.(*With)
 	}) {
 		return false
 	}
@@ -8640,6 +8582,11 @@ func (a *application) rewriteRefOfUnion(parent SQLNode, node *Union, replacer re
 			return true
 		}
 	}
+	if !a.rewriteRefOfWith(node, node.With, func(newNode, parent SQLNode) {
+		parent.(*Union).With = newNode.(*With)
+	}) {
+		return false
+	}
 	if !a.rewriteSelectStatement(node, node.Left, func(newNode, parent SQLNode) {
 		parent.(*Union).Left = newNode.(SelectStatement)
 	}) {
@@ -8652,11 +8599,6 @@ func (a *application) rewriteRefOfUnion(parent SQLNode, node *Union, replacer re
 	}
 	if !a.rewriteOrderBy(node, node.OrderBy, func(newNode, parent SQLNode) {
 		parent.(*Union).OrderBy = newNode.(OrderBy)
-	}) {
-		return false
-	}
-	if !a.rewriteRefOfWith(node, node.With, func(newNode, parent SQLNode) {
-		parent.(*Union).With = newNode.(*With)
 	}) {
 		return false
 	}
@@ -8726,10 +8668,14 @@ func (a *application) rewriteRefOfUpdate(parent SQLNode, node *Update, replacer 
 	}) {
 		return false
 	}
-	if !a.rewriteTableExprs(node, node.TableExprs, func(newNode, parent SQLNode) {
-		parent.(*Update).TableExprs = newNode.(TableExprs)
-	}) {
-		return false
+	for x, el := range node.TableExprs {
+		if !a.rewriteTableExpr(node, el, func(idx int) replacerFunc {
+			return func(newNode, parent SQLNode) {
+				parent.(*Update).TableExprs[idx] = newNode.(TableExpr)
+			}
+		}(x)) {
+			return false
+		}
 	}
 	if !a.rewriteUpdateExprs(node, node.Exprs, func(newNode, parent SQLNode) {
 		parent.(*Update).Exprs = newNode.(UpdateExprs)
@@ -9520,10 +9466,10 @@ func (a *application) rewriteRefOfWith(parent SQLNode, node *With, replacer repl
 			return true
 		}
 	}
-	for x, el := range node.ctes {
+	for x, el := range node.CTEs {
 		if !a.rewriteRefOfCommonTableExpr(node, el, func(idx int) replacerFunc {
 			return func(newNode, parent SQLNode) {
-				parent.(*With).ctes[idx] = newNode.(*CommonTableExpr)
+				parent.(*With).CTEs[idx] = newNode.(*CommonTableExpr)
 			}
 		}(x)) {
 			return false
@@ -9987,8 +9933,6 @@ func (a *application) rewriteExpr(parent SQLNode, node Expr, replacer replacerFu
 		return a.rewriteRefOfExtractFuncExpr(parent, node, replacer)
 	case *ExtractValueExpr:
 		return a.rewriteRefOfExtractValueExpr(parent, node, replacer)
-	case *ExtractedSubquery:
-		return a.rewriteRefOfExtractedSubquery(parent, node, replacer)
 	case *FirstOrLastValueExpr:
 		return a.rewriteRefOfFirstOrLastValueExpr(parent, node, replacer)
 	case *FuncExpr:
@@ -10261,6 +10205,8 @@ func (a *application) rewriteStatement(parent SQLNode, node Statement, replacer 
 		return a.rewriteRefOfAlterView(parent, node, replacer)
 	case *AlterVschema:
 		return a.rewriteRefOfAlterVschema(parent, node, replacer)
+	case *Analyze:
+		return a.rewriteRefOfAnalyze(parent, node, replacer)
 	case *Begin:
 		return a.rewriteRefOfBegin(parent, node, replacer)
 	case *CallProc:
@@ -10303,8 +10249,6 @@ func (a *application) rewriteStatement(parent SQLNode, node Statement, replacer 
 		return a.rewriteRefOfLockTables(parent, node, replacer)
 	case *OtherAdmin:
 		return a.rewriteRefOfOtherAdmin(parent, node, replacer)
-	case *OtherRead:
-		return a.rewriteRefOfOtherRead(parent, node, replacer)
 	case *PrepareStmt:
 		return a.rewriteRefOfPrepareStmt(parent, node, replacer)
 	case *PurgeBinaryLogs:

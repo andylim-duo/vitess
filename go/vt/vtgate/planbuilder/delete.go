@@ -18,13 +18,11 @@ package planbuilder
 
 import (
 	querypb "vitess.io/vitess/go/vt/proto/query"
-	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/operators"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
-	"vitess.io/vitess/go/vt/vtgate/semantics"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
 )
 
@@ -51,26 +49,28 @@ func gen4DeleteStmtPlanner(
 		return nil, err
 	}
 
-	err = rewriteRoutedTables(deleteStmt, vschema)
+	err = queryRewrite(ctx.SemTable, reservedVars, deleteStmt)
+	if err != nil {
+		return nil, err
+	}
+
+	// Remove all the foreign keys that don't require any handling.
+	err = ctx.SemTable.RemoveNonRequiredForeignKeys(ctx.VerifyAllFKs, vindexes.DeleteAction)
 	if err != nil {
 		return nil, err
 	}
 
 	if ks, tables := ctx.SemTable.SingleUnshardedKeyspace(); ks != nil {
-		if fkManagementNotRequired(ctx, vschema, tables) {
+		if !ctx.SemTable.ForeignKeysPresent() {
 			plan := deleteUnshardedShortcut(deleteStmt, ks, tables)
-			plan = pushCommentDirectivesOnPlan(plan, deleteStmt)
 			return newPlanResult(plan.Primitive(), operators.QualifiedTables(ks, tables)...), nil
 		}
 	}
 
-	if err := checkIfDeleteSupported(deleteStmt, ctx.SemTable); err != nil {
-		return nil, err
-	}
-
-	err = queryRewrite(ctx.SemTable, reservedVars, deleteStmt)
-	if err != nil {
-		return nil, err
+	// error out here if delete query cannot bypass the planner and
+	// planner cannot plan such query due to different reason like missing full information, etc.
+	if ctx.SemTable.NotUnshardedErr != nil {
+		return nil, ctx.SemTable.NotUnshardedErr
 	}
 
 	op, err := operators.PlanQuery(ctx, deleteStmt)
@@ -83,33 +83,7 @@ func gen4DeleteStmtPlanner(
 		return nil, err
 	}
 
-	plan = pushCommentDirectivesOnPlan(plan, deleteStmt)
-
-	setLockOnAllSelect(plan)
-
-	if err := plan.Wireup(ctx); err != nil {
-		return nil, err
-	}
-
 	return newPlanResult(plan.Primitive(), operators.TablesUsed(op)...), nil
-}
-
-func fkManagementNotRequired(ctx *plancontext.PlanningContext, vschema plancontext.VSchema, vTables []*vindexes.Table) bool {
-	// Find the foreign key mode and check for any managed child foreign keys.
-	for _, vTable := range vTables {
-		ksMode, err := vschema.ForeignKeyMode(vTable.Keyspace.Name)
-		if err != nil {
-			return false
-		}
-		if ksMode != vschemapb.Keyspace_FK_MANAGED {
-			continue
-		}
-		childFks := vTable.ChildFKsNeedsHandling(ctx.VerifyAllFKs, vindexes.DeleteAction)
-		if len(childFks) > 0 {
-			return false
-		}
-	}
-	return true
 }
 
 func rewriteSingleTbl(del *sqlparser.Delete) (*sqlparser.Delete, error) {
@@ -117,7 +91,7 @@ func rewriteSingleTbl(del *sqlparser.Delete) (*sqlparser.Delete, error) {
 	if !ok {
 		return del, nil
 	}
-	if !atExpr.As.IsEmpty() && !sqlparser.Equals.IdentifierCS(del.Targets[0].Name, atExpr.As) {
+	if atExpr.As.NotEmpty() && !sqlparser.Equals.IdentifierCS(del.Targets[0].Name, atExpr.As) {
 		// Unknown table in MULTI DELETE
 		return nil, vterrors.VT03003(del.Targets[0].Name.String())
 	}
@@ -158,41 +132,4 @@ func deleteUnshardedShortcut(stmt *sqlparser.Delete, ks *vindexes.Keyspace, tabl
 		edml.TableNames = append(edml.TableNames, tbl.Name.String())
 	}
 	return &primitiveWrapper{prim: &engine.Delete{DML: edml}}
-}
-
-// checkIfDeleteSupported checks if the delete query is supported or we must return an error.
-func checkIfDeleteSupported(del *sqlparser.Delete, semTable *semantics.SemTable) error {
-	if semTable.NotUnshardedErr != nil {
-		return semTable.NotUnshardedErr
-	}
-
-	// Delete is only supported for a single TableExpr which is supposed to be an aliased expression
-	multiShardErr := vterrors.VT12001("multi-shard or vindex write statement")
-	if len(del.TableExprs) != 1 {
-		return multiShardErr
-	}
-	_, isAliasedExpr := del.TableExprs[0].(*sqlparser.AliasedTableExpr)
-	if !isAliasedExpr {
-		return multiShardErr
-	}
-
-	if len(del.Targets) > 1 {
-		return vterrors.VT12001("multi-table DELETE statement in a sharded keyspace")
-	}
-
-	err := sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
-		switch node.(type) {
-		case *sqlparser.Subquery, *sqlparser.DerivedTable:
-			// We have a subquery, so we must fail the planning.
-			// If this subquery and the table expression were all belonging to the same unsharded keyspace,
-			// we would have already created a plan for them before doing these checks.
-			return false, vterrors.VT12001("subqueries in DML")
-		}
-		return true, nil
-	}, del)
-	if err != nil {
-		return err
-	}
-
-	return nil
 }

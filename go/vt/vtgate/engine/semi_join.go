@@ -43,7 +43,7 @@ type SemiJoin struct {
 
 	// Vars defines the list of SemiJoinVars that need to
 	// be built from the LHS result before invoking
-	// the RHS subqquery.
+	// the RHS subquery.
 	Vars map[string]int `json:",omitempty"`
 }
 
@@ -151,6 +151,9 @@ func projectFields(lfields []*querypb.Field, cols []int) []*querypb.Field {
 	if lfields == nil {
 		return nil
 	}
+	if len(cols) == 0 {
+		return lfields
+	}
 	fields := make([]*querypb.Field, len(cols))
 	for i, index := range cols {
 		fields[i] = lfields[-index-1]
@@ -159,6 +162,9 @@ func projectFields(lfields []*querypb.Field, cols []int) []*querypb.Field {
 }
 
 func projectRows(lrow []sqltypes.Value, cols []int) []sqltypes.Value {
+	if len(cols) == 0 {
+		return lrow
+	}
 	row := make([]sqltypes.Value, len(cols))
 	for i, index := range cols {
 		if index < 0 {

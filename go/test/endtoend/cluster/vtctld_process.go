@@ -66,12 +66,29 @@ func (vtctld *VtctldProcess) Setup(cell string, extraArgs ...string) (err error)
 		"--port", fmt.Sprintf("%d", vtctld.Port),
 		"--grpc_port", fmt.Sprintf("%d", vtctld.GrpcPort),
 	)
+
+	if v, err := GetMajorVersion("vtctld"); err != nil {
+		return err
+	} else if v >= 18 {
+		vtctld.proc.Args = append(vtctld.proc.Args, "--bind-address", "127.0.0.1")
+		vtctld.proc.Args = append(vtctld.proc.Args, "--grpc_bind_address", "127.0.0.1")
+	}
+
 	if *isCoverage {
 		vtctld.proc.Args = append(vtctld.proc.Args, "--test.coverprofile="+getCoveragePath("vtctld.out"))
 	}
 	vtctld.proc.Args = append(vtctld.proc.Args, extraArgs...)
 
-	errFile, _ := os.Create(path.Join(vtctld.LogDir, "vtctld-stderr.txt"))
+	err = os.MkdirAll(vtctld.LogDir, 0755)
+	if err != nil {
+		log.Errorf("cannot create log directory for vtctld: %v", err)
+		return err
+	}
+	errFile, err := os.Create(path.Join(vtctld.LogDir, "vtctld-stderr.txt"))
+	if err != nil {
+		log.Errorf("cannot create error log file for vtctld: %v", err)
+		return err
+	}
 	vtctld.proc.Stderr = errFile
 	vtctld.ErrorLog = errFile.Name()
 
