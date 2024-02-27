@@ -15,7 +15,8 @@
               "Sharded": false
             },
             "TargetDestination": "AllShards()",
-            "Query": "flush local tables unsharded_a with read lock"
+            "Query": "flush local tables unsharded_a with read lock",
+            "ReservedConnectionNeeded": true
           },
           {
             "OperatorType": "Send",
@@ -24,7 +25,8 @@
               "Sharded": true
             },
             "TargetDestination": "AllShards()",
-            "Query": "flush local tables `user`, user_extra with read lock"
+            "Query": "flush local tables `user`, user_extra with read lock",
+            "ReservedConnectionNeeded": true
           }
         ]
       },
@@ -38,7 +40,19 @@
   {
     "comment": "Flush statement with flush options",
     "query": "flush no_write_to_binlog hosts, logs",
-    "plan": "VT03007: keyspace not specified"
+    "plan": {
+      "QueryType": "FLUSH",
+      "Original": "flush no_write_to_binlog hosts, logs",
+      "Instructions": {
+        "OperatorType": "Send",
+        "Keyspace": {
+          "Name": "main",
+          "Sharded": false
+        },
+        "TargetDestination": "AllShards()",
+        "Query": "flush local hosts, logs"
+      }
+    }
   },
   {
     "comment": "Flush statement with routing rules",
@@ -93,7 +107,8 @@
           "Sharded": false
         },
         "TargetDestination": "AllShards()",
-        "Query": "flush tables a with read lock"
+        "Query": "flush tables a with read lock",
+        "ReservedConnectionNeeded": true
       },
       "TablesUsed": [
         "main.a"
@@ -116,7 +131,8 @@
               "Sharded": false
             },
             "TargetDestination": "AllShards()",
-            "Query": "flush local tables unsharded_a with read lock"
+            "Query": "flush local tables unsharded_a with read lock",
+            "ReservedConnectionNeeded": true
           },
           {
             "OperatorType": "Send",
@@ -125,7 +141,8 @@
               "Sharded": false
             },
             "TargetDestination": "AllShards()",
-            "Query": "flush local tables unsharded_tab with read lock"
+            "Query": "flush local tables unsharded_tab with read lock",
+            "ReservedConnectionNeeded": true
           },
           {
             "OperatorType": "Send",
@@ -134,7 +151,8 @@
               "Sharded": true
             },
             "TargetDestination": "AllShards()",
-            "Query": "flush local tables `user`, user_extra with read lock"
+            "Query": "flush local tables `user`, user_extra with read lock",
+            "ReservedConnectionNeeded": true
           }
         ]
       },

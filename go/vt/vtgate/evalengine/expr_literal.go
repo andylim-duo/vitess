@@ -28,29 +28,37 @@ type (
 	}
 )
 
+var _ IR = (*Literal)(nil)
 var _ Expr = (*Literal)(nil)
 
-// eval implements the Expr interface
+func (l *Literal) IR() IR {
+	return l
+}
+
+func (l *Literal) IsExpr() {}
+
+// eval implements the expression interface
 func (l *Literal) eval(_ *ExpressionEnv) (eval, error) {
 	return l.inner, nil
 }
 
 // typeof implements the Expr interface
-func (l *Literal) typeof(*ExpressionEnv) (sqltypes.Type, typeFlag) {
+func (l *Literal) typeof(*ExpressionEnv) (ctype, error) {
 	var f typeFlag
 	switch e := l.inner.(type) {
 	case nil:
-		return sqltypes.Null, flagNull | flagNullable
+		return ctype{Type: sqltypes.Null, Flag: flagNull | flagNullable, Col: collationNull}, nil
 	case *evalBytes:
-		if e.isBitLiteral {
-			f |= flagBit
-		}
-		if e.isHexLiteral {
-			f |= flagHex
-		}
+		f = e.flag
 	case *evalInt64:
 		if e.i == math.MinInt64 {
 			f |= flagIntegerUdf
+		}
+		if e == evalBoolTrue || e == evalBoolFalse {
+			f |= flagIsBoolean
+		}
+		if e.bitLiteral {
+			f |= flagBit
 		}
 	case *evalUint64:
 		if e.hexLiteral {
@@ -62,6 +70,19 @@ func (l *Literal) typeof(*ExpressionEnv) (sqltypes.Type, typeFlag) {
 		if e.u > math.MaxInt64+1 {
 			f |= flagIntegerOvf
 		}
+	case *evalTemporal:
+		return ctype{Type: e.t, Col: collationNumeric, Size: int32(e.prec)}, nil
+	case *evalDecimal:
+		return ctype{Type: sqltypes.Decimal, Col: collationNumeric, Size: e.length, Scale: -e.dec.Exponent()}, nil
 	}
-	return l.inner.SQLType(), f
+	return ctype{Type: l.inner.SQLType(), Flag: f, Col: evalCollation(l.inner)}, nil
+}
+
+func (l *Literal) compile(c *compiler) (ctype, error) {
+	if l.inner == nil {
+		c.asm.PushNull()
+	} else if err := c.asm.PushLiteral(l.inner); err != nil {
+		return ctype{}, err
+	}
+	return l.typeof(nil)
 }

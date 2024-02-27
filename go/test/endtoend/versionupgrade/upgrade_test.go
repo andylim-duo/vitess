@@ -88,7 +88,8 @@ func TestMain(m *testing.M) {
 		clusterInstance.VtctldExtraArgs = []string{
 			"--schema_change_dir", schemaChangeDirectory,
 			"--schema_change_controller", "local",
-			"--schema_change_check_interval", "1"}
+			"--schema_change_check_interval", "1s",
+		}
 
 		if err := clusterInstance.StartTopo(); err != nil {
 			return 1, err
@@ -106,9 +107,6 @@ func TestMain(m *testing.M) {
 			return 1, err
 		}
 
-		// TODO: remove this once we upgrade to v12
-		// setting the planner version to 0, so the vtgate binary's default is used
-		clusterInstance.VtGatePlannerVersion = 0
 		vtgateInstance := clusterInstance.NewVtgateInstance()
 		// Start vtgate
 		if err := vtgateInstance.Setup(); err != nil {
@@ -150,7 +148,7 @@ func TestDeploySchema(t *testing.T) {
 
 		{
 			sqlQuery := fmt.Sprintf(createTable, tableName)
-			result, err := clusterInstance.VtctlclientProcess.ApplySchemaWithOutput(keyspaceName, sqlQuery, cluster.VtctlClientParams{DDLStrategy: ""})
+			result, err := clusterInstance.VtctldClientProcess.ApplySchemaWithOutput(keyspaceName, sqlQuery, cluster.ApplySchemaParams{DDLStrategy: ""})
 			require.Nil(t, err, result)
 		}
 		for i := range clusterInstance.Keyspaces[0].Shards {

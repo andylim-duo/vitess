@@ -18,10 +18,11 @@ package tabletserver
 
 import (
 	"context"
-	"html/template"
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/google/safehtml"
 
 	"vitess.io/vitess/go/streamlog"
 	"vitess.io/vitess/go/vt/callinfo"
@@ -56,13 +57,16 @@ type QueryList struct {
 	// so have to maintain a list to compare with the actual connection.
 	// and remove appropriately.
 	queryDetails map[int64][]*QueryDetail
+
+	parser *sqlparser.Parser
 }
 
 // NewQueryList creates a new QueryList
-func NewQueryList(name string) *QueryList {
+func NewQueryList(name string, parser *sqlparser.Parser) *QueryList {
 	return &QueryList{
 		name:         name,
 		queryDetails: make(map[int64][]*QueryDetail),
+		parser:       parser,
 	}
 }
 
@@ -128,7 +132,7 @@ func (ql *QueryList) TerminateAll() {
 type QueryDetailzRow struct {
 	Type              string
 	Query             string
-	ContextHTML       template.HTML
+	ContextHTML       safehtml.HTML
 	Start             time.Time
 	Duration          time.Duration
 	ConnID            int64
@@ -149,7 +153,7 @@ func (ql *QueryList) AppendQueryzRows(rows []QueryDetailzRow) []QueryDetailzRow 
 		for _, qd := range qds {
 			query := qd.conn.Current()
 			if streamlog.GetRedactDebugUIQueries() {
-				query, _ = sqlparser.RedactSQLQuery(query)
+				query, _ = ql.parser.RedactSQLQuery(query)
 			}
 			row := QueryDetailzRow{
 				Type:        ql.name,

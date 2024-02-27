@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -52,8 +53,6 @@ var (
 					) Engine=InnoDB
 `
 	commonTabletArg = []string{
-		"--vreplication_healthcheck_topology_refresh", "1s",
-		"--vreplication_healthcheck_retry_delay", "1s",
 		"--vreplication_retry_delay", "1s",
 		"--degraded_threshold", "5s",
 		"--lock_tables_timeout", "5s",
@@ -132,7 +131,11 @@ func TestMain(m *testing.M) {
 
 		var mysqlProcs []*exec.Cmd
 		for _, tablet := range []*cluster.Vttablet{shard1Primary, shard1Replica, shard1Rdonly, shard2Primary, shard2Replica, shard2Rdonly} {
-			tablet.MysqlctlProcess = *cluster.MysqlCtlProcessInstance(tablet.TabletUID, tablet.MySQLPort, localCluster.TmpDirectory)
+			mysqlctlProcess, err := cluster.MysqlCtlProcessInstance(tablet.TabletUID, tablet.MySQLPort, localCluster.TmpDirectory)
+			if err != nil {
+				return 1, err
+			}
+			tablet.MysqlctlProcess = *mysqlctlProcess
 			tablet.VttabletProcess = cluster.VttabletProcessInstance(tablet.HTTPPort,
 				tablet.GrpcPort,
 				tablet.TabletUID,
@@ -183,14 +186,14 @@ func TestMain(m *testing.M) {
 				return 1, err
 			}
 		}
-		if err := localCluster.VtctlclientProcess.InitializeShard(keyspaceName, shard1.Name, shard1Primary.Cell, shard1Primary.TabletUID); err != nil {
+		if err := localCluster.VtctldClientProcess.InitializeShard(keyspaceName, shard1.Name, shard1Primary.Cell, shard1Primary.TabletUID); err != nil {
 			return 1, err
 		}
 
 		// run a health check on source replica so it responds to discovery
 		// (for binlog players) and on the source rdonlys (for workers)
 		for _, tablet := range []string{shard1Replica.Alias, shard1Rdonly.Alias} {
-			if err := localCluster.VtctlclientProcess.ExecuteCommand("RunHealthCheck", tablet); err != nil {
+			if err := localCluster.VtctldClientProcess.ExecuteCommand("RunHealthCheck", tablet); err != nil {
 				return 1, err
 			}
 		}
@@ -201,7 +204,7 @@ func TestMain(m *testing.M) {
 			}
 		}
 
-		if err := localCluster.VtctlclientProcess.InitializeShard(keyspaceName, shard2.Name, shard2Primary.Cell, shard2Primary.TabletUID); err != nil {
+		if err := localCluster.VtctldClientProcess.InitializeShard(keyspaceName, shard2.Name, shard2Primary.Cell, shard2Primary.TabletUID); err != nil {
 			return 1, err
 		}
 
@@ -209,14 +212,14 @@ func TestMain(m *testing.M) {
 			return 1, err
 		}
 
-		if err := localCluster.VtctlclientProcess.ApplySchema(keyspaceName, fmt.Sprintf(sqlSchema, tableName)); err != nil {
+		if err := localCluster.VtctldClientProcess.ApplySchema(keyspaceName, fmt.Sprintf(sqlSchema, tableName)); err != nil {
 			return 1, err
 		}
-		if err := localCluster.VtctlclientProcess.ApplyVSchema(keyspaceName, fmt.Sprintf(vSchema, tableName)); err != nil {
+		if err := localCluster.VtctldClientProcess.ApplyVSchema(keyspaceName, fmt.Sprintf(vSchema, tableName)); err != nil {
 			return 1, err
 		}
 
-		_ = localCluster.VtctlclientProcess.ExecuteCommand("RebuildKeyspaceGraph", keyspaceName)
+		_ = localCluster.VtctldClientProcess.ExecuteCommand("RebuildKeyspaceGraph", keyspaceName)
 
 		return m.Run(), nil
 	}()
@@ -234,7 +237,7 @@ func TestAlias(t *testing.T) {
 	insertInitialValues(t)
 	defer deleteInitialValues(t)
 
-	err := localCluster.VtctlclientProcess.ExecuteCommand("RebuildKeyspaceGraph", keyspaceName)
+	err := localCluster.VtctldClientProcess.ExecuteCommand("RebuildKeyspaceGraph", keyspaceName)
 	require.NoError(t, err)
 	shard1 := localCluster.Keyspaces[0].Shards[0]
 	shard2 := localCluster.Keyspaces[0].Shards[1]
@@ -248,11 +251,11 @@ func TestAlias(t *testing.T) {
 	cluster.CheckSrvKeyspace(t, cell2, keyspaceName, expectedPartitions, *localCluster)
 
 	// Adds alias so vtgate can route to replica/rdonly tablets that are not in the same cell, but same alias
-	err = localCluster.VtctlclientProcess.ExecuteCommand("AddCellsAlias", "--",
+	err = localCluster.VtctldClientProcess.ExecuteCommand("AddCellsAlias",
 		"--cells", allCells,
 		"region_east_coast")
 	require.NoError(t, err)
-	err = localCluster.VtctlclientProcess.ExecuteCommand("UpdateCellsAlias", "--",
+	err = localCluster.VtctldClientProcess.ExecuteCommand("UpdateCellsAlias",
 		"--cells", allCells,
 		"region_east_coast")
 	require.NoError(t, err)
@@ -274,7 +277,7 @@ func TestAlias(t *testing.T) {
 	testQueriesOnTabletType(t, "rdonly", vtgateInstance.GrpcPort, false)
 
 	// now, delete the alias, so that if we run above assertions again, it will fail for replica,rdonly target type
-	err = localCluster.VtctlclientProcess.ExecuteCommand("DeleteCellsAlias",
+	err = localCluster.VtctldClientProcess.ExecuteCommand("DeleteCellsAlias",
 		"region_east_coast")
 	require.NoError(t, err)
 
@@ -298,7 +301,7 @@ func TestAddAliasWhileVtgateUp(t *testing.T) {
 	insertInitialValues(t)
 	defer deleteInitialValues(t)
 
-	err := localCluster.VtctlclientProcess.ExecuteCommand("RebuildKeyspaceGraph", keyspaceName)
+	err := localCluster.VtctldClientProcess.ExecuteCommand("RebuildKeyspaceGraph", keyspaceName)
 	require.NoError(t, err)
 	shard1 := localCluster.Keyspaces[0].Shards[0]
 	shard2 := localCluster.Keyspaces[0].Shards[1]
@@ -325,7 +328,7 @@ func TestAddAliasWhileVtgateUp(t *testing.T) {
 	testQueriesOnTabletType(t, "rdonly", vtgateInstance.GrpcPort, true)
 
 	// Adds alias so vtgate can route to replica/rdonly tablets that are not in the same cell, but same alias
-	err = localCluster.VtctlclientProcess.ExecuteCommand("AddCellsAlias", "--",
+	err = localCluster.VtctldClientProcess.ExecuteCommand("AddCellsAlias",
 		"--cells", allCells,
 		"region_east_coast")
 	require.NoError(t, err)
@@ -339,12 +342,9 @@ func TestAddAliasWhileVtgateUp(t *testing.T) {
 
 func waitTillAllTabletsAreHealthyInVtgate(t *testing.T, vtgateInstance cluster.VtgateProcess, shards ...string) {
 	for _, shard := range shards {
-		err := vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.primary", keyspaceName, shard), 1)
-		require.Nil(t, err)
-		err = vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.replica", keyspaceName, shard), 1)
-		require.Nil(t, err)
-		err = vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.rdonly", keyspaceName, shard), 1)
-		require.Nil(t, err)
+		require.NoError(t, vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.primary", keyspaceName, shard), 1, 30*time.Second))
+		require.NoError(t, vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.replica", keyspaceName, shard), 1, 30*time.Second))
+		require.NoError(t, vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.rdonly", keyspaceName, shard), 1, 30*time.Second))
 	}
 }
 

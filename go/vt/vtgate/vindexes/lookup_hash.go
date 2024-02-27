@@ -21,41 +21,52 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"vitess.io/vitess/go/vt/vtgate/evalengine"
-
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
+	"vitess.io/vitess/go/vt/vterrors"
+)
+
+const (
+	lookupHashParamWriteOnly = "write_only"
 )
 
 var (
-	_ SingleColumn   = (*LookupHash)(nil)
-	_ Lookup         = (*LookupHash)(nil)
-	_ LookupPlanable = (*LookupHash)(nil)
-	_ SingleColumn   = (*LookupHashUnique)(nil)
-	_ Lookup         = (*LookupHashUnique)(nil)
-	_ LookupPlanable = (*LookupHashUnique)(nil)
+	_ SingleColumn    = (*LookupHash)(nil)
+	_ Lookup          = (*LookupHash)(nil)
+	_ LookupPlanable  = (*LookupHash)(nil)
+	_ ParamValidating = (*LookupHash)(nil)
+	_ SingleColumn    = (*LookupHashUnique)(nil)
+	_ Lookup          = (*LookupHashUnique)(nil)
+	_ LookupPlanable  = (*LookupHashUnique)(nil)
+	_ ParamValidating = (*LookupHashUnique)(nil)
+
+	lookupHashParams = append(
+		append(make([]string, 0), lookupCommonParams...),
+		lookupHashParamWriteOnly,
+	)
 )
 
 func init() {
-	Register("lookup_hash", NewLookupHash)
-	Register("lookup_hash_unique", NewLookupHashUnique)
+	Register("lookup_hash", newLookupHash)
+	Register("lookup_hash_unique", newLookupHashUnique)
 }
 
-//====================================================================
+// ====================================================================
 
 // LookupHash defines a vindex that uses a lookup table.
 // The table is expected to define the id column as unique. It's
 // NonUnique and a Lookup.
 // Warning: This Vindex is being deprecated in favor of Lookup
 type LookupHash struct {
-	name      string
-	writeOnly bool
-	lkp       lookupInternal
+	name          string
+	writeOnly     bool
+	lkp           lookupInternal
+	unknownParams []string
 }
 
-// NewLookupHash creates a LookupHash vindex.
+// newLookupHash creates a LookupHash vindex.
 // The supplied map has the following required fields:
 //
 //	table: name of the backing table. It can be qualified by the keyspace.
@@ -66,14 +77,17 @@ type LookupHash struct {
 //
 //	autocommit: setting this to "true" will cause inserts to upsert and deletes to be ignored.
 //	write_only: in this mode, Map functions return the full keyrange causing a full scatter.
-func NewLookupHash(name string, m map[string]string) (Vindex, error) {
-	lh := &LookupHash{name: name}
+func newLookupHash(name string, m map[string]string) (Vindex, error) {
+	lh := &LookupHash{
+		name:          name,
+		unknownParams: FindUnknownParams(m, lookupHashParams),
+	}
 
 	cc, err := parseCommonConfig(m)
 	if err != nil {
 		return nil, err
 	}
-	lh.writeOnly, err = boolFromMap(m, "write_only")
+	lh.writeOnly, err = boolFromMap(m, lookupHashParamWriteOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +162,7 @@ func (lh *LookupHash) MapResult(ids []sqltypes.Value, results []*sqltypes.Result
 		}
 		ksids := make([][]byte, 0, len(result.Rows))
 		for _, row := range result.Rows {
-			num, err := evalengine.ToUint64(row[0])
+			num, err := row[0].ToCastUint64()
 			if err != nil {
 				// A failure to convert is equivalent to not being
 				// able to map.
@@ -192,7 +206,7 @@ func (lh *LookupHash) Verify(ctx context.Context, vcursor VCursor, ids []sqltype
 
 	values, err := unhashList(ksids)
 	if err != nil {
-		return nil, fmt.Errorf("lookup.Verify.vunhash: %v", err)
+		return nil, vterrors.Wrap(err, "lookup.Verify.vunhash")
 	}
 	return lh.lkp.Verify(ctx, vcursor, ids, values)
 }
@@ -201,7 +215,7 @@ func (lh *LookupHash) Verify(ctx context.Context, vcursor VCursor, ids []sqltype
 func (lh *LookupHash) Create(ctx context.Context, vcursor VCursor, rowsColValues [][]sqltypes.Value, ksids [][]byte, ignoreMode bool) error {
 	values, err := unhashList(ksids)
 	if err != nil {
-		return fmt.Errorf("lookup.Create.vunhash: %v", err)
+		return vterrors.Wrap(err, "lookup.Create.vunhash")
 	}
 	return lh.lkp.Create(ctx, vcursor, rowsColValues, values, ignoreMode)
 }
@@ -210,7 +224,7 @@ func (lh *LookupHash) Create(ctx context.Context, vcursor VCursor, rowsColValues
 func (lh *LookupHash) Update(ctx context.Context, vcursor VCursor, oldValues []sqltypes.Value, ksid []byte, newValues []sqltypes.Value) error {
 	v, err := vunhash(ksid)
 	if err != nil {
-		return fmt.Errorf("lookup.Update.vunhash: %v", err)
+		return vterrors.Wrap(err, "lookup.Update.vunhash")
 	}
 	return lh.lkp.Update(ctx, vcursor, oldValues, ksid, sqltypes.NewUint64(v), newValues)
 }
@@ -219,7 +233,7 @@ func (lh *LookupHash) Update(ctx context.Context, vcursor VCursor, oldValues []s
 func (lh *LookupHash) Delete(ctx context.Context, vcursor VCursor, rowsColValues [][]sqltypes.Value, ksid []byte) error {
 	v, err := vunhash(ksid)
 	if err != nil {
-		return fmt.Errorf("lookup.Delete.vunhash: %v", err)
+		return vterrors.Wrap(err, "lookup.Delete.vunhash")
 	}
 	return lh.lkp.Delete(ctx, vcursor, rowsColValues, sqltypes.NewUint64(v), vtgatepb.CommitOrder_NORMAL)
 }
@@ -227,6 +241,11 @@ func (lh *LookupHash) Delete(ctx context.Context, vcursor VCursor, rowsColValues
 // MarshalJSON returns a JSON representation of LookupHash.
 func (lh *LookupHash) MarshalJSON() ([]byte, error) {
 	return json.Marshal(lh.lkp)
+}
+
+// UnknownParams satisfies the ParamValidating interface.
+func (lh *LookupHash) UnknownParams() []string {
+	return lh.unknownParams
 }
 
 // unhashList unhashes a list of keyspace ids into []sqltypes.Value.
@@ -242,21 +261,22 @@ func unhashList(ksids [][]byte) ([]sqltypes.Value, error) {
 	return values, nil
 }
 
-//====================================================================
+// ====================================================================
 
 // LookupHashUnique defines a vindex that uses a lookup table.
 // The table is expected to define the id column as unique. It's
 // Unique and a Lookup.
-// Warning: This Vindex is being depcreated in favor of LookupUnique
+// Warning: This Vindex is being deprecated in favor of LookupUnique
 type LookupHashUnique struct {
-	name      string
-	writeOnly bool
-	lkp       lookupInternal
+	name          string
+	writeOnly     bool
+	lkp           lookupInternal
+	unknownParams []string
 }
 
 var _ LookupPlanable = (*LookupHashUnique)(nil)
 
-// NewLookupHashUnique creates a LookupHashUnique vindex.
+// newLookupHashUnique creates a LookupHashUnique vindex.
 // The supplied map has the following required fields:
 //
 //	table: name of the backing table. It can be qualified by the keyspace.
@@ -267,14 +287,17 @@ var _ LookupPlanable = (*LookupHashUnique)(nil)
 //
 //	autocommit: setting this to "true" will cause deletes to be ignored.
 //	write_only: in this mode, Map functions return the full keyrange causing a full scatter.
-func NewLookupHashUnique(name string, m map[string]string) (Vindex, error) {
-	lhu := &LookupHashUnique{name: name}
+func newLookupHashUnique(name string, m map[string]string) (Vindex, error) {
+	lhu := &LookupHashUnique{
+		name:          name,
+		unknownParams: FindUnknownParams(m, lookupHashParams),
+	}
 
 	cc, err := parseCommonConfig(m)
 	if err != nil {
 		return nil, err
 	}
-	lhu.writeOnly, err = boolFromMap(m, "write_only")
+	lhu.writeOnly, err = boolFromMap(m, lookupHashParamWriteOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -336,7 +359,7 @@ func (lhu *LookupHashUnique) MapResult(ids []sqltypes.Value, results []*sqltypes
 		case 0:
 			out = append(out, key.DestinationNone{})
 		case 1:
-			num, err := evalengine.ToUint64(result.Rows[0][0])
+			num, err := result.Rows[0][0].ToCastUint64()
 			if err != nil {
 				out = append(out, key.DestinationNone{})
 				continue
@@ -361,7 +384,7 @@ func (lhu *LookupHashUnique) Verify(ctx context.Context, vcursor VCursor, ids []
 
 	values, err := unhashList(ksids)
 	if err != nil {
-		return nil, fmt.Errorf("lookup.Verify.vunhash: %v", err)
+		return nil, vterrors.Wrap(err, "lookup.Verify.vunhash")
 	}
 	return lhu.lkp.Verify(ctx, vcursor, ids, values)
 }
@@ -370,7 +393,7 @@ func (lhu *LookupHashUnique) Verify(ctx context.Context, vcursor VCursor, ids []
 func (lhu *LookupHashUnique) Create(ctx context.Context, vcursor VCursor, rowsColValues [][]sqltypes.Value, ksids [][]byte, ignoreMode bool) error {
 	values, err := unhashList(ksids)
 	if err != nil {
-		return fmt.Errorf("lookup.Create.vunhash: %v", err)
+		return vterrors.Wrap(err, "lookup.Create.vunhash")
 	}
 	return lhu.lkp.Create(ctx, vcursor, rowsColValues, values, ignoreMode)
 }
@@ -379,7 +402,7 @@ func (lhu *LookupHashUnique) Create(ctx context.Context, vcursor VCursor, rowsCo
 func (lhu *LookupHashUnique) Delete(ctx context.Context, vcursor VCursor, rowsColValues [][]sqltypes.Value, ksid []byte) error {
 	v, err := vunhash(ksid)
 	if err != nil {
-		return fmt.Errorf("lookup.Delete.vunhash: %v", err)
+		return vterrors.Wrap(err, "lookup.Delete.vunhash")
 	}
 	return lhu.lkp.Delete(ctx, vcursor, rowsColValues, sqltypes.NewUint64(v), vtgatepb.CommitOrder_NORMAL)
 }
@@ -388,7 +411,7 @@ func (lhu *LookupHashUnique) Delete(ctx context.Context, vcursor VCursor, rowsCo
 func (lhu *LookupHashUnique) Update(ctx context.Context, vcursor VCursor, oldValues []sqltypes.Value, ksid []byte, newValues []sqltypes.Value) error {
 	v, err := vunhash(ksid)
 	if err != nil {
-		return fmt.Errorf("lookup.Update.vunhash: %v", err)
+		return vterrors.Wrap(err, "lookup.Update.vunhash")
 	}
 	return lhu.lkp.Update(ctx, vcursor, oldValues, ksid, sqltypes.NewUint64(v), newValues)
 }
@@ -418,4 +441,9 @@ func (lhu *LookupHashUnique) Query() (selQuery string, arguments []string) {
 // GetCommitOrder implements the LookupPlanable interface
 func (lhu *LookupHashUnique) GetCommitOrder() vtgatepb.CommitOrder {
 	return vtgatepb.CommitOrder_NORMAL
+}
+
+// UnknownParams implements the ParamValidating interface.
+func (lhu *LookupHashUnique) UnknownParams() []string {
+	return lhu.unknownParams
 }

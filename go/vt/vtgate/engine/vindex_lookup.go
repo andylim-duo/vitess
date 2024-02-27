@@ -20,6 +20,7 @@ import (
 	"context"
 
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
+	"vitess.io/vitess/go/vt/sqlparser"
 
 	"vitess.io/vitess/go/vt/key"
 
@@ -81,7 +82,7 @@ func (vr *VindexLookup) NeedsTransaction() bool {
 
 // TryExecute implements the Primitive interface
 func (vr *VindexLookup) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
-	ids, err := vr.generateIds(vcursor, bindVars)
+	ids, err := vr.generateIds(ctx, vcursor, bindVars)
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +118,7 @@ func (vr *VindexLookup) mapVindexToDestination(ids []sqltypes.Value, results []*
 
 // TryStreamExecute implements the Primitive interface
 func (vr *VindexLookup) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
-	ids, err := vr.generateIds(vcursor, bindVars)
+	ids, err := vr.generateIds(ctx, vcursor, bindVars)
 	if err != nil {
 		return err
 	}
@@ -136,12 +137,12 @@ func (vr *VindexLookup) TryStreamExecute(ctx context.Context, vcursor VCursor, b
 }
 
 // Inputs implements the Primitive interface
-func (vr *VindexLookup) Inputs() []Primitive {
+func (vr *VindexLookup) Inputs() ([]Primitive, []map[string]any) {
 	if vr.Lookup != nil {
-		return []Primitive{vr.Lookup, vr.SendTo}
+		return []Primitive{vr.Lookup, vr.SendTo}, nil
 	}
 
-	return []Primitive{vr.SendTo}
+	return []Primitive{vr.SendTo}, nil
 }
 
 // description implements the Primitive interface
@@ -150,7 +151,7 @@ func (vr *VindexLookup) description() PrimitiveDescription {
 	if vr.Values != nil {
 		formattedValues := make([]string, 0, len(vr.Values))
 		for _, value := range vr.Values {
-			formattedValues = append(formattedValues, evalengine.FormatExpr(value))
+			formattedValues = append(formattedValues, sqlparser.String(value))
 		}
 		other["Values"] = formattedValues
 	}
@@ -227,10 +228,6 @@ func (vr *VindexLookup) executeBatch(ctx context.Context, vcursor VCursor, ids [
 		result, err = vcursor.ExecutePrimitive(ctx, vr.Lookup, bindVars, false)
 	}
 	if err != nil {
-		return nil, err
-	}
-
-	if err != nil {
 		return nil, vterrors.Wrapf(err, "failed while running the lookup query")
 	}
 	resultMap := make(map[string][][]sqltypes.Value)
@@ -246,15 +243,15 @@ func (vr *VindexLookup) executeBatch(ctx context.Context, vcursor VCursor, ids [
 	return results, nil
 }
 
-func (vr *VindexLookup) generateIds(vcursor VCursor, bindVars map[string]*querypb.BindVariable) ([]sqltypes.Value, error) {
-	env := evalengine.EnvWithBindVars(bindVars, vcursor.ConnCollation())
+func (vr *VindexLookup) generateIds(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) ([]sqltypes.Value, error) {
+	env := evalengine.NewExpressionEnv(ctx, bindVars, vcursor)
 	value, err := env.Evaluate(vr.Values[0])
 	if err != nil {
 		return nil, err
 	}
 	switch vr.Opcode {
 	case Equal, EqualUnique:
-		return []sqltypes.Value{value.Value()}, nil
+		return []sqltypes.Value{value.Value(vcursor.ConnCollation())}, nil
 	case IN:
 		return value.TupleValues(), nil
 	}

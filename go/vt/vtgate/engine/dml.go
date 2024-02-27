@@ -36,6 +36,8 @@ import (
 
 // DML contains the common elements between Update and Delete plans
 type DML struct {
+	txNeeded
+
 	// Query specifies the query to be executed.
 	Query string
 
@@ -45,8 +47,11 @@ type DML struct {
 	// KsidLength is number of columns that represents KsidVindex
 	KsidLength int
 
-	// Table specifies the table for the update.
-	Table []*vindexes.Table
+	// TableNames are the name of the tables involved in the query.
+	TableNames []string
+
+	// Vindexes are the column vindexes modified by this DML.
+	Vindexes []*vindexes.ColumnVindex
 
 	// OwnedVindexQuery is used for updating changes in lookup vindexes.
 	OwnedVindexQuery string
@@ -58,10 +63,10 @@ type DML struct {
 	// QueryTimeout contains the optional timeout (in milliseconds) to apply to this query
 	QueryTimeout int
 
+	PreventAutoCommit bool
+
 	// RoutingParameters parameters required for query routing.
 	*RoutingParameters
-
-	txNeeded
 }
 
 // NewDML returns and empty initialized DML struct.
@@ -70,7 +75,7 @@ func NewDML() *DML {
 }
 
 func (dml *DML) execUnsharded(ctx context.Context, primitive Primitive, vcursor VCursor, bindVars map[string]*querypb.BindVariable, rss []*srvtopo.ResolvedShard) (*sqltypes.Result, error) {
-	return execShard(ctx, primitive, vcursor, dml.Query, bindVars, rss[0], true /* rollbackOnError */, true /* canAutocommit */)
+	return execShard(ctx, primitive, vcursor, dml.Query, bindVars, rss[0], true /* rollbackOnError */, !dml.PreventAutoCommit /* canAutocommit */)
 }
 
 func (dml *DML) execMultiDestination(ctx context.Context, primitive Primitive, vcursor VCursor, bindVars map[string]*querypb.BindVariable, rss []*srvtopo.ResolvedShard, dmlSpecialFunc func(context.Context, VCursor, map[string]*querypb.BindVariable, []*srvtopo.ResolvedShard) error) (*sqltypes.Result, error) {
@@ -103,29 +108,16 @@ func (dml *DML) GetKeyspaceName() string {
 
 // GetTableName specifies the table that this primitive routes to.
 func (dml *DML) GetTableName() string {
-	if dml.Table != nil {
-		tableNameMap := map[string]any{}
-		for _, table := range dml.Table {
-			tableNameMap[table.Name.String()] = nil
-		}
-
-		var tableNames []string
-		for name := range tableNameMap {
+	sort.Strings(dml.TableNames)
+	var tableNames []string
+	var previousTbl string
+	for _, name := range dml.TableNames {
+		if name != previousTbl {
 			tableNames = append(tableNames, name)
+			previousTbl = name
 		}
-		sort.Strings(tableNames)
-
-		return strings.Join(tableNames, ", ")
 	}
-	return ""
-}
-
-// GetSingleTable returns single table used in dml.
-func (dml *DML) GetSingleTable() (*vindexes.Table, error) {
-	if len(dml.Table) > 1 {
-		return nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "unsupported dml on complex table expression")
-	}
-	return dml.Table[0], nil
+	return strings.Join(tableNames, ", ")
 }
 
 func allowOnlyPrimary(rss ...*srvtopo.ResolvedShard) error {

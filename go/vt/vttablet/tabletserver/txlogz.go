@@ -18,10 +18,11 @@ package tabletserver
 
 import (
 	"fmt"
-	"html/template"
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/google/safehtml/template"
 
 	"vitess.io/vitess/go/acl"
 	"vitess.io/vitess/go/streamlog"
@@ -69,10 +70,6 @@ var (
 			</td>
 		</tr>`))
 )
-
-func init() {
-	http.HandleFunc("/txlogz", txlogzHandler)
-}
 
 // txlogzHandler serves a human readable snapshot of the
 // current transaction log.

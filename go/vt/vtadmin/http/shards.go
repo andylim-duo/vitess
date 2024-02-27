@@ -70,7 +70,7 @@ func DeleteShards(ctx context.Context, r Request, api *API) *JSONResponse {
 	}
 
 	shardList := r.URL.Query()["keyspace_shard"]
-	shardList = sets.List(sets.New[string](shardList...))
+	shardList = sets.List(sets.New(shardList...))
 	shards := make([]*vtctldatapb.Shard, len(shardList))
 	for i, kss := range shardList {
 		ks, shard, err := topoproto.ParseKeyspaceShard(kss)
@@ -178,7 +178,7 @@ func ReloadSchemaShard(ctx context.Context, r Request, api *API) *JSONResponse {
 	var params struct {
 		WaitPosition   string `json:"wait_position"`
 		IncludePrimary bool   `json:"include_primary"`
-		Concurrency    uint32 `json:"concurrency"`
+		Concurrency    int32  `json:"concurrency"`
 	}
 
 	if err := decoder.Decode(&params); err != nil {

@@ -24,19 +24,17 @@ import (
 	"reflect"
 	"regexp"
 	"strconv"
-
-	"vitess.io/vitess/go/vt/vtgate/evalengine"
+	"time"
 
 	"vitess.io/vitess/go/sqltypes"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/planbuilder"
-
-	querypb "vitess.io/vitess/go/vt/proto/query"
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
-//-----------------------------------------------
+// -----------------------------------------------
 
 const (
 	bufferedTableRuleName = "buffered_table"
@@ -177,16 +175,20 @@ func (qrs *Rules) GetAction(
 	user string,
 	bindVars map[string]*querypb.BindVariable,
 	marginComments sqlparser.MarginComments,
-) (action Action, cancelCtx context.Context, desc string) {
+) (
+	action Action,
+	cancelCtx context.Context,
+	timeout time.Duration,
+	desc string) {
 	for _, qr := range qrs.rules {
 		if act := qr.GetAction(ip, user, bindVars, marginComments); act != QRContinue {
-			return act, qr.cancelCtx, qr.Description
+			return act, qr.cancelCtx, qr.timeout, qr.Description
 		}
 	}
-	return QRContinue, nil, ""
+	return QRContinue, nil, 0, ""
 }
 
-//-----------------------------------------------
+// -----------------------------------------------
 
 // Rule represents one rule (conditions-action).
 // Name is meant to uniquely identify a rule.
@@ -217,8 +219,11 @@ type Rule struct {
 	// Action to be performed on trigger
 	act Action
 
-	// a rule can be dynamically cancelled. This function determines whether it is cancelled
+	// a rule can be dynamically cancelled.
 	cancelCtx context.Context
+
+	// a rule can timeout.
+	timeout time.Duration
 }
 
 type namedRegexp struct {
@@ -246,9 +251,9 @@ func NewQueryRule(description, name string, act Action) (qr *Rule) {
 }
 
 // NewBufferedTableQueryRule creates a new buffer Rule.
-func NewBufferedTableQueryRule(cancelCtx context.Context, tableName string, description string) (qr *Rule) {
+func NewBufferedTableQueryRule(cancelCtx context.Context, tableName string, bufferTimeout time.Duration, description string) (qr *Rule) {
 	// We ignore act because there's only one action right now
-	return &Rule{cancelCtx: cancelCtx, Description: description, Name: bufferedTableRuleName, tableNames: []string{tableName}, act: QRBuffer}
+	return &Rule{cancelCtx: cancelCtx, timeout: bufferTimeout, Description: description, Name: bufferedTableRuleName, tableNames: []string{tableName}, act: QRBuffer}
 }
 
 // Equal returns true if other is equal to this Rule, otherwise false.
@@ -263,6 +268,7 @@ func (qr *Rule) Equal(other *Rule) bool {
 		qr.query.Equal(other.query) &&
 		qr.leadingComment.Equal(other.leadingComment) &&
 		qr.trailingComment.Equal(other.trailingComment) &&
+		qr.timeout == other.timeout &&
 		reflect.DeepEqual(qr.plans, other.plans) &&
 		reflect.DeepEqual(qr.tableNames, other.tableNames) &&
 		reflect.DeepEqual(qr.bindVarConds, other.bindVarConds) &&
@@ -281,6 +287,7 @@ func (qr *Rule) Copy() (newqr *Rule) {
 		trailingComment: qr.trailingComment,
 		act:             qr.act,
 		cancelCtx:       qr.cancelCtx,
+		timeout:         qr.timeout,
 	}
 	if qr.plans != nil {
 		newqr.plans = make([]planbuilder.PlanType, len(qr.plans))
@@ -328,6 +335,9 @@ func (qr *Rule) MarshalJSON() ([]byte, error) {
 	}
 	if qr.act != QRContinue {
 		safeEncode(b, `,"Action":`, qr.act)
+	}
+	if qr.timeout != 0 {
+		safeEncode(b, `,"Timeout":`, qr.timeout)
 	}
 	_, _ = b.WriteString("}")
 	return b.Bytes(), nil
@@ -550,10 +560,10 @@ func bvMatch(bvcond BindVarCond, bindVars map[string]*querypb.BindVariable) bool
 	return bvcond.value.eval(bv, bvcond.op, bvcond.onMismatch)
 }
 
-//-----------------------------------------------
+// -----------------------------------------------
 // Support types for Rule
 
-// Action speficies the list of actions to perform
+// Action specifies the list of actions to perform
 // when a Rule is triggered.
 type Action int
 
@@ -645,7 +655,7 @@ func init() {
 	}
 }
 
-// These are return statii.
+// These are return states.
 const (
 	QROK = iota
 	QRMismatch
@@ -819,7 +829,7 @@ func getuint64(val *querypb.BindVariable) (uv uint64, status int) {
 	if err != nil {
 		return 0, QROutOfRange
 	}
-	v, err := evalengine.ToUint64(bv)
+	v, err := bv.ToCastUint64()
 	if err != nil {
 		return 0, QROutOfRange
 	}
@@ -832,7 +842,7 @@ func getint64(val *querypb.BindVariable) (iv int64, status int) {
 	if err != nil {
 		return 0, QROutOfRange
 	}
-	v, err := evalengine.ToInt64(bv)
+	v, err := bv.ToCastInt64()
 	if err != nil {
 		return 0, QROutOfRange
 	}
@@ -841,13 +851,13 @@ func getint64(val *querypb.BindVariable) (iv int64, status int) {
 
 // TODO(sougou): this is inefficient. Optimize to use []byte.
 func getstring(val *querypb.BindVariable) (s string, status int) {
-	if sqltypes.IsIntegral(val.Type) || sqltypes.IsFloat(val.Type) || sqltypes.IsText(val.Type) || sqltypes.IsBinary(val.Type) {
+	if sqltypes.IsIntegral(val.Type) || sqltypes.IsFloat(val.Type) || sqltypes.IsTextOrBinary(val.Type) {
 		return string(val.Value), QROK
 	}
 	return "", QRMismatch
 }
 
-//-----------------------------------------------
+// -----------------------------------------------
 // Support functions for JSON
 
 // MapStrOperator maps a string representation to an Operator.

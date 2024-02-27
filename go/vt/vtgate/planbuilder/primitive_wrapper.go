@@ -17,41 +17,16 @@ limitations under the License.
 package planbuilder
 
 import (
-	"vitess.io/vitess/go/vt/sqlparser"
-	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
-	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
-	"vitess.io/vitess/go/vt/vtgate/semantics"
 )
 
 // primitiveWrapper is used when only need a logical plan that supports plan.Primitive() and nothing else
 type primitiveWrapper struct {
 	prim engine.Primitive
-	gen4Plan
-}
-
-func (p *primitiveWrapper) WireupGen4(*plancontext.PlanningContext) error {
-	return nil
 }
 
 func (p *primitiveWrapper) Primitive() engine.Primitive {
 	return p.prim
-}
-
-func (p *primitiveWrapper) Inputs() []logicalPlan {
-	return nil
-}
-
-func (p *primitiveWrapper) Rewrite(...logicalPlan) error {
-	return vterrors.VT13001("cannot rewrite")
-}
-
-func (p *primitiveWrapper) ContainsTables() semantics.TableSet {
-	return semantics.EmptyTableSet()
-}
-
-func (p *primitiveWrapper) OutputColumns() []sqlparser.SelectExpr {
-	return nil
 }
 
 var _ logicalPlan = (*primitiveWrapper)(nil)

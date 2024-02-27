@@ -18,6 +18,7 @@ package tabletserver
 
 import (
 	"context"
+	"time"
 
 	"vitess.io/vitess/go/vt/dbconfigs"
 	"vitess.io/vitess/go/vt/mysqlctl"
@@ -26,9 +27,7 @@ import (
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/rules"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
-	"vitess.io/vitess/go/vt/vttablet/vexec"
-
-	"time"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -53,7 +52,7 @@ type Controller interface {
 
 	// SetServingType transitions the query service to the required serving type.
 	// Returns true if the state of QueryService or the tablet type changed.
-	SetServingType(tabletType topodatapb.TabletType, terTimestamp time.Time, serving bool, reason string) error
+	SetServingType(tabletType topodatapb.TabletType, ptsTimestamp time.Time, serving bool, reason string) error
 
 	// EnterLameduck causes tabletserver to enter the lameduck state.
 	EnterLameduck()
@@ -67,13 +66,13 @@ type Controller interface {
 	// ClearQueryPlanCache clears internal query plan cache
 	ClearQueryPlanCache()
 
-	// ReloadSchema makes the quey service reload its schema cache
+	// ReloadSchema makes the query service reload its schema cache
 	ReloadSchema(ctx context.Context) error
 
 	// RegisterQueryRuleSource adds a query rule source
 	RegisterQueryRuleSource(ruleSource string)
 
-	// RegisterQueryRuleSource removes a query rule source
+	// UnRegisterQueryRuleSource removes a query rule source
 	UnRegisterQueryRuleSource(ruleSource string)
 
 	// SetQueryRules sets the query rules for this QueryService
@@ -81,9 +80,6 @@ type Controller interface {
 
 	// QueryService returns the QueryService object used by this Controller
 	QueryService() queryservice.QueryService
-
-	// OnlineDDLExecutor the online DDL executor used by this Controller
-	OnlineDDLExecutor() vexec.Executor
 
 	// SchemaEngine returns the SchemaEngine object used by this Controller
 	SchemaEngine() *schema.Engine
@@ -93,6 +89,9 @@ type Controller interface {
 
 	// TopoServer returns the topo server.
 	TopoServer() *topo.Server
+
+	// CheckThrottler
+	CheckThrottler(ctx context.Context, appName string, flags *throttle.CheckFlags) *throttle.CheckResult
 }
 
 // Ensure TabletServer satisfies Controller interface.

@@ -21,8 +21,10 @@ import (
 	"strings"
 	"time"
 
-	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	"vitess.io/vitess/go/protoutil"
 	"vitess.io/vitess/go/vt/throttler"
+
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 )
 
 // InsertGenerator generates a vreplication insert statement.
@@ -36,12 +38,12 @@ type InsertGenerator struct {
 }
 
 // NewInsertGenerator creates a new InsertGenerator.
-func NewInsertGenerator(state, dbname string) *InsertGenerator {
+func NewInsertGenerator(state binlogdatapb.VReplicationWorkflowState, dbname string) *InsertGenerator {
 	buf := &strings.Builder{}
 	buf.WriteString("insert into _vt.vreplication(workflow, source, pos, max_tps, max_replication_lag, cell, tablet_types, time_updated, transaction_timestamp, state, db_name, workflow_type, workflow_sub_type, defer_secondary_keys) values ")
 	return &InsertGenerator{
 		buf:    buf,
-		state:  state,
+		state:  state.String(),
 		dbname: dbname,
 		now:    time.Now().Unix(),
 	}
@@ -50,6 +52,7 @@ func NewInsertGenerator(state, dbname string) *InsertGenerator {
 // AddRow adds a row to the insert statement.
 func (ig *InsertGenerator) AddRow(workflow string, bls *binlogdatapb.BinlogSource, pos, cell, tabletTypes string,
 	workflowType binlogdatapb.VReplicationWorkflowType, workflowSubType binlogdatapb.VReplicationWorkflowSubType, deferSecondaryKeys bool) {
+	protoutil.SortBinlogSourceTables(bls)
 	fmt.Fprintf(ig.buf, "%s(%v, %v, %v, %v, %v, %v, %v, %v, 0, '%v', %v, %d, %d, %v)",
 		ig.prefix,
 		encodeString(workflow),

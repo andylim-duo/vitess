@@ -17,16 +17,25 @@ limitations under the License.
 package evalengine
 
 import (
-	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 type (
+	opLogical interface {
+		String() string
+		eval(left, right IR, env *ExpressionEnv) (boolean, error)
+		compileLeft(c *compiler) *jump
+		compileRight(c *compiler)
+	}
+
+	opLogicalAnd struct{}
+	opLogicalOr  struct{}
+	opLogicalXor struct{}
+
 	LogicalExpr struct {
 		BinaryExpr
-		op     func(left, right boolean) boolean
-		opname string
+		op opLogical
 	}
 
 	NotExpr struct {
@@ -34,6 +43,10 @@ type (
 	}
 
 	boolean int8
+
+	IntervalExpr struct {
+		CallExpr
+	}
 
 	// IsExpr represents the IS expression in MySQL.
 	// boolean_primary IS [NOT] {TRUE | FALSE | NULL}
@@ -44,19 +57,20 @@ type (
 	}
 
 	WhenThen struct {
-		when Expr
-		then Expr
+		when IR
+		then IR
 	}
 
 	CaseExpr struct {
 		cases []WhenThen
-		Else  Expr
+		Else  IR
 	}
 )
 
-var _ Expr = (*IsExpr)(nil)
-var _ Expr = (*LogicalExpr)(nil)
-var _ Expr = (*NotExpr)(nil)
+var _ IR = (*IntervalExpr)(nil)
+var _ IR = (*IsExpr)(nil)
+var _ IR = (*LogicalExpr)(nil)
+var _ IR = (*NotExpr)(nil)
 
 const (
 	boolFalse boolean = 0
@@ -100,56 +114,222 @@ func (left boolean) not() boolean {
 	}
 }
 
-func (left boolean) and(right boolean) boolean {
+func (opLogicalAnd) String() string {
+	return "and"
+}
+
+func (opLogicalAnd) eval(le, re IR, env *ExpressionEnv) (boolean, error) {
 	// Logical AND.
 	// Evaluates to 1 if all operands are nonzero and not NULL, to 0 if one or more operands are 0, otherwise NULL is returned.
+	l, err := le.eval(env)
+	if err != nil {
+		return boolNULL, err
+	}
+
+	left := evalIsTruthy(l)
+	if left == boolFalse {
+		return boolFalse, nil
+	}
+
+	r, err := re.eval(env)
+	if err != nil {
+		return boolNULL, err
+	}
+	right := evalIsTruthy(r)
+
 	switch {
 	case left == boolTrue && right == boolTrue:
-		return boolTrue
-	case left == boolFalse || right == boolFalse:
-		return boolFalse
+		return boolTrue, nil
+	case right == boolFalse:
+		return boolFalse, nil
 	default:
-		return boolNULL
+		return boolNULL, nil
 	}
 }
 
-func (left boolean) or(right boolean) boolean {
+func (op opLogicalAnd) compileLeft(c *compiler) *jump {
+	j := c.asm.jumpFrom()
+	c.asm.emit(func(env *ExpressionEnv) int {
+		left, ok := env.vm.stack[env.vm.sp-1].(*evalInt64)
+		if ok && left.i == 0 {
+			return j.offset()
+		}
+		return 1
+	}, "AND CHECK INT64(SP-1)")
+	return j
+}
+
+func (op opLogicalAnd) compileRight(c *compiler) {
+	c.asm.adjustStack(-1)
+	c.asm.emit(func(env *ExpressionEnv) int {
+		left, lok := env.vm.stack[env.vm.sp-2].(*evalInt64)
+		right, rok := env.vm.stack[env.vm.sp-1].(*evalInt64)
+
+		isLeft := lok && left.i != 0
+		isRight := rok && right.i != 0
+
+		if isLeft && isRight {
+			left.i = 1
+		} else if rok && !isRight {
+			env.vm.stack[env.vm.sp-2] = env.vm.arena.newEvalBool(false)
+		} else {
+			env.vm.stack[env.vm.sp-2] = nil
+		}
+		env.vm.sp--
+		return 1
+	}, "AND INT64(SP-2), INT64(SP-1)")
+}
+
+func (opLogicalOr) String() string {
+	return "or"
+}
+
+func (opLogicalOr) eval(le, re IR, env *ExpressionEnv) (boolean, error) {
 	// Logical OR. When both operands are non-NULL, the result is 1 if any operand is nonzero, and 0 otherwise.
 	// With a NULL operand, the result is 1 if the other operand is nonzero, and NULL otherwise.
 	// If both operands are NULL, the result is NULL.
+	l, err := le.eval(env)
+	if err != nil {
+		return boolNULL, err
+	}
+
+	left := evalIsTruthy(l)
+	if left == boolTrue {
+		return boolTrue, nil
+	}
+
+	r, err := re.eval(env)
+	if err != nil {
+		return boolNULL, err
+	}
+	right := evalIsTruthy(r)
+
 	switch {
 	case left == boolNULL:
 		if right == boolTrue {
-			return boolTrue
+			return boolTrue, nil
 		}
-		return boolNULL
+		return boolNULL, nil
 
 	case right == boolNULL:
-		if left == boolTrue {
-			return boolTrue
-		}
-		return boolNULL
+		return boolNULL, nil
 
 	default:
-		if left == boolTrue || right == boolTrue {
-			return boolTrue
+		if right == boolTrue {
+			return boolTrue, nil
 		}
-		return boolFalse
+		return boolFalse, nil
 	}
 }
 
-func (left boolean) xor(right boolean) boolean {
+func (opLogicalOr) compileLeft(c *compiler) *jump {
+	j := c.asm.jumpFrom()
+	c.asm.emit(func(env *ExpressionEnv) int {
+		left, ok := env.vm.stack[env.vm.sp-1].(*evalInt64)
+		if ok && left.i != 0 {
+			left.i = 1
+			return j.offset()
+		}
+		return 1
+	}, "OR CHECK INT64(SP-1)")
+	return j
+}
+
+func (opLogicalOr) compileRight(c *compiler) {
+	c.asm.adjustStack(-1)
+	c.asm.emit(func(env *ExpressionEnv) int {
+		left, lok := env.vm.stack[env.vm.sp-2].(*evalInt64)
+		right, rok := env.vm.stack[env.vm.sp-1].(*evalInt64)
+
+		isLeft := lok && left.i != 0
+		isRight := rok && right.i != 0
+
+		switch {
+		case !lok:
+			if isRight {
+				env.vm.stack[env.vm.sp-2] = env.vm.arena.newEvalBool(true)
+			}
+		case !rok:
+			env.vm.stack[env.vm.sp-2] = nil
+		default:
+			if isLeft || isRight {
+				left.i = 1
+			} else {
+				left.i = 0
+			}
+		}
+		env.vm.sp--
+		return 1
+	}, "OR INT64(SP-2), INT64(SP-1)")
+}
+
+func (opLogicalXor) String() string {
+	return "xor"
+}
+
+func (opLogicalXor) eval(le, re IR, env *ExpressionEnv) (boolean, error) {
 	// Logical XOR. Returns NULL if either operand is NULL.
 	// For non-NULL operands, evaluates to 1 if an odd number of operands is nonzero, otherwise 0 is returned.
+	l, err := le.eval(env)
+	if err != nil {
+		return boolNULL, err
+	}
+
+	left := evalIsTruthy(l)
+	if left == boolNULL {
+		return boolNULL, nil
+	}
+
+	r, err := re.eval(env)
+	if err != nil {
+		return boolNULL, err
+	}
+	right := evalIsTruthy(r)
+
 	switch {
 	case left == boolNULL || right == boolNULL:
-		return boolNULL
+		return boolNULL, nil
 	default:
 		if left != right {
-			return boolTrue
+			return boolTrue, nil
 		}
-		return boolFalse
+		return boolFalse, nil
 	}
+}
+
+func (opLogicalXor) compileLeft(c *compiler) *jump {
+	j := c.asm.jumpFrom()
+	c.asm.emit(func(env *ExpressionEnv) int {
+		if env.vm.stack[env.vm.sp-1] == nil {
+			return j.offset()
+		}
+		return 1
+	}, "XOR CHECK INT64(SP-1)")
+	return j
+}
+
+func (opLogicalXor) compileRight(c *compiler) {
+	c.asm.adjustStack(-1)
+	c.asm.emit(func(env *ExpressionEnv) int {
+		left := env.vm.stack[env.vm.sp-2].(*evalInt64)
+		right, rok := env.vm.stack[env.vm.sp-1].(*evalInt64)
+
+		isLeft := left.i != 0
+		isRight := rok && right.i != 0
+
+		switch {
+		case !rok:
+			env.vm.stack[env.vm.sp-2] = nil
+		default:
+			if isLeft != isRight {
+				left.i = 1
+			} else {
+				left.i = 0
+			}
+		}
+		env.vm.sp--
+		return 1
+	}, "XOR INT64(SP-2), INT64(SP-1)")
 }
 
 func (n *NotExpr) eval(env *ExpressionEnv) (eval, error) {
@@ -160,23 +340,229 @@ func (n *NotExpr) eval(env *ExpressionEnv) (eval, error) {
 	return evalIsTruthy(e).not().eval(), nil
 }
 
-func (n *NotExpr) typeof(env *ExpressionEnv) (sqltypes.Type, typeFlag) {
-	_, flags := n.Inner.typeof(env)
-	return sqltypes.Uint64, flags
+func (expr *NotExpr) compile(c *compiler) (ctype, error) {
+	arg, err := expr.Inner.compile(c)
+	if err != nil {
+		return ctype{}, nil
+	}
+
+	skip := c.compileNullCheck1(arg)
+
+	switch arg.Type {
+	case sqltypes.Null:
+		// No-op.
+	case sqltypes.Int64:
+		c.asm.Not_i()
+	case sqltypes.Uint64:
+		c.asm.Not_u()
+	case sqltypes.Float64:
+		c.asm.Not_f()
+	case sqltypes.Decimal:
+		c.asm.Not_d()
+	case sqltypes.VarChar, sqltypes.VarBinary:
+		if arg.isHexOrBitLiteral() {
+			c.asm.Convert_xu(1)
+			c.asm.Not_u()
+		} else {
+			c.asm.Convert_bB(1)
+			c.asm.Not_i()
+		}
+	case sqltypes.TypeJSON:
+		c.asm.Convert_jB(1)
+		c.asm.Not_i()
+	case sqltypes.Time, sqltypes.Datetime, sqltypes.Date, sqltypes.Timestamp:
+		c.asm.Convert_TB(1)
+		c.asm.Not_i()
+	default:
+		c.asm.Convert_bB(1)
+		c.asm.Not_i()
+	}
+	c.asm.jumpDestination(skip)
+	return ctype{Type: sqltypes.Int64, Flag: nullableFlags(arg.Flag) | flagIsBoolean, Col: collationNumeric}, nil
 }
 
 func (l *LogicalExpr) eval(env *ExpressionEnv) (eval, error) {
-	left, right, err := l.arguments(env)
+	res, err := l.op.eval(l.Left, l.Right, env)
+	return res.eval(), err
+}
+
+func (expr *LogicalExpr) compile(c *compiler) (ctype, error) {
+	lt, err := expr.Left.compile(c)
+	if err != nil {
+		return ctype{}, err
+	}
+
+	switch lt.Type {
+	case sqltypes.Null, sqltypes.Int64:
+		// No-op.
+	case sqltypes.Uint64:
+		c.asm.Convert_uB(1)
+	case sqltypes.Float64:
+		c.asm.Convert_fB(1)
+	case sqltypes.Decimal:
+		c.asm.Convert_dB(1)
+	case sqltypes.VarChar, sqltypes.VarBinary:
+		if lt.isHexOrBitLiteral() {
+			c.asm.Convert_xu(1)
+			c.asm.Convert_uB(1)
+		} else {
+			c.asm.Convert_bB(1)
+		}
+	case sqltypes.TypeJSON:
+		c.asm.Convert_jB(1)
+	case sqltypes.Time, sqltypes.Datetime, sqltypes.Date, sqltypes.Timestamp:
+		c.asm.Convert_TB(1)
+	default:
+		c.asm.Convert_bB(1)
+	}
+
+	jump := expr.op.compileLeft(c)
+
+	rt, err := expr.Right.compile(c)
+	if err != nil {
+		return ctype{}, err
+	}
+
+	switch rt.Type {
+	case sqltypes.Null, sqltypes.Int64:
+		// No-op.
+	case sqltypes.Uint64:
+		c.asm.Convert_uB(1)
+	case sqltypes.Float64:
+		c.asm.Convert_fB(1)
+	case sqltypes.Decimal:
+		c.asm.Convert_dB(1)
+	case sqltypes.VarChar, sqltypes.VarBinary:
+		if rt.isHexOrBitLiteral() {
+			c.asm.Convert_xu(1)
+			c.asm.Convert_uB(1)
+		} else {
+			c.asm.Convert_bB(1)
+		}
+	case sqltypes.TypeJSON:
+		c.asm.Convert_jB(1)
+	case sqltypes.Time, sqltypes.Datetime, sqltypes.Date, sqltypes.Timestamp:
+		c.asm.Convert_TB(1)
+	default:
+		c.asm.Convert_bB(1)
+	}
+
+	expr.op.compileRight(c)
+	c.asm.jumpDestination(jump)
+	return ctype{Type: sqltypes.Int64, Flag: ((lt.Flag | rt.Flag) & flagNullable) | flagIsBoolean, Col: collationNumeric}, nil
+}
+
+func intervalCompare(n, val eval) (int, bool, error) {
+	if val == nil {
+		return 1, true, nil
+	}
+
+	val = evalToNumeric(val, false)
+	cmp, err := compareNumeric(n, val)
+	return cmp, false, err
+}
+
+func findInterval(args []eval) (int64, error) {
+	n := args[0]
+	start := int64(1)
+	end := int64(len(args) - 1)
+	for {
+		if start > end {
+			return end, nil
+		}
+
+		val := args[start]
+		cmp, _, err := intervalCompare(n, val)
+		if err != nil {
+			return 0, err
+		}
+
+		if cmp < 0 {
+			return start - 1, nil
+		}
+
+		pos := start + (end-start)/2
+
+		val = args[pos]
+		cmp, null, err := intervalCompare(n, val)
+		if err != nil {
+			return 0, err
+		}
+
+		prevPos := pos
+		for null {
+			prevPos--
+			if prevPos < start {
+				break
+			}
+			prevVal := args[prevPos]
+			cmp, null, err = intervalCompare(n, prevVal)
+			if err != nil {
+				return 0, err
+			}
+		}
+
+		if cmp < 0 {
+			end = pos - 1
+		} else {
+			start = pos + 1
+		}
+	}
+}
+
+func (i *IntervalExpr) eval(env *ExpressionEnv) (eval, error) {
+	args := make([]eval, 0, len(i.Arguments))
+	for _, arg := range i.Arguments {
+		val, err := arg.eval(env)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, val)
+	}
+
+	if args[0] == nil {
+		return newEvalInt64(-1), nil
+	}
+
+	args[0] = evalToNumeric(args[0], false)
+
+	idx, err := findInterval(args)
 	if err != nil {
 		return nil, err
 	}
-	return l.op(evalIsTruthy(left), evalIsTruthy(right)).eval(), nil
+	return newEvalInt64(idx), err
 }
 
-func (l *LogicalExpr) typeof(env *ExpressionEnv) (sqltypes.Type, typeFlag) {
-	_, f1 := l.Left.typeof(env)
-	_, f2 := l.Right.typeof(env)
-	return sqltypes.Uint64, f1 | f2
+func (i *IntervalExpr) compile(c *compiler) (ctype, error) {
+	n, err := i.Arguments[0].compile(c)
+	if err != nil {
+		return ctype{}, err
+	}
+
+	switch n.Type {
+	case sqltypes.Int64, sqltypes.Uint64, sqltypes.Float64, sqltypes.Decimal:
+	default:
+		s := c.compileNullCheck1(n)
+		c.asm.Convert_xf(1)
+		c.asm.jumpDestination(s)
+	}
+
+	for j := 1; j < len(i.Arguments); j++ {
+		argType, err := i.Arguments[j].compile(c)
+		if err != nil {
+			return ctype{}, err
+		}
+		switch argType.Type {
+		case sqltypes.Int64, sqltypes.Uint64, sqltypes.Float64, sqltypes.Decimal:
+		default:
+			s := c.compileNullCheck1(argType)
+			c.asm.Convert_xf(1)
+			c.asm.jumpDestination(s)
+		}
+	}
+
+	c.asm.Interval(len(i.Arguments) - 1)
+	return ctype{Type: sqltypes.Int64, Col: collationNumeric}, nil
 }
 
 func (i *IsExpr) eval(env *ExpressionEnv) (eval, error) {
@@ -187,13 +573,18 @@ func (i *IsExpr) eval(env *ExpressionEnv) (eval, error) {
 	return newEvalBool(i.Check(e)), nil
 }
 
-func (i *IsExpr) typeof(env *ExpressionEnv) (sqltypes.Type, typeFlag) {
-	return sqltypes.Int64, 0
+func (is *IsExpr) compile(c *compiler) (ctype, error) {
+	_, err := is.Inner.compile(c)
+	if err != nil {
+		return ctype{}, err
+	}
+	c.asm.Is(is.Check)
+	return ctype{Type: sqltypes.Int64, Col: collationNumeric, Flag: flagIsBoolean}, nil
 }
 
 func (c *CaseExpr) eval(env *ExpressionEnv) (eval, error) {
+	var ta typeAggregation
 	var ca collationAggregation
-	var local = collations.Local()
 	var result eval
 	var matched = false
 
@@ -212,7 +603,8 @@ func (c *CaseExpr) eval(env *ExpressionEnv) (eval, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := ca.add(local, evalCollation(then)); err != nil {
+		ta.addEval(then)
+		if err := ca.add(evalCollation(then), env.collationEnv); err != nil {
 			return nil, err
 		}
 
@@ -226,7 +618,8 @@ func (c *CaseExpr) eval(env *ExpressionEnv) (eval, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := ca.add(local, evalCollation(e)); err != nil {
+		ta.addEval(e)
+		if err := ca.add(evalCollation(e), env.collationEnv); err != nil {
 			return nil, err
 		}
 		if !matched {
@@ -238,39 +631,7 @@ func (c *CaseExpr) eval(env *ExpressionEnv) (eval, error) {
 	if !matched {
 		return nil, nil
 	}
-	t, _ := c.typeof(env)
-	return evalCoerce(result, t, ca.result().Collation)
-}
-
-func (c *CaseExpr) typeof(env *ExpressionEnv) (sqltypes.Type, typeFlag) {
-	var ta typeAggregation
-	var resultFlag typeFlag
-
-	for _, whenthen := range c.cases {
-		t, f := whenthen.then.typeof(env)
-		ta.add(t, f)
-		resultFlag = resultFlag | f
-	}
-	if c.Else != nil {
-		t, f := c.Else.typeof(env)
-		ta.add(t, f)
-		resultFlag = f
-	}
-	return ta.result(), resultFlag
-}
-
-func (c *CaseExpr) format(buf *formatter, depth int) {
-	buf.WriteString("CASE")
-	for _, cs := range c.cases {
-		buf.WriteString(" WHEN ")
-		cs.when.format(buf, depth)
-		buf.WriteString(" THEN ")
-		cs.then.format(buf, depth)
-	}
-	if c.Else != nil {
-		buf.WriteString(" ELSE ")
-		c.Else.format(buf, depth)
-	}
+	return evalCoerce(result, ta.result(), ca.result().Collation, env.now, env.sqlmode.AllowZeroDate())
 }
 
 func (c *CaseExpr) constant() bool {
@@ -310,4 +671,50 @@ func (c *CaseExpr) simplify(env *ExpressionEnv) error {
 	return err
 }
 
-var _ Expr = (*CaseExpr)(nil)
+func (cs *CaseExpr) compile(c *compiler) (ctype, error) {
+	var ca collationAggregation
+	var ta typeAggregation
+
+	for _, wt := range cs.cases {
+		when, err := wt.when.compile(c)
+		if err != nil {
+			return ctype{}, err
+		}
+
+		if err := c.compileCheckTrue(when, 1); err != nil {
+			return ctype{}, err
+		}
+
+		then, err := wt.then.compile(c)
+		if err != nil {
+			return ctype{}, err
+		}
+
+		ta.add(then.Type, then.Flag)
+		if err := ca.add(then.Col, c.env.CollationEnv()); err != nil {
+			return ctype{}, err
+		}
+	}
+
+	if cs.Else != nil {
+		els, err := cs.Else.compile(c)
+		if err != nil {
+			return ctype{}, err
+		}
+
+		ta.add(els.Type, els.Flag)
+		if err := ca.add(els.Col, c.env.CollationEnv()); err != nil {
+			return ctype{}, err
+		}
+	}
+
+	var f typeFlag
+	if ta.nullable {
+		f |= flagNullable
+	}
+	ct := ctype{Type: ta.result(), Flag: f, Col: ca.result()}
+	c.asm.CmpCase(len(cs.cases), cs.Else != nil, ct.Type, ct.Col, c.sqlmode.AllowZeroDate())
+	return ct, nil
+}
+
+var _ IR = (*CaseExpr)(nil)

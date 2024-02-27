@@ -25,6 +25,7 @@ import (
 	"vitess.io/vitess/go/vt/mysqlctl"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vtctl/reparentutil"
 	"vitess.io/vitess/go/vt/wrangler"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -114,6 +115,7 @@ func commandPlannedReparentShard(ctx context.Context, wr *wrangler.Wrangler, sub
 	}
 
 	waitReplicasTimeout := subFlags.Duration("wait_replicas_timeout", topo.RemoteOperationTimeout, "time to wait for replicas to catch up on replication before and after reparenting")
+	tolerableReplicationLag := subFlags.Duration("tolerable-replication-lag", 0, "amount of replication lag that is considered acceptable for a tablet to be eligible for promotion when Vitess makes the choice of a new primary")
 	keyspaceShard := subFlags.String("keyspace_shard", "", "keyspace/shard of the shard that needs to be reparented")
 	newPrimary := subFlags.String("new_primary", "", "alias of a tablet that should be the new primary")
 	avoidTablet := subFlags.String("avoid_tablet", "", "alias of a tablet that should not be the primary, i.e. reparent to any other tablet if this one is the primary")
@@ -149,7 +151,13 @@ func commandPlannedReparentShard(ctx context.Context, wr *wrangler.Wrangler, sub
 			return err
 		}
 	}
-	return wr.PlannedReparentShard(ctx, keyspace, shard, newPrimaryAlias, avoidTabletAlias, *waitReplicasTimeout)
+
+	return wr.PlannedReparentShard(ctx, keyspace, shard, reparentutil.PlannedReparentOptions{
+		NewPrimaryAlias:     newPrimaryAlias,
+		AvoidPrimaryAlias:   avoidTabletAlias,
+		WaitReplicasTimeout: *waitReplicasTimeout,
+		TolerableReplLag:    *tolerableReplicationLag,
+	})
 }
 
 func commandEmergencyReparentShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
@@ -162,6 +170,7 @@ func commandEmergencyReparentShard(ctx context.Context, wr *wrangler.Wrangler, s
 	newPrimary := subFlags.String("new_primary", "", "optional alias of a tablet that should be the new primary. If not specified, Vitess will select the best candidate")
 	preventCrossCellPromotion := subFlags.Bool("prevent_cross_cell_promotion", false, "only promotes a new primary from the same cell as the previous primary")
 	ignoreReplicasList := subFlags.String("ignore_replicas", "", "comma-separated list of replica tablet aliases to ignore during emergency reparent")
+	waitForAllTablets := subFlags.Bool("wait_for_all_tablets", false, "should ERS wait for all the tablets to respond. Useful when all the tablets are reachable")
 
 	if err := subFlags.Parse(args); err != nil {
 		return err
@@ -188,8 +197,14 @@ func commandEmergencyReparentShard(ctx context.Context, wr *wrangler.Wrangler, s
 			return err
 		}
 	}
-	unreachableReplicas := topoproto.ParseTabletSet(*ignoreReplicasList)
-	return wr.EmergencyReparentShard(ctx, keyspace, shard, tabletAlias, *waitReplicasTimeout, unreachableReplicas, *preventCrossCellPromotion)
+
+	return wr.EmergencyReparentShard(ctx, keyspace, shard, reparentutil.EmergencyReparentOptions{
+		NewPrimaryAlias:           tabletAlias,
+		WaitAllTablets:            *waitForAllTablets,
+		WaitReplicasTimeout:       *waitReplicasTimeout,
+		IgnoreReplicas:            topoproto.ParseTabletSet(*ignoreReplicasList),
+		PreventCrossCellPromotion: *preventCrossCellPromotion,
+	})
 }
 
 func commandTabletExternallyReparented(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {

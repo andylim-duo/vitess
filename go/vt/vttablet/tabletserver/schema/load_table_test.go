@@ -19,10 +19,14 @@ package schema
 import (
 	"context"
 	"errors"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"vitess.io/vitess/go/mysql/collations"
+	"vitess.io/vitess/go/test/utils"
+	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/vtenv"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -40,9 +44,7 @@ func TestLoadTable(t *testing.T) {
 	defer db.Close()
 	mockLoadTableQueries(db)
 	table, err := newTestLoadTable("USER_TABLE", "test table", db)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	want := &Table{
 		Name: sqlparser.NewIdentifierCS("test_table"),
 		Fields: []*querypb.Field{{
@@ -59,14 +61,37 @@ func TestLoadTable(t *testing.T) {
 	assert.Equal(t, want, table)
 }
 
+func TestLoadView(t *testing.T) {
+	db := fakesqldb.New(t)
+	defer db.Close()
+	mockLoadTableQueries(db)
+	table, err := newTestLoadTable("VIEW", "test table", db)
+	require.NoError(t, err)
+	want := &Table{
+		Name: sqlparser.NewIdentifierCS("test_table"),
+		Type: View,
+		Fields: []*querypb.Field{{
+			Name: "pk",
+			Type: sqltypes.Int32,
+		}, {
+			Name: "name",
+			Type: sqltypes.Int32,
+		}, {
+			Name: "addr",
+			Type: sqltypes.Int32,
+		}},
+	}
+	assert.Equal(t, want, table)
+}
+
+// TestLoadTableSequence tests that sequence tables are loaded correctly.
+// It also confirms that a reset of a sequence table works.
 func TestLoadTableSequence(t *testing.T) {
 	db := fakesqldb.New(t)
 	defer db.Close()
 	mockLoadTableQueries(db)
 	table, err := newTestLoadTable("USER_TABLE", "vitess_sequence", db)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	want := &Table{
 		Name:         sqlparser.NewIdentifierCS("test_table"),
 		Type:         Sequence,
@@ -74,9 +99,12 @@ func TestLoadTableSequence(t *testing.T) {
 	}
 	table.Fields = nil
 	table.PKColumns = nil
-	if !reflect.DeepEqual(table, want) {
-		t.Errorf("Table:\n%#v, want\n%#v", table, want)
-	}
+	utils.MustMatch(t, want, table)
+
+	table.SequenceInfo.NextVal = 10
+	table.SequenceInfo.LastVal = 5
+	table.SequenceInfo.Reset()
+	utils.MustMatch(t, want, table)
 }
 
 func TestLoadTableMessage(t *testing.T) {
@@ -84,9 +112,7 @@ func TestLoadTableMessage(t *testing.T) {
 	defer db.Close()
 	mockMessageTableQueries(db)
 	table, err := newTestLoadTable("USER_TABLE", "vitess_message,vt_ack_wait=30,vt_purge_after=120,vt_batch_size=1,vt_cache_size=10,vt_poller_interval=30", db)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	want := &Table{
 		Name: sqlparser.NewIdentifierCS("test_table"),
 		Type: Message,
@@ -204,12 +230,13 @@ func TestLoadTableMessage(t *testing.T) {
 
 func newTestLoadTable(tableType string, comment string, db *fakesqldb.DB) (*Table, error) {
 	ctx := context.Background()
-	appParams := db.ConnParams()
-	dbaParams := db.ConnParams()
-	connPool := connpool.NewPool(tabletenv.NewEnv(nil, "SchemaTest"), "", tabletenv.ConnPoolConfig{
-		Size:               2,
-		IdleTimeoutSeconds: 10,
-	})
+	appParams := dbconfigs.New(db.ConnParams())
+	dbaParams := dbconfigs.New(db.ConnParams())
+	cfg := tabletenv.ConnPoolConfig{
+		Size:        2,
+		IdleTimeout: 10 * time.Second,
+	}
+	connPool := connpool.NewPool(tabletenv.NewEnv(vtenv.NewTestEnv(), nil, "SchemaTest"), "", cfg)
 	connPool.Open(appParams, dbaParams, appParams)
 	conn, err := connPool.Get(ctx, nil)
 	if err != nil {
@@ -217,7 +244,7 @@ func newTestLoadTable(tableType string, comment string, db *fakesqldb.DB) (*Tabl
 	}
 	defer conn.Recycle()
 
-	return LoadTable(conn, "fakesqldb", "test_table", comment)
+	return LoadTable(conn, "fakesqldb", "test_table", tableType, comment, collations.MySQL8())
 }
 
 func mockLoadTableQueries(db *fakesqldb.DB) {

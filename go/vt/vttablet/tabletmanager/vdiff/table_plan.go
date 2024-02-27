@@ -17,16 +17,26 @@ limitations under the License.
 package vdiff
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
-	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
-
+	"vitess.io/vitess/go/mysql/collations"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/binlog/binlogplayer"
 	"vitess.io/vitess/go/vt/log"
-	querypb "vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/mysqlctl"
 	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
+	"vitess.io/vitess/go/vt/vtgate/engine/opcode"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
+
+const sqlSelectColumnCollations = "select column_name as column_name, collation_name as collation_name from information_schema.columns where table_schema=%a and table_name=%a and column_name in %a"
 
 type tablePlan struct {
 	// sourceQuery and targetQuery are select queries.
@@ -45,14 +55,18 @@ type tablePlan struct {
 
 	// selectPks is the list of pk columns as they appear in the select clause for the diff.
 	selectPks  []int
+	dbName     string
 	table      *tabletmanagerdatapb.TableDefinition
 	orderBy    sqlparser.OrderBy
 	aggregates []*engine.AggregateParams
 }
 
-func (td *tableDiffer) buildTablePlan() (*tablePlan, error) {
-	tp := &tablePlan{table: td.table}
-	statement, err := sqlparser.Parse(td.sourceQuery)
+func (td *tableDiffer) buildTablePlan(dbClient binlogplayer.DBClient, dbName string, collationEnv *collations.Environment) (*tablePlan, error) {
+	tp := &tablePlan{
+		table:  td.table,
+		dbName: dbName,
+	}
+	statement, err := td.wd.ct.vde.parser.Parse(td.sourceQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +77,7 @@ func (td *tableDiffer) buildTablePlan() (*tablePlan, error) {
 
 	sourceSelect := &sqlparser.Select{}
 	targetSelect := &sqlparser.Select{}
-	// aggregates is the list of Aggregate functions, if any.
+	// Aggregates is the list of Aggregate functions, if any.
 	var aggregates []*engine.AggregateParams
 	for _, selExpr := range sel.SelectExprs {
 		switch selExpr := selExpr.(type) {
@@ -76,14 +90,14 @@ func (td *tableDiffer) buildTablePlan() (*tablePlan, error) {
 			}
 		case *sqlparser.AliasedExpr:
 			var targetCol *sqlparser.ColName
-			if !selExpr.As.IsEmpty() {
-				targetCol = &sqlparser.ColName{Name: selExpr.As}
-			} else {
+			if selExpr.As.IsEmpty() {
 				if colAs, ok := selExpr.Expr.(*sqlparser.ColName); ok {
 					targetCol = colAs
 				} else {
 					return nil, fmt.Errorf("expression needs an alias: %v", sqlparser.String(selExpr))
 				}
+			} else {
+				targetCol = &sqlparser.ColName{Name: selExpr.As}
 			}
 			// If the input was "select a as b", then source will use "a" and target will use "b".
 			sourceSelect.SelectExprs = append(sourceSelect.SelectExprs, selExpr)
@@ -91,17 +105,17 @@ func (td *tableDiffer) buildTablePlan() (*tablePlan, error) {
 
 			// Check if it's an aggregate expression
 			if expr, ok := selExpr.Expr.(sqlparser.AggrFunc); ok {
-				switch fname := strings.ToLower(expr.AggrName()); fname {
+				switch fname := expr.AggrName(); fname {
 				case "count", "sum":
 					// this will only work as long as aggregates can be pushed down to tablets
 					// this won't work: "select count(*) from (select id from t limit 1)"
 					// since vreplication only handles simple tables (no joins/derived tables) this is fine for now
 					// but will need to be revisited when we add such support to vreplication
-					aggregateFuncType := "sum"
-					aggregates = append(aggregates, &engine.AggregateParams{
-						Opcode: engine.SupportedAggregates[aggregateFuncType],
-						Col:    len(sourceSelect.SelectExprs) - 1,
-					})
+					aggregates = append(aggregates, engine.NewAggregateParam(
+						/*opcode*/ opcode.AggregateSum,
+						/*offset*/ len(sourceSelect.SelectExprs)-1,
+						/*alias*/ "", collationEnv),
+					)
 				}
 			}
 		default:
@@ -141,12 +155,27 @@ func (td *tableDiffer) buildTablePlan() (*tablePlan, error) {
 		},
 	}
 
-	err = tp.findPKs(targetSelect)
+	if len(tp.table.PrimaryKeyColumns) == 0 {
+		// We use the columns from a PKE if there is one.
+		pkeCols, err := tp.getPKEquivalentColumns(dbClient)
+		if err != nil {
+			return nil, vterrors.Wrapf(err, "error getting PK equivalent columns for table %s", tp.table.Name)
+		}
+		if len(pkeCols) > 0 {
+			tp.table.PrimaryKeyColumns = append(tp.table.PrimaryKeyColumns, pkeCols...)
+		} else {
+			// We use every column together as a substitute PK.
+			tp.table.PrimaryKeyColumns = append(tp.table.PrimaryKeyColumns, tp.table.Columns...)
+		}
+	}
+
+	err = tp.findPKs(dbClient, targetSelect, collationEnv)
 	if err != nil {
 		return nil, err
 	}
+
 	// Remove in_keyrange. It's not understood by mysql.
-	sourceSelect.Where = sel.Where //removeKeyrange(sel.Where)
+	sourceSelect.Where = sel.Where // removeKeyrange(sel.Where)
 	// The source should also perform the group by.
 	sourceSelect.GroupBy = sel.GroupBy
 	sourceSelect.OrderBy = tp.orderBy
@@ -156,8 +185,8 @@ func (td *tableDiffer) buildTablePlan() (*tablePlan, error) {
 
 	tp.sourceQuery = sqlparser.String(sourceSelect)
 	tp.targetQuery = sqlparser.String(targetSelect)
-	log.Info("VDiff query on source: %v", tp.sourceQuery)
-	log.Info("VDiff query on target: %v", tp.targetQuery)
+	log.Infof("VDiff query on source: %v", tp.sourceQuery)
+	log.Infof("VDiff query on target: %v", tp.targetQuery)
 
 	tp.aggregates = aggregates
 	td.tablePlan = tp
@@ -165,7 +194,10 @@ func (td *tableDiffer) buildTablePlan() (*tablePlan, error) {
 }
 
 // findPKs identifies PKs and removes them from the columns to do data comparison.
-func (tp *tablePlan) findPKs(targetSelect *sqlparser.Select) error {
+func (tp *tablePlan) findPKs(dbClient binlogplayer.DBClient, targetSelect *sqlparser.Select, collationEnv *collations.Environment) error {
+	if len(tp.table.PrimaryKeyColumns) == 0 {
+		return nil
+	}
 	var orderby sqlparser.OrderBy
 	for _, pk := range tp.table.PrimaryKeyColumns {
 		found := false
@@ -175,8 +207,8 @@ func (tp *tablePlan) findPKs(targetSelect *sqlparser.Select) error {
 			switch ct := expr.(type) {
 			case *sqlparser.ColName:
 				colname = ct.Name.String()
-			case *sqlparser.FuncExpr: //eg. weight_string()
-				//no-op
+			case *sqlparser.FuncExpr: // eg. weight_string()
+				// no-op
 			default:
 				log.Warningf("Not considering column %v for PK, type %v not handled", selExpr, ct)
 			}
@@ -184,7 +216,7 @@ func (tp *tablePlan) findPKs(targetSelect *sqlparser.Select) error {
 				tp.compareCols[i].isPK = true
 				tp.comparePKs = append(tp.comparePKs, tp.compareCols[i])
 				tp.selectPks = append(tp.selectPks, i)
-				// We'll be comparing pks separately. So, remove them from compareCols.
+				// We'll be comparing PKs separately. So, remove them from compareCols.
 				tp.pkCols = append(tp.pkCols, i)
 				found = true
 				break
@@ -199,6 +231,68 @@ func (tp *tablePlan) findPKs(targetSelect *sqlparser.Select) error {
 			Direction: sqlparser.AscOrder,
 		})
 	}
+	if err := tp.getPKColumnCollations(dbClient, collationEnv); err != nil {
+		return vterrors.Wrapf(err, "error getting PK column collations for table %s", tp.table.Name)
+	}
 	tp.orderBy = orderby
 	return nil
+}
+
+// getPKColumnCollations queries the database to find the collation
+// to use for the each PK column used in the query to ensure proper
+// sorting when we do the merge sort and for the comparisons. It then
+// saves the collations in the tablePlan's comparePKs column info
+// structs for those subsequent operations.
+func (tp *tablePlan) getPKColumnCollations(dbClient binlogplayer.DBClient, collationEnv *collations.Environment) error {
+	if len(tp.comparePKs) == 0 {
+		return nil
+	}
+	columnList := make([]string, len(tp.comparePKs))
+	for i := range tp.comparePKs {
+		columnList[i] = tp.comparePKs[i].colName
+	}
+	columnsBV, err := sqltypes.BuildBindVariable(columnList)
+	if err != nil {
+		return err
+	}
+	query, err := sqlparser.ParseAndBind(sqlSelectColumnCollations,
+		sqltypes.StringBindVariable(tp.dbName),
+		sqltypes.StringBindVariable(tp.table.Name),
+		columnsBV,
+	)
+	if err != nil {
+		return err
+	}
+	qr, err := dbClient.ExecuteFetch(query, len(tp.comparePKs))
+	if err != nil {
+		return err
+	}
+	if qr == nil || len(qr.Rows) != len(tp.comparePKs) {
+		return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] unexpected result for query %s: %+v", query, qr)
+	}
+	for _, row := range qr.Named().Rows {
+		columnName := row["column_name"].ToString()
+		collateName := strings.ToLower(row["collation_name"].ToString())
+		for i := range tp.comparePKs {
+			if strings.EqualFold(tp.comparePKs[i].colName, columnName) {
+				tp.comparePKs[i].collation = collationEnv.LookupByName(collateName)
+				break
+			}
+		}
+	}
+	return nil
+}
+
+func (tp *tablePlan) getPKEquivalentColumns(dbClient binlogplayer.DBClient) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), BackgroundOperationTimeout/2)
+	defer cancel()
+	executeFetch := func(query string, maxrows int, wantfields bool) (*sqltypes.Result, error) {
+		// This sets wantfields to true.
+		return dbClient.ExecuteFetch(query, maxrows)
+	}
+	pkeCols, _, err := mysqlctl.GetPrimaryKeyEquivalentColumns(ctx, executeFetch, tp.dbName, tp.table.Name)
+	if err != nil {
+		return nil, err
+	}
+	return pkeCols, nil
 }

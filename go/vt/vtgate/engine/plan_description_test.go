@@ -19,6 +19,7 @@ package engine
 import (
 	"testing"
 
+	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
 	"vitess.io/vitess/go/test/utils"
@@ -50,7 +51,7 @@ func TestCreateRoutePlanDescription(t *testing.T) {
 }
 
 func createRoute() *Route {
-	hash, _ := vindexes.NewHash("vindex name", nil)
+	hash, _ := vindexes.CreateVindex("hash", "vindex name", nil)
 	return &Route{
 		RoutingParameters: &RoutingParameters{
 			Opcode:            Scatter,
@@ -80,8 +81,8 @@ func TestPlanDescriptionWithInputs(t *testing.T) {
 	expected := PrimitiveDescription{
 		OperatorType: "Limit",
 		Other: map[string]any{
-			"Count":  evalengine.FormatExpr(count),
-			"Offset": evalengine.FormatExpr(offset),
+			"Count":  sqlparser.String(count),
+			"Offset": sqlparser.String(offset),
 		},
 		Inputs: []PrimitiveDescription{routeDescr},
 	}

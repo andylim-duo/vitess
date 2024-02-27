@@ -133,7 +133,7 @@ func TestServingChange(t *testing.T) {
 
 	// changing rdonly tablet to spare (non serving).
 	rdonlyTablet := clusterInstance.Keyspaces[0].Shards[0].Rdonly()
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("ChangeTabletType", rdonlyTablet.Alias, "replica")
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("ChangeTabletType", rdonlyTablet.Alias, "replica")
 	require.NoError(t, err)
 	rdonlyTablet.Type = "replica"
 
@@ -143,12 +143,12 @@ func TestServingChange(t *testing.T) {
 
 	// changing replica tablet to rdonly to make rdonly available for serving.
 	replicaTablet := clusterInstance.Keyspaces[0].Shards[0].Replica()
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("ChangeTabletType", replicaTablet.Alias, "rdonly")
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("ChangeTabletType", replicaTablet.Alias, "rdonly")
 	require.NoError(t, err)
 	replicaTablet.Type = "rdonly"
 
 	// to see/make the new rdonly available
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("Ping", replicaTablet.Alias)
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("PingTablet", replicaTablet.Alias)
 	require.NoError(t, err)
 
 	// this should pass now as there is rdonly present
@@ -174,22 +174,30 @@ func TestServingChangeStreaming(t *testing.T) {
 
 	// changing rdonly tablet to spare (non serving).
 	rdonlyTablet := clusterInstance.Keyspaces[0].Shards[0].Rdonly()
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("ChangeTabletType", rdonlyTablet.Alias, "replica")
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("ChangeTabletType", rdonlyTablet.Alias, "replica")
 	require.NoError(t, err)
 	rdonlyTablet.Type = "replica"
 
 	// this should fail as there is no rdonly present
+	// This can also close the streaming connection if it goes to 80- shard first and sends the fields from that.
+	// Current, stream logic is to close the server connection if partial stream result is sent and an error is received later.
 	_, err = utils.ExecAllowError(t, conn, "select * from test")
 	require.Error(t, err)
 
+	// check if connection is still available
+	_, err = utils.ExecAllowError(t, conn, "select 1")
+	if err != nil {
+		t.Skip("connection is closed, cannot continue with the test")
+	}
+
 	// changing replica tablet to rdonly to make rdonly available for serving.
 	replicaTablet := clusterInstance.Keyspaces[0].Shards[0].Replica()
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("ChangeTabletType", replicaTablet.Alias, "rdonly")
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("ChangeTabletType", replicaTablet.Alias, "rdonly")
 	require.NoError(t, err)
 	replicaTablet.Type = "rdonly"
 
 	// to see/make the new rdonly available
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("Ping", replicaTablet.Alias)
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("PingTablet", replicaTablet.Alias)
 	require.NoError(t, err)
 
 	// this should pass now as there is rdonly present

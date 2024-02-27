@@ -18,21 +18,26 @@ package utils
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
-	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/vt/dbconfigs"
-	"vitess.io/vitess/go/vt/sqlparser"
-
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/collations"
+	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/test/endtoend/cluster"
+	"vitess.io/vitess/go/vt/dbconfigs"
 	"vitess.io/vitess/go/vt/mysqlctl"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
+
+const mysqlShutdownTimeout = 1 * time.Minute
 
 // NewMySQL creates a new MySQL server using the local mysqld binary. The name of the database
 // will be set to `dbName`. SQL queries that need to be executed on the new MySQL instance
@@ -40,7 +45,18 @@ import (
 // The mysql.ConnParams to connect to the new database is returned, along with a function to
 // teardown the database.
 func NewMySQL(cluster *cluster.LocalProcessCluster, dbName string, schemaSQL ...string) (mysql.ConnParams, func(), error) {
-	return NewMySQLWithDetails(cluster.GetAndReservePort(), cluster.Hostname, dbName, schemaSQL...)
+	// Even though we receive schemaSQL as a variadic argument, we ensure to further split it into singular statements.
+	parser := sqlparser.NewTestParser()
+	var sqls []string
+	for _, sql := range schemaSQL {
+		split, err := parser.SplitStatementToPieces(sql)
+		if err != nil {
+			return mysql.ConnParams{}, nil, err
+		}
+		sqls = append(sqls, split...)
+	}
+	mysqlParam, _, closer, error := NewMySQLWithMysqld(cluster.GetAndReservePort(), cluster.Hostname, dbName, sqls...)
+	return mysqlParam, closer, error
 }
 
 // CreateMysqldAndMycnf returns a Mysqld and a Mycnf object to use for working with a MySQL
@@ -56,28 +72,28 @@ func CreateMysqldAndMycnf(tabletUID uint32, mysqlSocket string, mysqlPort int) (
 	var cfg dbconfigs.DBConfigs
 	// ensure the DBA username is 'root' instead of the system's default username so that mysqladmin can shutdown
 	cfg.Dba.User = "root"
-	cfg.InitWithSocket(mycnf.SocketFile)
+	cfg.InitWithSocket(mycnf.SocketFile, collations.MySQL8())
 	return mysqlctl.NewMysqld(&cfg), mycnf, nil
 }
 
-func NewMySQLWithDetails(port int, hostname, dbName string, schemaSQL ...string) (mysql.ConnParams, func(), error) {
+func NewMySQLWithMysqld(port int, hostname, dbName string, schemaSQL ...string) (mysql.ConnParams, *mysqlctl.Mysqld, func(), error) {
 	mysqlDir, err := createMySQLDir()
 	if err != nil {
-		return mysql.ConnParams{}, nil, err
+		return mysql.ConnParams{}, nil, nil, err
 	}
 	initMySQLFile, err := createInitSQLFile(mysqlDir, dbName)
 	if err != nil {
-		return mysql.ConnParams{}, nil, err
+		return mysql.ConnParams{}, nil, nil, err
 	}
 
 	mysqlPort := port
 	mysqld, mycnf, err := CreateMysqldAndMycnf(0, "", mysqlPort)
 	if err != nil {
-		return mysql.ConnParams{}, nil, err
+		return mysql.ConnParams{}, nil, nil, err
 	}
 	err = initMysqld(mysqld, mycnf, initMySQLFile)
 	if err != nil {
-		return mysql.ConnParams{}, nil, err
+		return mysql.ConnParams{}, nil, nil, err
 	}
 
 	params := mysql.ConnParams{
@@ -89,12 +105,12 @@ func NewMySQLWithDetails(port int, hostname, dbName string, schemaSQL ...string)
 	for _, sql := range schemaSQL {
 		err = prepareMySQLWithSchema(params, sql)
 		if err != nil {
-			return mysql.ConnParams{}, nil, err
+			return mysql.ConnParams{}, nil, nil, err
 		}
 	}
-	return params, func() {
+	return params, mysqld, func() {
 		ctx := context.Background()
-		_ = mysqld.Teardown(ctx, mycnf, true)
+		_ = mysqld.Teardown(ctx, mycnf, true, mysqlShutdownTimeout)
 	}, nil
 }
 
@@ -114,7 +130,10 @@ func createInitSQLFile(mysqlDir, ksName string) (string, error) {
 		return "", err
 	}
 	defer f.Close()
-
+	_, err = f.WriteString("SET GLOBAL super_read_only='OFF';")
+	if err != nil {
+		return "", err
+	}
 	_, err = f.WriteString(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s;", ksName))
 	if err != nil {
 		return "", err
@@ -150,60 +169,90 @@ func prepareMySQLWithSchema(params mysql.ConnParams, sql string) error {
 	return nil
 }
 
-func compareVitessAndMySQLResults(t *testing.T, query string, vtQr, mysqlQr *sqltypes.Result, compareColumns bool) {
+func compareVitessAndMySQLResults(t *testing.T, query string, vtConn *mysql.Conn, vtQr, mysqlQr *sqltypes.Result, compareColumnNames bool) error {
+	t.Helper()
+
 	if vtQr == nil && mysqlQr == nil {
-		return
+		return nil
 	}
 	if vtQr == nil {
 		t.Error("Vitess result is 'nil' while MySQL's is not.")
-		return
+		return errors.New("Vitess result is 'nil' while MySQL's is not.\n")
 	}
 	if mysqlQr == nil {
 		t.Error("MySQL result is 'nil' while Vitess' is not.")
-		return
+		return errors.New("MySQL result is 'nil' while Vitess' is not.\n")
 	}
-	if compareColumns {
-		vtColCount := len(vtQr.Fields)
-		myColCount := len(mysqlQr.Fields)
-		if vtColCount > 0 && myColCount > 0 {
-			if vtColCount != myColCount {
-				t.Errorf("column count does not match: %d vs %d", vtColCount, myColCount)
-			}
 
-			var vtCols []string
-			var myCols []string
-			for i, vtField := range vtQr.Fields {
-				vtCols = append(vtCols, vtField.Name)
-				myCols = append(myCols, mysqlQr.Fields[i].Name)
-			}
-			assert.Equal(t, myCols, vtCols, "column names do not match - the expected values are what mysql produced")
+	vtColCount := len(vtQr.Fields)
+	myColCount := len(mysqlQr.Fields)
+
+	if vtColCount != myColCount {
+		t.Errorf("column count does not match: %d vs %d", vtColCount, myColCount)
+	}
+
+	if vtColCount > 0 {
+		var vtCols []string
+		var myCols []string
+		for i, vtField := range vtQr.Fields {
+			myField := mysqlQr.Fields[i]
+			checkFields(t, myField.Name, vtField, myField)
+
+			vtCols = append(vtCols, vtField.Name)
+			myCols = append(myCols, myField.Name)
+		}
+
+		if compareColumnNames && !assert.Equal(t, myCols, vtCols, "column names do not match - the expected values are what mysql produced") {
+			t.Errorf("column names do not match - the expected values are what mysql produced\nNot equal: \nexpected: %v\nactual: %v\n", myCols, vtCols)
 		}
 	}
-	stmt, err := sqlparser.Parse(query)
+
+	stmt, err := sqlparser.NewTestParser().Parse(query)
 	if err != nil {
 		t.Error(err)
-		return
+		return err
 	}
 	orderBy := false
 	if selStmt, isSelStmt := stmt.(sqlparser.SelectStatement); isSelStmt {
 		orderBy = selStmt.GetOrderBy() != nil
 	}
 
-	if orderBy && sqltypes.ResultsEqual([]sqltypes.Result{*vtQr}, []sqltypes.Result{*mysqlQr}) {
-		return
-	} else if sqltypes.ResultsEqualUnordered([]sqltypes.Result{*vtQr}, []sqltypes.Result{*mysqlQr}) {
-		return
+	if (orderBy && sqltypes.ResultsEqual([]sqltypes.Result{*vtQr}, []sqltypes.Result{*mysqlQr})) || sqltypes.ResultsEqualUnordered([]sqltypes.Result{*vtQr}, []sqltypes.Result{*mysqlQr}) {
+		return nil
 	}
 
 	errStr := "Query (" + query + ") results mismatched.\nVitess Results:\n"
 	for _, row := range vtQr.Rows {
 		errStr += fmt.Sprintf("%s\n", row)
 	}
+	errStr += fmt.Sprintf("Vitess RowsAffected: %v\n", vtQr.RowsAffected)
 	errStr += "MySQL Results:\n"
 	for _, row := range mysqlQr.Rows {
 		errStr += fmt.Sprintf("%s\n", row)
 	}
+	errStr += fmt.Sprintf("MySQL RowsAffected: %v\n", mysqlQr.RowsAffected)
+	if vtConn != nil {
+		qr, _ := ExecAllowError(t, vtConn, fmt.Sprintf("vexplain plan %s", query))
+		if qr != nil && len(qr.Rows) > 0 {
+			errStr += fmt.Sprintf("query plan: \n%s\n", qr.Rows[0][0].ToString())
+		}
+	}
 	t.Error(errStr)
+	return errors.New(errStr)
+}
+
+func checkFields(t *testing.T, columnName string, vtField, myField *querypb.Field) {
+	t.Helper()
+	if vtField.Type != myField.Type {
+		t.Errorf("for column %s field types do not match\nNot equal: \nMySQL: %v\nVitess: %v\n", columnName, myField.Type.String(), vtField.Type.String())
+	}
+
+	// starting in Vitess 20, decimal types are properly sized in their field information
+	if BinaryIsAtLeastAtVersion(20, "vtgate") && vtField.Type == sqltypes.Decimal {
+		if vtField.Decimals != myField.Decimals {
+			t.Errorf("for column %s field decimals count do not match\nNot equal: \nMySQL: %v\nVitess: %v\n", columnName, myField.Decimals, vtField.Decimals)
+		}
+	}
 }
 
 func compareVitessAndMySQLErrors(t *testing.T, vtErr, mysqlErr error) {

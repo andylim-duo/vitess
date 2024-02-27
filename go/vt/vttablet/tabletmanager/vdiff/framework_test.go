@@ -40,6 +40,7 @@ import (
 	"vitess.io/vitess/go/vt/vttablet/tabletconntest"
 	"vitess.io/vitess/go/vt/vttablet/tabletmanager/vreplication"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/vstreamer"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/vstreamer/testenv"
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
@@ -99,16 +100,26 @@ var (
 				Columns:           []string{"id", "dt"},
 				PrimaryKeyColumns: []string{"id"},
 				Fields:            sqltypes.MakeTestFields("id|dt", "int64|datetime"),
+			}, {
+				Name:    "nopk",
+				Columns: []string{"c1", "c2", "c3"},
+				Fields:  sqltypes.MakeTestFields("c1|c2|c3", "int64|int64|int64"),
+			}, {
+				Name:    "nopkwithpke",
+				Columns: []string{"c1", "c2", "c3"},
+				Fields:  sqltypes.MakeTestFields("c1|c2|c3", "int64|int64|int64"),
 			},
 		},
 	}
 	tableDefMap = map[string]int{
-		"t1":        0,
-		"nonpktext": 1,
-		"pktext":    2,
-		"multipk":   3,
-		"aggr":      4,
-		"datze":     5,
+		"t1":          0,
+		"nonpktext":   1,
+		"pktext":      2,
+		"multipk":     3,
+		"aggr":        4,
+		"datze":       5,
+		"nopk":        6,
+		"nopkwithpke": 7,
 	}
 )
 
@@ -173,7 +184,9 @@ func init() {
 func TestMain(m *testing.M) {
 	exitCode := func() int {
 		var err error
-		tstenv, err = testenv.Init()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		tstenv, err = testenv.Init(ctx)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%v", err)
 			return 1
@@ -194,7 +207,7 @@ func resetBinlogClient() {
 // has verified the necessary behavior.
 func shortCircuitTestAfterQuery(query string, dbClient *binlogplayer.MockDBClient) {
 	dbClient.ExpectRequest(query, singleRowAffected, fmt.Errorf("Short circuiting test"))
-	dbClient.ExpectRequest("update _vt.vdiff set state = 'error', last_error = 'Short circuiting test'  where id = 1", singleRowAffected, nil)
+	dbClient.ExpectRequest("update _vt.vdiff set state = 'error', last_error = left('Short circuiting test', 1024)  where id = 1", singleRowAffected, nil)
 	dbClient.ExpectRequest("insert into _vt.vdiff_log(vdiff_id, message) values (1, 'State changed to: error')", singleRowAffected, nil)
 	dbClient.ExpectRequest("insert into _vt.vdiff_log(vdiff_id, message) values (1, 'Error: Short circuiting test')", singleRowAffected, nil)
 }
@@ -235,7 +248,7 @@ func (ftc *fakeTabletConn) VStream(ctx context.Context, request *binlogdatapb.VS
 	if vstreamHook != nil {
 		vstreamHook(ctx)
 	}
-	return vdiffenv.vse.Stream(ctx, request.Position, request.TableLastPKs, request.Filter, send)
+	return vdiffenv.vse.Stream(ctx, request.Position, request.TableLastPKs, request.Filter, throttlerapp.VStreamerName, send)
 }
 
 // vstreamRowsHook allows you to do work just before calling VStreamRows.
@@ -393,6 +406,22 @@ func (dbc *realDBClient) ExecuteFetch(query string, maxrows int) (*sqltypes.Resu
 	return qr, err
 }
 
+func (dbc *realDBClient) ExecuteFetchMulti(query string, maxrows int) ([]*sqltypes.Result, error) {
+	queries, err := sqlparser.NewTestParser().SplitStatementToPieces(query)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]*sqltypes.Result, 0, len(queries))
+	for _, query := range queries {
+		qr, err := dbc.ExecuteFetch(query, maxrows)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, qr)
+	}
+	return results, nil
+}
+
 //----------------------------------------------
 // fakeTMClient
 
@@ -475,6 +504,10 @@ func (tmc *fakeTMClient) PrimaryPosition(ctx context.Context, tablet *topodatapb
 		return "", fmt.Errorf("no primary position for %d", tablet.Alias.Uid)
 	}
 	return pos, nil
+}
+
+func (tmc *fakeTMClient) CheckThrottler(ctx context.Context, tablet *topodatapb.Tablet, request *tabletmanagerdatapb.CheckThrottlerRequest) (*tabletmanagerdatapb.CheckThrottlerResponse, error) {
+	return &tabletmanagerdatapb.CheckThrottlerResponse{}, nil
 }
 
 // ----------------------------------------------

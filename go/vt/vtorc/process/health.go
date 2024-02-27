@@ -32,6 +32,7 @@ import (
 var lastHealthCheckUnixNano int64
 var lastGoodHealthCheckUnixNano int64
 var LastContinousCheckHealthy int64
+var FirstDiscoveryCycleComplete atomic.Bool
 
 var lastHealthCheckCache = cache.New(config.HealthPollSeconds*time.Second, time.Second)
 
@@ -73,6 +74,7 @@ type HealthStatus struct {
 	Hostname           string
 	Token              string
 	IsActiveNode       bool
+	DiscoveredOnce     bool
 	ActiveNode         *NodeHealth
 	Error              error
 	AvailableNodes     [](*NodeHealth)
@@ -106,7 +108,9 @@ func RegisterNode(nodeHealth *NodeHealth) (healthy bool, err error) {
 func HealthTest() (health *HealthStatus, err error) {
 	cacheKey := util.ProcessToken.Hash
 	if healthStatus, found := lastHealthCheckCache.Get(cacheKey); found {
-		return healthStatus.(*HealthStatus), nil
+		health = healthStatus.(*HealthStatus)
+		health.DiscoveredOnce = FirstDiscoveryCycleComplete.Load()
+		return
 	}
 
 	health = &HealthStatus{Healthy: false, Hostname: ThisHostname, Token: util.ProcessToken.Hash}
@@ -119,6 +123,7 @@ func HealthTest() (health *HealthStatus, err error) {
 		return health, err
 	}
 	health.Healthy = healthy
+	health.DiscoveredOnce = FirstDiscoveryCycleComplete.Load()
 
 	if health.ActiveNode, health.IsActiveNode, err = ElectedNode(); err != nil {
 		health.Error = err

@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"testing"
 
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+
 	"vitess.io/vitess/go/mysql/collations"
 
 	"vitess.io/vitess/go/test/utils"
@@ -65,12 +67,12 @@ func TestDistinct(t *testing.T) {
 		expectedError: "text type with an unknown/unsupported collation cannot be hashed",
 	}, {
 		testName:       "varchar columns with collations",
-		collations:     []collations.ID{collations.ID(0x21)},
+		collations:     []collations.ID{collations.CollationUtf8mb4ID},
 		inputs:         r("myid", "varchar", "monkey", "horse", "Horse", "Monkey", "horses", "MONKEY"),
 		expectedResult: r("myid", "varchar", "monkey", "horse", "horses"),
 	}, {
 		testName:       "mixed columns",
-		collations:     []collations.ID{collations.ID(0x21), collations.Unknown},
+		collations:     []collations.ID{collations.CollationUtf8mb4ID, collations.Unknown},
 		inputs:         r("myid|id", "varchar|int64", "monkey|1", "horse|1", "Horse|1", "Monkey|1", "horses|1", "MONKEY|2"),
 		expectedResult: r("myid|id", "varchar|int64", "monkey|1", "horse|1", "horses|1", "MONKEY|2"),
 	}}
@@ -87,8 +89,9 @@ func TestDistinct(t *testing.T) {
 					collID = collations.CollationBinaryID
 				}
 				checkCols = append(checkCols, CheckCol{
-					Col:       i,
-					Collation: collID,
+					Col:          i,
+					Type:         evalengine.NewTypeEx(tc.inputs.Fields[i].Type, collID, false, 0, 0),
+					CollationEnv: collations.MySQL8(),
 				})
 			}
 		}
@@ -96,7 +99,6 @@ func TestDistinct(t *testing.T) {
 			distinct := &Distinct{
 				Source:    &fakePrimitive{results: []*sqltypes.Result{tc.inputs}},
 				CheckCols: checkCols,
-				Truncate:  false,
 			}
 
 			qr, err := distinct.TryExecute(context.Background(), &noopVCursor{}, nil, true)
@@ -129,12 +131,64 @@ func TestDistinct(t *testing.T) {
 	}
 }
 
+func TestDistinctStreamAsync(t *testing.T) {
+	distinct := &Distinct{
+		Source: &fakePrimitive{
+			results: sqltypes.MakeTestStreamingResults(sqltypes.MakeTestFields("myid|id|num|name", "varchar|int64|int64|varchar"),
+				"a|1|1|a",
+				"a|1|1|a",
+				"a|1|1|a",
+				"a|1|1|a",
+				"---",
+				"c|1|1|a",
+				"a|1|1|a",
+				"z|1|1|a",
+				"a|1|1|t",
+				"a|1|1|a",
+				"a|1|1|a",
+				"a|1|1|a",
+				"---",
+				"c|1|1|a",
+				"a|1|1|a",
+				"---",
+				"c|1|1|a",
+				"a|1|1|a",
+				"a|1|1|a",
+				"c|1|1|a",
+				"a|1|1|a",
+				"a|1|1|a",
+				"---",
+				"c|1|1|a",
+				"a|1|1|a",
+			),
+			async: true,
+		},
+		CheckCols: []CheckCol{
+			{Col: 0, Type: evalengine.NewType(sqltypes.VarChar, collations.CollationUtf8mb4ID)},
+			{Col: 1, Type: evalengine.NewType(sqltypes.Int64, collations.CollationBinaryID)},
+			{Col: 2, Type: evalengine.NewType(sqltypes.Int64, collations.CollationBinaryID)},
+			{Col: 3, Type: evalengine.NewType(sqltypes.VarChar, collations.CollationUtf8mb4ID)},
+		},
+	}
+
+	qr := &sqltypes.Result{}
+	err := distinct.TryStreamExecute(context.Background(), &noopVCursor{}, nil, true, func(result *sqltypes.Result) error {
+		qr.Rows = append(qr.Rows, result.Rows...)
+		return nil
+	})
+	require.NoError(t, err)
+	require.NoError(t, sqltypes.RowsEqualsStr(`
+[[VARCHAR("c") INT64(1) INT64(1) VARCHAR("a")] 
+[VARCHAR("a") INT64(1) INT64(1) VARCHAR("a")] 
+[VARCHAR("z") INT64(1) INT64(1) VARCHAR("a")] 
+[VARCHAR("a") INT64(1) INT64(1) VARCHAR("t")]]`, qr.Rows))
+}
+
 func TestWeightStringFallBack(t *testing.T) {
 	offsetOne := 1
 	checkCols := []CheckCol{{
-		Col:       0,
-		WsCol:     &offsetOne,
-		Collation: collations.Unknown,
+		Col:   0,
+		WsCol: &offsetOne,
 	}}
 	input := r("myid|weightstring(myid)",
 		"varchar|varbinary",
@@ -145,7 +199,7 @@ func TestWeightStringFallBack(t *testing.T) {
 	distinct := &Distinct{
 		Source:    &fakePrimitive{results: []*sqltypes.Result{input}},
 		CheckCols: checkCols,
-		Truncate:  true,
+		Truncate:  1,
 	}
 
 	qr, err := distinct.TryExecute(context.Background(), &noopVCursor{}, nil, true)
@@ -157,8 +211,7 @@ func TestWeightStringFallBack(t *testing.T) {
 
 	// the primitive must not change just because one run needed weight strings
 	utils.MustMatch(t, []CheckCol{{
-		Col:       0,
-		WsCol:     &offsetOne,
-		Collation: collations.Unknown,
+		Col:   0,
+		WsCol: &offsetOne,
 	}}, distinct.CheckCols, "checkCols should not be updated")
 }

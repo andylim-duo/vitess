@@ -21,7 +21,12 @@ import (
 	"fmt"
 	"testing"
 
+	"vitess.io/vitess/go/test/vschemawrapper"
+	"vitess.io/vitess/go/vt/vtenv"
+
 	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/mysql/collations"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/sqlparser"
@@ -29,8 +34,9 @@ import (
 )
 
 func TestBuildDBPlan(t *testing.T) {
-	vschema := &vschemaWrapper{
-		keyspace: &vindexes.Keyspace{Name: "main"},
+	vschema := &vschemawrapper.VSchemaWrapper{
+		Keyspace: &vindexes.Keyspace{Name: "main"},
+		Env:      vtenv.NewTestEnv(),
 	}
 
 	testCases := []struct {
@@ -46,7 +52,7 @@ func TestBuildDBPlan(t *testing.T) {
 
 	for _, s := range testCases {
 		t.Run(s.query, func(t *testing.T) {
-			parserOut, err := sqlparser.Parse(s.query)
+			parserOut, err := sqlparser.NewTestParser().Parse(s.query)
 			require.NoError(t, err)
 
 			show := parserOut.(*sqlparser.Show)
@@ -61,56 +67,56 @@ func TestBuildDBPlan(t *testing.T) {
 }
 
 func TestGenerateCharsetRows(t *testing.T) {
-	rows := make([][]sqltypes.Value, 0, 4)
 	rows0 := [][]sqltypes.Value{
 		append(buildVarCharRow(
-			"utf8",
+			"utf8mb3",
 			"UTF-8 Unicode",
-			"utf8_general_ci"),
-			sqltypes.NewInt32(3)),
+			"utf8mb3_general_ci"),
+			sqltypes.NewUint32(3)),
 	}
 	rows1 := [][]sqltypes.Value{
 		append(buildVarCharRow(
 			"utf8mb4",
 			"UTF-8 Unicode",
-			"utf8mb4_general_ci"),
-			sqltypes.NewInt32(4)),
+			collations.MySQL8().LookupName(collations.MySQL8().DefaultConnectionCharset())),
+			sqltypes.NewUint32(4)),
 	}
 	rows2 := [][]sqltypes.Value{
 		append(buildVarCharRow(
-			"utf8",
+			"utf8mb3",
 			"UTF-8 Unicode",
-			"utf8_general_ci"),
-			sqltypes.NewInt32(3)),
+			"utf8mb3_general_ci"),
+			sqltypes.NewUint32(3)),
 		append(buildVarCharRow(
 			"utf8mb4",
 			"UTF-8 Unicode",
-			"utf8mb4_general_ci"),
-			sqltypes.NewInt32(4)),
+			collations.MySQL8().LookupName(collations.MySQL8().DefaultConnectionCharset())),
+			sqltypes.NewUint32(4)),
 	}
 
 	testcases := []struct {
 		input    string
 		expected [][]sqltypes.Value
 	}{
-		{input: "show charset", expected: rows2},
-		{input: "show character set", expected: rows2},
-		{input: "show charset where charset like 'foo%'", expected: rows},
-		{input: "show charset where charset like 'utf8%'", expected: rows0},
-		{input: "show charset where charset = 'utf8'", expected: rows0},
-		{input: "show charset where charset = 'foo%'", expected: rows},
+		{input: "show charset", expected: charsets()},
+		{input: "show character set", expected: charsets()},
+		{input: "show charset where charset like 'foo%'", expected: nil},
+		{input: "show charset where charset like 'utf8%'", expected: rows2},
+		{input: "show charset where charset like 'utf8mb3%'", expected: rows0},
+		{input: "show charset where charset like 'foo%'", expected: nil},
+		{input: "show character set where charset like '%foo'", expected: nil},
+		{input: "show charset where charset = 'utf8mb3'", expected: rows0},
+		{input: "show charset where charset = 'foo%'", expected: nil},
 		{input: "show charset where charset = 'utf8mb4'", expected: rows1},
 	}
 
-	charsets := []string{"utf8", "utf8mb4"}
-
 	for _, tc := range testcases {
 		t.Run(tc.input, func(t *testing.T) {
-			stmt, err := sqlparser.Parse(tc.input)
+			stmt, err := sqlparser.NewTestParser().Parse(tc.input)
 			require.NoError(t, err)
 			match := stmt.(*sqlparser.Show).Internal.(*sqlparser.ShowBasic)
 			filter := match.Filter
-			actual, err := generateCharsetRows(filter, charsets)
+			actual, err := generateCharsetRows(filter)
 			require.NoError(t, err)
 			require.Equal(t, tc.expected, actual)
 		})

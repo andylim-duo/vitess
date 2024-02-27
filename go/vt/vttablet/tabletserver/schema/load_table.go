@@ -26,6 +26,7 @@ import (
 	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/mysqlctl"
+	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
@@ -33,8 +34,8 @@ import (
 )
 
 // LoadTable creates a Table from the schema info in the database.
-func LoadTable(conn *connpool.DBConn, databaseName, tableName string, comment string) (*Table, error) {
-	ta := NewTable(tableName)
+func LoadTable(conn *connpool.PooledConn, databaseName, tableName, tableType string, comment string, collationEnv *collations.Environment) (*Table, error) {
+	ta := NewTable(tableName, NoType)
 	sqlTableName := sqlparser.String(ta.Name)
 	if err := fetchColumns(ta, conn, databaseName, sqlTableName); err != nil {
 		return nil, err
@@ -44,18 +45,20 @@ func LoadTable(conn *connpool.DBConn, databaseName, tableName string, comment st
 		ta.Type = Sequence
 		ta.SequenceInfo = &SequenceInfo{}
 	case strings.Contains(comment, "vitess_message"):
-		if err := loadMessageInfo(ta, comment); err != nil {
+		if err := loadMessageInfo(ta, comment, collationEnv); err != nil {
 			return nil, err
 		}
 		ta.Type = Message
+	case strings.Contains(tableType, tmutils.TableView):
+		ta.Type = View
 	}
 	return ta, nil
 }
 
-func fetchColumns(ta *Table, conn *connpool.DBConn, databaseName, sqlTableName string) error {
+func fetchColumns(ta *Table, conn *connpool.PooledConn, databaseName, sqlTableName string) error {
 	ctx := context.Background()
 	exec := func(query string, maxRows int, wantFields bool) (*sqltypes.Result, error) {
-		return conn.Exec(ctx, query, maxRows, wantFields)
+		return conn.Conn.Exec(ctx, query, maxRows, wantFields)
 	}
 	fields, _, err := mysqlctl.GetColumns(databaseName, sqlTableName, exec)
 	if err != nil {
@@ -65,7 +68,7 @@ func fetchColumns(ta *Table, conn *connpool.DBConn, databaseName, sqlTableName s
 	return nil
 }
 
-func loadMessageInfo(ta *Table, comment string) error {
+func loadMessageInfo(ta *Table, comment string, collationEnv *collations.Environment) error {
 	ta.MessageInfo = &MessageInfo{}
 	// Extract keyvalues.
 	keyvals := make(map[string]string)
@@ -149,7 +152,7 @@ func loadMessageInfo(ta *Table, comment string) error {
 		if specifiedCols[0] != "id" {
 			return fmt.Errorf("vt_message_cols must begin with id: %s", ta.Name.String())
 		}
-		ta.MessageInfo.Fields = getSpecifiedMessageFields(ta.Fields, specifiedCols)
+		ta.MessageInfo.Fields = getSpecifiedMessageFields(ta.Fields, specifiedCols, collationEnv)
 	} else {
 		ta.MessageInfo.Fields = getDefaultMessageFields(ta.Fields, hiddenCols)
 	}
@@ -208,11 +211,11 @@ func getDefaultMessageFields(tableFields []*querypb.Field, hiddenCols map[string
 
 // we have already validated that all the specified columns exist in the table schema, so we don't need to
 // check again and possibly return an error here.
-func getSpecifiedMessageFields(tableFields []*querypb.Field, specifiedCols []string) []*querypb.Field {
+func getSpecifiedMessageFields(tableFields []*querypb.Field, specifiedCols []string, collationEnv *collations.Environment) []*querypb.Field {
 	fields := make([]*querypb.Field, 0, len(specifiedCols))
 	for _, col := range specifiedCols {
 		for _, field := range tableFields {
-			if res, _ := evalengine.NullsafeCompare(sqltypes.NewVarChar(field.Name), sqltypes.NewVarChar(strings.TrimSpace(col)), collations.Default()); res == 0 {
+			if res, _ := evalengine.NullsafeCompare(sqltypes.NewVarChar(field.Name), sqltypes.NewVarChar(strings.TrimSpace(col)), collationEnv, collationEnv.DefaultConnectionCharset()); res == 0 {
 				fields = append(fields, field)
 				break
 			}

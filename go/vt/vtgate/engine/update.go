@@ -36,19 +36,19 @@ var _ Primitive = (*Update)(nil)
 
 // VindexValues contains changed values for a vindex.
 type VindexValues struct {
-	PvMap  map[string]evalengine.Expr
-	Offset int // Offset from ownedVindexQuery to provide input decision for vindex update.
+	EvalExprMap map[string]evalengine.Expr
+	Offset      int // Offset from ownedVindexQuery to provide input decision for vindex update.
 }
 
 // Update represents the instructions to perform an update.
 type Update struct {
+	// Update does not take inputs
+	noInputs
+
 	*DML
 
 	// ChangedVindexValues contains values for updated Vindexes during an update statement.
 	ChangedVindexValues map[string]*VindexValues
-
-	// Update does not take inputs
-	noInputs
 }
 
 // TryExecute performs a non-streaming exec.
@@ -120,7 +120,7 @@ func (upd *Update) updateVindexEntries(ctx context.Context, vcursor VCursor, bin
 	for colNum, field := range subQueryResult.Fields {
 		fieldColNumMap[field.Name] = colNum
 	}
-	env := evalengine.EnvWithBindVars(bindVars, vcursor.ConnCollation())
+	env := evalengine.NewExpressionEnv(ctx, bindVars, vcursor)
 
 	for _, row := range subQueryResult.Rows {
 		ksid, err := resolveKeyspaceID(ctx, vcursor, upd.KsidVindex, row[0:upd.KsidLength])
@@ -128,11 +128,7 @@ func (upd *Update) updateVindexEntries(ctx context.Context, vcursor VCursor, bin
 			return err
 		}
 
-		vindexTable, err := upd.GetSingleTable()
-		if err != nil {
-			return err
-		}
-		for _, colVindex := range vindexTable.ColumnVindexes {
+		for _, colVindex := range upd.Vindexes {
 			// Skip this vindex if no rows are being changed
 			updColValues, ok := upd.ChangedVindexValues[colVindex.Name]
 			if !ok {
@@ -141,7 +137,7 @@ func (upd *Update) updateVindexEntries(ctx context.Context, vcursor VCursor, bin
 
 			offset := updColValues.Offset
 			if !row[offset].IsNull() {
-				val, err := evalengine.ToInt64(row[offset])
+				val, err := row[offset].ToCastInt64()
 				if err != nil {
 					return err
 				}
@@ -156,12 +152,12 @@ func (upd *Update) updateVindexEntries(ctx context.Context, vcursor VCursor, bin
 				// Fetch the column values.
 				origColValue := row[fieldColNumMap[vCol.String()]]
 				fromIds = append(fromIds, origColValue)
-				if colValue, exists := updColValues.PvMap[vCol.String()]; exists {
+				if colValue, exists := updColValues.EvalExprMap[vCol.String()]; exists {
 					resolvedVal, err := env.Evaluate(colValue)
 					if err != nil {
 						return err
 					}
-					vindexColumnKeys = append(vindexColumnKeys, resolvedVal.Value())
+					vindexColumnKeys = append(vindexColumnKeys, resolvedVal.Value(vcursor.ConnCollation()))
 				} else {
 					// Set the column value to original as this column in vindex is not updated.
 					vindexColumnKeys = append(vindexColumnKeys, origColValue)
@@ -208,6 +204,7 @@ func (upd *Update) description() PrimitiveDescription {
 		"OwnedVindexQuery":     upd.OwnedVindexQuery,
 		"MultiShardAutocommit": upd.MultiShardAutocommit,
 		"QueryTimeout":         upd.QueryTimeout,
+		"NoAutoCommit":         upd.PreventAutoCommit,
 	}
 
 	addFieldsIfNotEmpty(upd.DML, other)

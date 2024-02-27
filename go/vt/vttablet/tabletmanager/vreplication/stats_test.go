@@ -18,16 +18,20 @@ package vreplication
 
 import (
 	"bytes"
-	"html/template"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/safehtml/template"
 	"github.com/stretchr/testify/require"
 
-	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/replication"
+	"vitess.io/vitess/go/stats"
+
 	"vitess.io/vitess/go/vt/binlog/binlogplayer"
 	"vitess.io/vitess/go/vt/proto/binlogdata"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 var wantOut = `
@@ -72,12 +76,13 @@ VReplication state: Open</br>
 `
 
 func TestStatusHtml(t *testing.T) {
-	pos, err := mysql.DecodePosition("MariaDB/1-2-3")
+	pos, err := replication.DecodePosition("MariaDB/1-2-3")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	blpStats := binlogplayer.NewStats()
+	defer blpStats.Stop()
 	blpStats.SetLastPosition(pos)
 	blpStats.ReplicationLagSeconds.Store(2)
 	blpStats.History.Add(&binlogplayer.StatsHistoryRecord{Time: time.Now(), Message: "Test Message1"})
@@ -107,8 +112,14 @@ func TestStatusHtml(t *testing.T) {
 			done:     make(chan struct{}),
 		},
 	}
-	testStats.controllers[1].sourceTablet.Store("src1")
-	testStats.controllers[2].sourceTablet.Store("src2")
+	testStats.controllers[1].sourceTablet.Store(&topodatapb.TabletAlias{
+		Cell: "zone1",
+		Uid:  01,
+	})
+	testStats.controllers[2].sourceTablet.Store(&topodatapb.TabletAlias{
+		Cell: "zone1",
+		Uid:  02,
+	})
 	close(testStats.controllers[2].done)
 
 	tpl := template.Must(template.New("test").Parse(vreplicationTemplate))
@@ -121,8 +132,10 @@ func TestStatusHtml(t *testing.T) {
 
 func TestVReplicationStats(t *testing.T) {
 	blpStats := binlogplayer.NewStats()
-
-	testStats := &vrStats{}
+	defer blpStats.Stop()
+	testStats := &vrStats{
+		ThrottledCount: stats.NewCounter("", ""),
+	}
 	testStats.isOpen = true
 	testStats.controllers = map[int32]*controller{
 		1: {
@@ -135,7 +148,10 @@ func TestVReplicationStats(t *testing.T) {
 			done:     make(chan struct{}),
 		},
 	}
-	testStats.controllers[1].sourceTablet.Store("src1")
+	testStats.controllers[1].sourceTablet.Store(&topodatapb.TabletAlias{
+		Cell: "zone1",
+		Uid:  01,
+	})
 
 	sleepTime := 1 * time.Millisecond
 	record := func(phase string) {
@@ -156,10 +172,28 @@ func TestVReplicationStats(t *testing.T) {
 	require.Equal(t, int64(11), testStats.status().Controllers[0].QueryCounts["replicate"])
 	require.Equal(t, int64(23), testStats.status().Controllers[0].QueryCounts["fastforward"])
 
+	blpStats.BulkQueryCount.Add("insert", 101)
+	blpStats.BulkQueryCount.Add("delete", 203)
+	require.Equal(t, int64(101), testStats.status().Controllers[0].BulkQueryCounts["insert"])
+	require.Equal(t, int64(203), testStats.status().Controllers[0].BulkQueryCounts["delete"])
+
+	blpStats.TrxQueryBatchCount.Add("without_commit", 10)
+	blpStats.TrxQueryBatchCount.Add("with_commit", 2193)
+	require.Equal(t, int64(10), testStats.status().Controllers[0].TrxQueryBatchCounts["without_commit"])
+	require.Equal(t, int64(2193), testStats.status().Controllers[0].TrxQueryBatchCounts["with_commit"])
+
 	blpStats.CopyLoopCount.Add(100)
 	blpStats.CopyRowCount.Add(200)
 	require.Equal(t, int64(100), testStats.status().Controllers[0].CopyLoopCount)
 	require.Equal(t, int64(200), testStats.status().Controllers[0].CopyRowCount)
+
+	testStats.ThrottledCount.Add(99)
+	require.Equal(t, int64(99), testStats.ThrottledCount.Get())
+
+	blpStats.ThrottledCounts.Add([]string{"tablet", "vcopier"}, 10)
+	blpStats.ThrottledCounts.Add([]string{"tablet", "vplayer"}, 80)
+	require.Equal(t, int64(10), testStats.controllers[1].blpStats.ThrottledCounts.Counts()["tablet.vcopier"])
+	require.Equal(t, int64(80), testStats.controllers[1].blpStats.ThrottledCounts.Counts()["tablet.vplayer"])
 
 	var tm int64 = 1234567890
 	blpStats.RecordHeartbeat(tm)

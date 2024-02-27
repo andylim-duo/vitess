@@ -52,7 +52,7 @@ function createRelease () {
   rm -f ./.github/workflows/code_freeze.yml.bak
 
   # Wait for release notes to be injected in the code base
-  echo -n Pausing so relase notes can be added. Press enter to continue
+  echo -n Pausing so release notes can be added. Press enter to continue
   read line
 
   git add --all
@@ -61,7 +61,6 @@ function createRelease () {
   # Preparing the release commit
   updateVitessExamples $RELEASE_VERSION $VTOP_VERSION
   updateJava $RELEASE_VERSION
-  updateDockerReleaseScript $RELEASE_VERSION
   updateVersionGo $RELEASE_VERSION
 
   ## Create the commit for this release and tag it
@@ -88,7 +87,7 @@ echo " "
 echo "   git push upstream $current_branch"
 echo " "
 echo " "
-echo "Once pushed, please execute the following gh command to create the Pull Requests. Please replace 'USER_ON_WHICH_YOU_PUSHED' with the user/org on which you pushed the two branches."
+echo "Once pushed, please execute the following gh command to create the Pull Requests. Please replace 'USER_ON_WHICH_YOU_PUSHED' with the user/org on which you pushed the branch."
 echo " "
 echo "   gh pr create -w --title 'Release of v$RELEASE_VERSION' --base $BASE_BRANCH --head USER_ON_WHICH_YOU_PUSHED:$current_branch --label 'Type: Release','Component: General','Do Not Merge' --body 'Includes the release notes and release commit for the v$RELEASE_VERSION release. Once this PR is merged, we will be able to tag v$RELEASE_VERSION on the merge commit.'"
 echo " "

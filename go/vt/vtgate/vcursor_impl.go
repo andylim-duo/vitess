@@ -19,18 +19,17 @@ package vtgate
 import (
 	"context"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"sync/atomic"
-
-	"vitess.io/vitess/go/vt/vtgate/logstats"
-
-	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
+	"time"
 
 	"github.com/google/uuid"
 
-	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/mysql/collations"
+	"vitess.io/vitess/go/mysql/config"
+	"vitess.io/vitess/go/mysql/sqlerror"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/callerid"
 	"vitess.io/vitess/go/vt/discovery"
@@ -39,6 +38,7 @@ import (
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
+	vtctldatapb "vitess.io/vitess/go/vt/proto/vtctldata"
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/sqlparser"
@@ -46,12 +46,16 @@ import (
 	"vitess.io/vitess/go/vt/topo"
 	topoprotopb "vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/topotools"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/buffer"
 	"vitess.io/vitess/go/vt/vtgate/engine"
+	"vitess.io/vitess/go/vt/vtgate/logstats"
+	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 	"vitess.io/vitess/go/vt/vtgate/semantics"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
 	"vitess.io/vitess/go/vt/vtgate/vschemaacl"
+	"vitess.io/vitess/go/vt/vtgate/vtgateservice"
 )
 
 var _ engine.VCursor = (*vcursorImpl)(nil)
@@ -61,7 +65,7 @@ var _ vindexes.VCursor = (*vcursorImpl)(nil)
 
 // vcursor_impl needs these facilities to be able to be able to execute queries for vindexes
 type iExecute interface {
-	Execute(ctx context.Context, method string, session *SafeSession, s string, vars map[string]*querypb.BindVariable) (*sqltypes.Result, error)
+	Execute(ctx context.Context, mysqlCtx vtgateservice.MySQLConnection, method string, session *SafeSession, s string, vars map[string]*querypb.BindVariable) (*sqltypes.Result, error)
 	ExecuteMultiShard(ctx context.Context, primitive engine.Primitive, rss []*srvtopo.ResolvedShard, queries []*querypb.BoundQuery, session *SafeSession, autocommit bool, ignoreMaxMemoryRows bool) (qr *sqltypes.Result, errs []error)
 	StreamExecuteMulti(ctx context.Context, primitive engine.Primitive, query string, rss []*srvtopo.ResolvedShard, vars []map[string]*querypb.BindVariable, session *SafeSession, autocommit bool, callback func(reply *sqltypes.Result) error) []error
 	ExecuteLock(ctx context.Context, rs *srvtopo.ResolvedShard, query *querypb.BoundQuery, session *SafeSession, lockFuncType sqlparser.LockingFuncType) (*sqltypes.Result, error)
@@ -79,6 +83,9 @@ type iExecute interface {
 	// TODO: remove when resolver is gone
 	ParseDestinationTarget(targetString string) (string, topodatapb.TabletType, key.Destination, error)
 	VSchema() *vindexes.VSchema
+	planPrepareStmt(ctx context.Context, vcursor *vcursorImpl, query string) (*engine.Plan, sqlparser.Statement, error)
+
+	environment() *vtenv.Environment
 }
 
 // VSchemaOperator is an interface to Vschema Operations
@@ -101,6 +108,11 @@ type vcursorImpl struct {
 	logStats       *logstats.LogStats
 	collation      collations.ID
 
+	// fkChecksState stores the state of foreign key checks variable.
+	// This state is meant to be the final fk checks state after consulting the
+	// session state, and the given query's comments for `SET_VAR` optimizer hints.
+	// A nil value represents that no foreign_key_checks value was provided.
+	fkChecksState       *bool
 	ignoreMaxMemoryRows bool
 	vschema             *vindexes.VSchema
 	vm                  VSchemaOperator
@@ -109,6 +121,9 @@ type vcursorImpl struct {
 
 	warnings []*querypb.QueryWarning // any warnings that are accumulated during the planning phase are stored here
 	pv       plancontext.PlannerVersion
+
+	warmingReadsPercent int
+	warmingReadsChannel chan bool
 }
 
 // newVcursorImpl creates a vcursorImpl. Before creating this object, you have to separate out any marginComments that came with
@@ -150,24 +165,32 @@ func newVCursorImpl(
 		}
 	}
 	if connCollation == collations.Unknown {
-		connCollation = collations.Default()
+		connCollation = executor.env.CollationEnv().DefaultConnectionCharset()
 	}
 
+	warmingReadsPct := 0
+	var warmingReadsChan chan bool
+	if executor != nil {
+		warmingReadsPct = executor.warmingReadsPercent
+		warmingReadsChan = executor.warmingReadsChannel
+	}
 	return &vcursorImpl{
-		safeSession:     safeSession,
-		keyspace:        keyspace,
-		tabletType:      tabletType,
-		destination:     destination,
-		marginComments:  marginComments,
-		executor:        executor,
-		logStats:        logStats,
-		collation:       connCollation,
-		resolver:        resolver,
-		vschema:         vschema,
-		vm:              vm,
-		topoServer:      ts,
-		warnShardedOnly: warnShardedOnly,
-		pv:              pv,
+		safeSession:         safeSession,
+		keyspace:            keyspace,
+		tabletType:          tabletType,
+		destination:         destination,
+		marginComments:      marginComments,
+		executor:            executor,
+		logStats:            logStats,
+		collation:           connCollation,
+		resolver:            resolver,
+		vschema:             vschema,
+		vm:                  vm,
+		topoServer:          ts,
+		warnShardedOnly:     warnShardedOnly,
+		pv:                  pv,
+		warmingReadsPercent: warmingReadsPct,
+		warmingReadsChannel: warmingReadsChan,
 	}, nil
 }
 
@@ -184,6 +207,21 @@ func (vc *vcursorImpl) GetSystemVariables(f func(k string, v string)) {
 // ConnCollation returns the collation of this session
 func (vc *vcursorImpl) ConnCollation() collations.ID {
 	return vc.collation
+}
+
+// Environment returns the vtenv associated with this session
+func (vc *vcursorImpl) Environment() *vtenv.Environment {
+	return vc.executor.environment()
+}
+
+func (vc *vcursorImpl) TimeZone() *time.Location {
+	return vc.safeSession.TimeZone()
+}
+
+func (vc *vcursorImpl) SQLMode() string {
+	// TODO: Implement return the current sql_mode.
+	// This is currently hardcoded to the default in MySQL 8.0.
+	return config.DefaultSQLMode
 }
 
 // MaxMemoryRows returns the maxMemoryRows flag value.
@@ -336,13 +374,7 @@ func (vc *vcursorImpl) AnyKeyspace() (*vindexes.Keyspace, error) {
 		return nil, errNoDbAvailable
 	}
 
-	var keyspaces = make([]*vindexes.Keyspace, 0, len(vc.vschema.Keyspaces))
-	for _, ks := range vc.vschema.Keyspaces {
-		keyspaces = append(keyspaces, ks.Keyspace)
-	}
-	sort.Slice(keyspaces, func(i, j int) bool {
-		return keyspaces[i].Name < keyspaces[j].Name
-	})
+	keyspaces := vc.getSortedServingKeyspaces()
 
 	// Look for any sharded keyspace if present, otherwise take the first keyspace,
 	// sorted alphabetically
@@ -354,18 +386,38 @@ func (vc *vcursorImpl) AnyKeyspace() (*vindexes.Keyspace, error) {
 	return keyspaces[0], nil
 }
 
+// getSortedServingKeyspaces gets the sorted serving keyspaces
+func (vc *vcursorImpl) getSortedServingKeyspaces() []*vindexes.Keyspace {
+	var keyspaces []*vindexes.Keyspace
+
+	if vc.resolver != nil && vc.resolver.GetGateway() != nil {
+		keyspaceNames := vc.resolver.GetGateway().GetServingKeyspaces()
+		for _, ksName := range keyspaceNames {
+			ks, exists := vc.vschema.Keyspaces[ksName]
+			if exists {
+				keyspaces = append(keyspaces, ks.Keyspace)
+			}
+		}
+	}
+
+	if len(keyspaces) == 0 {
+		for _, ks := range vc.vschema.Keyspaces {
+			keyspaces = append(keyspaces, ks.Keyspace)
+		}
+	}
+	sort.Slice(keyspaces, func(i, j int) bool {
+		return keyspaces[i].Name < keyspaces[j].Name
+	})
+	return keyspaces
+}
+
 func (vc *vcursorImpl) FirstSortedKeyspace() (*vindexes.Keyspace, error) {
 	if len(vc.vschema.Keyspaces) == 0 {
 		return nil, errNoDbAvailable
 	}
-	kss := vc.vschema.Keyspaces
-	keys := make([]string, 0, len(kss))
-	for ks := range kss {
-		keys = append(keys, ks)
-	}
-	sort.Strings(keys)
+	keyspaces := vc.getSortedServingKeyspaces()
 
-	return kss[keys[0]].Keyspace, nil
+	return keyspaces[0], nil
 }
 
 // SysVarSetEnabled implements the ContextVSchema interface
@@ -491,7 +543,7 @@ func (vc *vcursorImpl) Execute(ctx context.Context, method string, query string,
 		return nil, err
 	}
 
-	qr, err := vc.executor.Execute(ctx, method, session, vc.marginComments.Leading+query+vc.marginComments.Trailing, bindVars)
+	qr, err := vc.executor.Execute(ctx, nil, method, session, vc.marginComments.Leading+query+vc.marginComments.Trailing, bindVars)
 	vc.setRollbackOnPartialExecIfRequired(err != nil, rollbackOnError)
 
 	return qr, err
@@ -506,7 +558,7 @@ func (vc *vcursorImpl) markSavepoint(ctx context.Context, needsRollbackOnParialE
 	}
 	uID := fmt.Sprintf("_vt%s", strings.ReplaceAll(uuid.NewString(), "-", "_"))
 	spQuery := fmt.Sprintf("%ssavepoint %s%s", vc.marginComments.Leading, uID, vc.marginComments.Trailing)
-	_, err := vc.executor.Execute(ctx, "MarkSavepoint", vc.safeSession, spQuery, bindVars)
+	_, err := vc.executor.Execute(ctx, nil, "MarkSavepoint", vc.safeSession, spQuery, bindVars)
 	if err != nil {
 		return err
 	}
@@ -841,6 +893,15 @@ func (vc *vcursorImpl) SetPlannerVersion(v plancontext.PlannerVersion) {
 	vc.safeSession.GetOrCreateOptions().PlannerVersion = v
 }
 
+func (vc *vcursorImpl) SetPriority(priority string) {
+	if priority != "" {
+		vc.safeSession.GetOrCreateOptions().Priority = priority
+	} else if vc.safeSession.Options != nil && vc.safeSession.Options.Priority != "" {
+		vc.safeSession.Options.Priority = ""
+	}
+
+}
+
 // SetConsolidator implements the SessionActions interface
 func (vc *vcursorImpl) SetConsolidator(consolidator querypb.ExecuteOptions_Consolidator) {
 	// Avoid creating session Options when they do not yet exist and the
@@ -849,6 +910,12 @@ func (vc *vcursorImpl) SetConsolidator(consolidator querypb.ExecuteOptions_Conso
 		return
 	}
 	vc.safeSession.GetOrCreateOptions().Consolidator = consolidator
+}
+
+func (vc *vcursorImpl) SetWorkloadName(workloadName string) {
+	if workloadName != "" {
+		vc.safeSession.GetOrCreateOptions().WorkloadName = workloadName
+	}
 }
 
 // SetFoundRows implements the SessionActions interface
@@ -865,6 +932,16 @@ func (vc *vcursorImpl) SetDDLStrategy(strategy string) {
 // GetDDLStrategy implements the SessionActions interface
 func (vc *vcursorImpl) GetDDLStrategy() string {
 	return vc.safeSession.GetDDLStrategy()
+}
+
+// SetMigrationContext implements the SessionActions interface
+func (vc *vcursorImpl) SetMigrationContext(migrationContext string) {
+	vc.safeSession.SetMigrationContext(migrationContext)
+}
+
+// GetMigrationContext implements the SessionActions interface
+func (vc *vcursorImpl) GetMigrationContext() string {
+	return vc.safeSession.GetMigrationContext()
 }
 
 // GetSessionUUID implements the SessionActions interface
@@ -931,6 +1008,10 @@ func (vc *vcursorImpl) InTransaction() bool {
 	return vc.safeSession.InTransaction()
 }
 
+func (vc *vcursorImpl) Commit(ctx context.Context) error {
+	return vc.executor.Commit(ctx, vc.safeSession)
+}
+
 // GetDBDDLPluginName implements the VCursor interface
 func (vc *vcursorImpl) GetDBDDLPluginName() string {
 	return dbDDLPlugin
@@ -956,9 +1037,10 @@ func (vc *vcursorImpl) ErrorIfShardedF(ks *vindexes.Keyspace, warn, errFormat st
 func (vc *vcursorImpl) WarnUnshardedOnly(format string, params ...any) {
 	if vc.warnShardedOnly {
 		vc.warnings = append(vc.warnings, &querypb.QueryWarning{
-			Code:    uint32(mysql.ERNotSupportedYet),
+			Code:    uint32(sqlerror.ERNotSupportedYet),
 			Message: fmt.Sprintf(format, params...),
 		})
+		warnings.Add("WarnUnshardedOnly", 1)
 	}
 }
 
@@ -968,14 +1050,29 @@ func (vc *vcursorImpl) PlannerWarning(message string) {
 		return
 	}
 	vc.warnings = append(vc.warnings, &querypb.QueryWarning{
-		Code:    uint32(mysql.ERNotSupportedYet),
+		Code:    uint32(sqlerror.ERNotSupportedYet),
 		Message: message,
 	})
 }
 
 // ForeignKeyMode implements the VCursor interface
-func (vc *vcursorImpl) ForeignKeyMode() string {
-	return strings.ToLower(foreignKeyMode)
+func (vc *vcursorImpl) ForeignKeyMode(keyspace string) (vschemapb.Keyspace_ForeignKeyMode, error) {
+	if strings.ToLower(foreignKeyMode) == "disallow" {
+		return vschemapb.Keyspace_disallow, nil
+	}
+	ks := vc.vschema.Keyspaces[keyspace]
+	if ks == nil {
+		return 0, vterrors.VT14004(keyspace)
+	}
+	return ks.ForeignKeyMode, nil
+}
+
+func (vc *vcursorImpl) KeyspaceError(keyspace string) error {
+	ks := vc.vschema.Keyspaces[keyspace]
+	if ks == nil {
+		return vterrors.VT14004(keyspace)
+	}
+	return ks.Error
 }
 
 // ParseDestinationTarget parses destination target string and sets default keyspace if possible.
@@ -990,7 +1087,12 @@ func parseDestinationTarget(targetString string, vschema *vindexes.VSchema) (str
 	return destKeyspace, destTabletType, dest, err
 }
 
-func (vc *vcursorImpl) planPrefixKey(ctx context.Context) string {
+func (vc *vcursorImpl) keyForPlan(ctx context.Context, query string, buf io.StringWriter) {
+	_, _ = buf.WriteString(vc.keyspace)
+	_, _ = buf.WriteString(vindexes.TabletTypeSuffix[vc.tabletType])
+	_, _ = buf.WriteString("+Collate:")
+	_, _ = buf.WriteString(vc.Environment().CollationEnv().LookupName(vc.collation))
+
 	if vc.destination != nil {
 		switch vc.destination.(type) {
 		case key.DestinationKeyspaceID, key.DestinationKeyspaceIDs:
@@ -1001,14 +1103,22 @@ func (vc *vcursorImpl) planPrefixKey(ctx context.Context) string {
 					shards[i] = resolved[i].Target.GetShard()
 				}
 				sort.Strings(shards)
-				return fmt.Sprintf("%s%sKsIDsResolved(%s)", vc.keyspace, vindexes.TabletTypeSuffix[vc.tabletType], strings.Join(shards, ","))
+
+				_, _ = buf.WriteString("+KsIDsResolved:")
+				for i, s := range shards {
+					if i > 0 {
+						_, _ = buf.WriteString(",")
+					}
+					_, _ = buf.WriteString(s)
+				}
 			}
 		default:
-			// use destination string (out of the switch)
+			_, _ = buf.WriteString("+")
+			_, _ = buf.WriteString(vc.destination.String())
 		}
-		return fmt.Sprintf("%s%s%s", vc.keyspace, vindexes.TabletTypeSuffix[vc.tabletType], vc.destination.String())
 	}
-	return fmt.Sprintf("%s%s", vc.keyspace, vindexes.TabletTypeSuffix[vc.tabletType])
+	_, _ = buf.WriteString("+Query:")
+	_, _ = buf.WriteString(query)
 }
 
 func (vc *vcursorImpl) GetKeyspace() string {
@@ -1089,8 +1199,57 @@ func (vc *vcursorImpl) SetExec(ctx context.Context, name string, value string) e
 	return vc.executor.setVitessMetadata(ctx, name, value)
 }
 
+func (vc *vcursorImpl) ThrottleApp(ctx context.Context, throttledAppRule *topodatapb.ThrottledAppRule) (err error) {
+	if throttledAppRule == nil {
+		return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "ThrottleApp: nil rule")
+	}
+	if throttledAppRule.Name == "" {
+		return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "ThrottleApp: app name is empty")
+	}
+	// We don't strictly have to construct a UpdateThrottlerConfigRequest here, because we only populate it
+	// with a couple variables; we could do without it. However, constructing the request makes the remaining code
+	// consistent with vtctldclient/command/throttler.go and we prefer this consistency
+	req := &vtctldatapb.UpdateThrottlerConfigRequest{
+		Keyspace:     vc.keyspace,
+		ThrottledApp: throttledAppRule,
+	}
+
+	update := func(throttlerConfig *topodatapb.ThrottlerConfig) *topodatapb.ThrottlerConfig {
+		if throttlerConfig == nil {
+			throttlerConfig = &topodatapb.ThrottlerConfig{}
+		}
+		if throttlerConfig.ThrottledApps == nil {
+			throttlerConfig.ThrottledApps = make(map[string]*topodatapb.ThrottledAppRule)
+		}
+		throttlerConfig.ThrottledApps[req.ThrottledApp.Name] = req.ThrottledApp
+		return throttlerConfig
+	}
+
+	ctx, unlock, lockErr := vc.topoServer.LockKeyspace(ctx, req.Keyspace, "UpdateThrottlerConfig")
+	if lockErr != nil {
+		return lockErr
+	}
+	defer unlock(&err)
+
+	ki, err := vc.topoServer.GetKeyspace(ctx, req.Keyspace)
+	if err != nil {
+		return err
+	}
+
+	ki.ThrottlerConfig = update(ki.ThrottlerConfig)
+
+	err = vc.topoServer.UpdateKeyspace(ctx, ki)
+	if err != nil {
+		return err
+	}
+
+	_, err = vc.topoServer.UpdateSrvKeyspaceThrottlerConfig(ctx, req.Keyspace, []string{}, update)
+
+	return err
+}
+
 func (vc *vcursorImpl) CanUseSetVar() bool {
-	return sqlparser.IsMySQL80AndAbove() && setVarEnabled
+	return vc.Environment().Parser().IsMySQL80AndAbove() && setVarEnabled
 }
 
 func (vc *vcursorImpl) ReleaseLock(ctx context.Context) error {
@@ -1119,7 +1278,7 @@ func (vc *vcursorImpl) cloneWithAutocommitSession() *vcursorImpl {
 }
 
 func (vc *vcursorImpl) VExplainLogging() {
-	vc.safeSession.EnableLogging()
+	vc.safeSession.EnableLogging(vc.Environment().Parser())
 }
 
 func (vc *vcursorImpl) GetVExplainLogs() []engine.ExecuteEntry {
@@ -1131,4 +1290,83 @@ func (vc *vcursorImpl) FindRoutedShard(keyspace, shard string) (keyspaceName str
 
 func (vc *vcursorImpl) IsViewsEnabled() bool {
 	return enableViews
+}
+
+func (vc *vcursorImpl) GetUDV(name string) *querypb.BindVariable {
+	return vc.safeSession.GetUDV(name)
+}
+
+func (vc *vcursorImpl) PlanPrepareStatement(ctx context.Context, query string) (*engine.Plan, sqlparser.Statement, error) {
+	return vc.executor.planPrepareStmt(ctx, vc, query)
+}
+
+func (vc *vcursorImpl) ClearPrepareData(name string) {
+	delete(vc.safeSession.PrepareStatement, name)
+}
+
+func (vc *vcursorImpl) StorePrepareData(stmtName string, prepareData *vtgatepb.PrepareData) {
+	vc.safeSession.StorePrepareData(stmtName, prepareData)
+}
+
+func (vc *vcursorImpl) GetPrepareData(stmtName string) *vtgatepb.PrepareData {
+	return vc.safeSession.GetPrepareData(stmtName)
+}
+
+func (vc *vcursorImpl) GetWarmingReadsPercent() int {
+	return vc.warmingReadsPercent
+}
+
+func (vc *vcursorImpl) GetWarmingReadsChannel() chan bool {
+	return vc.warmingReadsChannel
+}
+
+func (vc *vcursorImpl) CloneForReplicaWarming(ctx context.Context) engine.VCursor {
+	callerId := callerid.EffectiveCallerIDFromContext(ctx)
+	immediateCallerId := callerid.ImmediateCallerIDFromContext(ctx)
+
+	timedCtx, _ := context.WithTimeout(context.Background(), warmingReadsQueryTimeout) //nolint
+	clonedCtx := callerid.NewContext(timedCtx, callerId, immediateCallerId)
+
+	v := &vcursorImpl{
+		safeSession:         NewAutocommitSession(vc.safeSession.Session),
+		keyspace:            vc.keyspace,
+		tabletType:          topodatapb.TabletType_REPLICA,
+		destination:         vc.destination,
+		marginComments:      vc.marginComments,
+		executor:            vc.executor,
+		resolver:            vc.resolver,
+		topoServer:          vc.topoServer,
+		logStats:            &logstats.LogStats{Ctx: clonedCtx},
+		collation:           vc.collation,
+		ignoreMaxMemoryRows: vc.ignoreMaxMemoryRows,
+		vschema:             vc.vschema,
+		vm:                  vc.vm,
+		semTable:            vc.semTable,
+		warnShardedOnly:     vc.warnShardedOnly,
+		warnings:            vc.warnings,
+		pv:                  vc.pv,
+	}
+
+	v.marginComments.Trailing += "/* warming read */"
+
+	return v
+}
+
+// UpdateForeignKeyChecksState updates the foreign key checks state of the vcursor.
+func (vc *vcursorImpl) UpdateForeignKeyChecksState(fkStateFromQuery *bool) {
+	// Initialize the state to unspecified.
+	vc.fkChecksState = nil
+	// If the query has a SET_VAR optimizer hint that explicitly sets the foreign key checks state,
+	// we should use that.
+	if fkStateFromQuery != nil {
+		vc.fkChecksState = fkStateFromQuery
+		return
+	}
+	// If the query doesn't have anything, then we consult the session state.
+	vc.fkChecksState = vc.safeSession.ForeignKeyChecks()
+}
+
+// GetForeignKeyChecksState gets the stored foreign key checks state in the vcursor.
+func (vc *vcursorImpl) GetForeignKeyChecksState() *bool {
+	return vc.fkChecksState
 }

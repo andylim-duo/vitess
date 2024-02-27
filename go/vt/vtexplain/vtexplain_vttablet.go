@@ -23,7 +23,10 @@ import (
 	"strings"
 	"sync"
 
+	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/sidecardb"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vtenv"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/mysql/collations"
@@ -34,7 +37,6 @@ import (
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/mysqlctl"
 	"vitess.io/vitess/go/vt/sqlparser"
-	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
@@ -98,13 +100,15 @@ type explainTablet struct {
 	mysqlQueries  []*MysqlQuery
 	currentTime   int
 	vte           *VTExplain
+
+	collationEnv *collations.Environment
 }
 
 var _ queryservice.QueryService = (*explainTablet)(nil)
 
-func (vte *VTExplain) newTablet(opts *Options, t *topodatapb.Tablet) *explainTablet {
+func (vte *VTExplain) newTablet(ctx context.Context, env *vtenv.Environment, opts *Options, t *topodatapb.Tablet, ts *topo.Server, srvTopoCounts *stats.CountersWithSingleLabel) *explainTablet {
 	db := fakesqldb.New(nil)
-	sidecardb.AddSchemaInitQueries(db, true)
+	sidecardb.AddSchemaInitQueries(db, true, env.Parser())
 
 	config := tabletenv.NewCurrentConfig()
 	config.TrackSchemaVersions = false
@@ -117,9 +121,9 @@ func (vte *VTExplain) newTablet(opts *Options, t *topodatapb.Tablet) *explainTab
 	config.EnableTableGC = false
 
 	// XXX much of this is cloned from the tabletserver tests
-	tsv := tabletserver.NewTabletServer(topoproto.TabletAliasString(t.Alias), config, memorytopo.NewServer(""), t.Alias)
+	tsv := tabletserver.NewTabletServer(ctx, env, topoproto.TabletAliasString(t.Alias), config, ts, t.Alias, srvTopoCounts)
 
-	tablet := explainTablet{db: db, tsv: tsv, vte: vte}
+	tablet := explainTablet{db: db, tsv: tsv, vte: vte, collationEnv: env.CollationEnv()}
 	db.Handler = &tablet
 
 	tablet.QueryService = queryservice.Wrap(
@@ -129,7 +133,7 @@ func (vte *VTExplain) newTablet(opts *Options, t *topodatapb.Tablet) *explainTab
 		},
 	)
 
-	params, _ := db.ConnParams().MysqlParams()
+	params := db.ConnParams()
 	cp := *params
 	dbcfgs := dbconfigs.NewTestDBConfigs(cp, cp, "")
 	cnf := mysqlctl.NewMycnf(22222, 6802)
@@ -280,12 +284,14 @@ func (t *explainTablet) Close(ctx context.Context) error {
 	return t.tsv.Close(ctx)
 }
 
-func newTabletEnvironment(ddls []sqlparser.DDLStatement, opts *Options) (*tabletEnv, error) {
+func newTabletEnvironment(ddls []sqlparser.DDLStatement, opts *Options, collationEnv *collations.Environment) (*tabletEnv, error) {
 	tEnv := newTabletEnv()
 	schemaQueries := map[string]*sqltypes.Result{
 		"select unix_timestamp()": {
 			Fields: []*querypb.Field{{
-				Type: sqltypes.Uint64,
+				Type:    sqltypes.Int64,
+				Charset: collations.CollationBinaryID,
+				Flags:   uint32(querypb.MySqlFlag_BINARY_FLAG | querypb.MySqlFlag_NOT_NULL_FLAG | querypb.MySqlFlag_NUM_FLAG),
 			}},
 			Rows: [][]sqltypes.Value{
 				{sqltypes.NewInt32(1427325875)},
@@ -293,95 +299,120 @@ func newTabletEnvironment(ddls []sqlparser.DDLStatement, opts *Options) (*tablet
 		},
 		"select @@global.sql_mode": {
 			Fields: []*querypb.Field{{
-				Type: sqltypes.VarChar,
+				Type:    sqltypes.VarChar,
+				Charset: uint32(collations.SystemCollation.Collation),
 			}},
 			Rows: [][]sqltypes.Value{
-				{sqltypes.NewVarBinary("STRICT_TRANS_TABLES")},
+				{sqltypes.NewVarChar("STRICT_TRANS_TABLES")},
+			},
+		},
+		"select @@global.collation_server": {
+			Fields: []*querypb.Field{{
+				Type:    sqltypes.VarChar,
+				Charset: uint32(collations.SystemCollation.Collation),
+			}},
+			Rows: [][]sqltypes.Value{
+				{sqltypes.NewVarChar("utf8mb4_0900_ai_ci")},
 			},
 		},
 		"select @@session.sql_mode as sql_mode": {
 			Fields: []*querypb.Field{{
-				Name: "sql_mode",
-				Type: sqltypes.VarChar,
+				Name:    "sql_mode",
+				Type:    sqltypes.VarChar,
+				Charset: uint32(collations.SystemCollation.Collation),
 			}},
 			Rows: [][]sqltypes.Value{
-				{sqltypes.NewVarBinary("STRICT_TRANS_TABLES")},
+				{sqltypes.NewVarChar("STRICT_TRANS_TABLES")},
 			},
 		},
 		"select @@autocommit": {
 			Fields: []*querypb.Field{{
-				Type: sqltypes.Uint64,
+				Type:    sqltypes.Int64,
+				Charset: collations.CollationBinaryID,
+				Flags:   uint32(querypb.MySqlFlag_BINARY_FLAG | querypb.MySqlFlag_NUM_FLAG),
 			}},
 			Rows: [][]sqltypes.Value{
-				{sqltypes.NewVarBinary("1")},
+				{sqltypes.NewInt64(1)},
 			},
 		},
 		"select @@sql_auto_is_null": {
 			Fields: []*querypb.Field{{
-				Type: sqltypes.Uint64,
+				Type:    sqltypes.Int64,
+				Charset: collations.CollationBinaryID,
+				Flags:   uint32(querypb.MySqlFlag_BINARY_FLAG | querypb.MySqlFlag_NUM_FLAG),
 			}},
 			Rows: [][]sqltypes.Value{
-				{sqltypes.NewVarBinary("0")},
+				{sqltypes.NewInt64(0)},
 			},
 		},
 		"set @@session.sql_log_bin = 0": {
 			Fields: []*querypb.Field{{
-				Type: sqltypes.Uint64,
+				Type:    sqltypes.Uint64,
+				Charset: collations.CollationBinaryID,
 			}},
 			Rows: [][]sqltypes.Value{},
 		},
 		"create database if not exists `_vt`": {
 			Fields: []*querypb.Field{{
-				Type: sqltypes.Uint64,
+				Type:    sqltypes.Uint64,
+				Charset: collations.CollationBinaryID,
 			}},
 			Rows: [][]sqltypes.Value{},
 		},
 		"drop table if exists `_vt`.redo_log_transaction": {
 			Fields: []*querypb.Field{{
-				Type: sqltypes.Uint64,
+				Type:    sqltypes.Uint64,
+				Charset: collations.CollationBinaryID,
 			}},
 			Rows: [][]sqltypes.Value{},
 		},
 		"drop table if exists `_vt`.redo_log_statement": {
 			Fields: []*querypb.Field{{
-				Type: sqltypes.Uint64,
+				Type:    sqltypes.Uint64,
+				Charset: collations.CollationBinaryID,
 			}},
 			Rows: [][]sqltypes.Value{},
 		},
 		"drop table if exists `_vt`.transaction": {
 			Fields: []*querypb.Field{{
-				Type: sqltypes.Uint64,
+				Type:    sqltypes.Uint64,
+				Charset: collations.CollationBinaryID,
 			}},
 			Rows: [][]sqltypes.Value{},
 		},
 		"drop table if exists `_vt`.participant": {
 			Fields: []*querypb.Field{{
-				Type: sqltypes.Uint64,
+				Type:    sqltypes.Uint64,
+				Charset: collations.CollationBinaryID,
 			}},
 			Rows: [][]sqltypes.Value{},
 		},
 		"create table if not exists `_vt`.redo_state(\n  dtid varbinary(512),\n  state bigint,\n  time_created bigint,\n  primary key(dtid)\n\t) engine=InnoDB": {
 			Fields: []*querypb.Field{{
-				Type: sqltypes.Uint64,
+				Type:    sqltypes.Uint64,
+				Charset: collations.CollationBinaryID,
 			}},
 			Rows: [][]sqltypes.Value{},
 		},
 		"create table if not exists `_vt`.redo_statement(\n  dtid varbinary(512),\n  id bigint,\n  statement mediumblob,\n  primary key(dtid, id)\n\t) engine=InnoDB": {
 			Fields: []*querypb.Field{{
-				Type: sqltypes.Uint64,
+				Type:    sqltypes.Uint64,
+				Charset: collations.CollationBinaryID,
 			}},
 			Rows: [][]sqltypes.Value{},
 		},
 		"create table if not exists `_vt`.dt_state(\n  dtid varbinary(512),\n  state bigint,\n  time_created bigint,\n  primary key(dtid)\n\t) engine=InnoDB": {
 			Fields: []*querypb.Field{{
-				Type: sqltypes.Uint64,
+				Type:    sqltypes.Uint64,
+				Charset: collations.CollationBinaryID,
 			}},
 			Rows: [][]sqltypes.Value{},
 		},
 		"create table if not exists `_vt`.dt_participant(\n  dtid varbinary(512),\n\tid bigint,\n\tkeyspace varchar(256),\n\tshard varchar(256),\n  primary key(dtid, id)\n\t) engine=InnoDB": {
 
 			Fields: []*querypb.Field{{
-				Type: sqltypes.Uint64,
+				Type:    sqltypes.Uint64,
+				Charset: collations.CollationBinaryID,
 			}},
 			Rows: [][]sqltypes.Value{},
 		},
@@ -424,10 +455,18 @@ func newTabletEnvironment(ddls []sqlparser.DDLStatement, opts *Options) (*tablet
 	indexRows := make([][]sqltypes.Value, 0, 4)
 	for _, ddl := range ddls {
 		table := sqlparser.String(ddl.GetTable().Name)
-		backtickedTable := sqlescape.EscapeID(sqlescape.UnescapeID(table))
+		sanitizedTable, err := sqlescape.UnescapeID(table)
+		if err != nil {
+			return nil, err
+		}
+		backtickedTable := sqlescape.EscapeID(sanitizedTable)
 		if ddl.GetOptLike() != nil {
 			likeTable := ddl.GetOptLike().LikeTable.Name.String()
-			backtickedLikeTable := sqlescape.EscapeID(sqlescape.UnescapeID(likeTable))
+			sanitizedLikeTable, err := sqlescape.UnescapeID(likeTable)
+			if err != nil {
+				return nil, err
+			}
+			backtickedLikeTable := sqlescape.EscapeID(sanitizedLikeTable)
 
 			likeQuery := "SELECT * FROM " + backtickedLikeTable + " WHERE 1 != 1"
 			query := "SELECT * FROM " + backtickedTable + " WHERE 1 != 1"
@@ -436,8 +475,8 @@ func newTabletEnvironment(ddls []sqlparser.DDLStatement, opts *Options) (*tablet
 			}
 			tEnv.addResult(query, tEnv.getResult(likeQuery))
 
-			likeQuery = fmt.Sprintf(mysqlctl.GetColumnNamesQuery, "database()", sqlescape.UnescapeID(likeTable))
-			query = fmt.Sprintf(mysqlctl.GetColumnNamesQuery, "database()", sqlescape.UnescapeID(table))
+			likeQuery = fmt.Sprintf(mysqlctl.GetColumnNamesQuery, "database()", sqltypes.EncodeStringSQL(sanitizedLikeTable))
+			query = fmt.Sprintf(mysqlctl.GetColumnNamesQuery, "database()", sqltypes.EncodeStringSQL(sanitizedTable))
 			if tEnv.getResult(likeQuery) == nil {
 				return nil, fmt.Errorf("check your schema, table[%s] doesn't exist", likeTable)
 			}
@@ -445,7 +484,7 @@ func newTabletEnvironment(ddls []sqlparser.DDLStatement, opts *Options) (*tablet
 			continue
 		}
 		for _, idx := range ddl.GetTableSpec().Indexes {
-			if !idx.Info.Primary {
+			if idx.Info.Type != sqlparser.IndexTypePrimary {
 				continue
 			}
 			for _, col := range idx.Columns {
@@ -459,15 +498,17 @@ func newTabletEnvironment(ddls []sqlparser.DDLStatement, opts *Options) (*tablet
 		var colTypes []*querypb.Field
 		var colValues [][]sqltypes.Value
 		colType := &querypb.Field{
-			Name: "column_type",
-			Type: sqltypes.VarChar,
+			Name:    "column_type",
+			Type:    sqltypes.VarChar,
+			Charset: uint32(collationEnv.DefaultConnectionCharset()),
 		}
 		colTypes = append(colTypes, colType)
 		for _, col := range ddl.GetTableSpec().Columns {
 			colName := strings.ToLower(col.Name.String())
 			rowType := &querypb.Field{
-				Name: colName,
-				Type: col.Type.SQLType(),
+				Name:    colName,
+				Type:    col.Type.SQLType(),
+				Charset: uint32(collations.SystemCollation.Collation),
 			}
 			rowTypes = append(rowTypes, rowType)
 			tEnv.tableColumns[table][colName] = col.Type.SQLType()
@@ -476,7 +517,7 @@ func newTabletEnvironment(ddls []sqlparser.DDLStatement, opts *Options) (*tablet
 		tEnv.addResult("SELECT * FROM "+backtickedTable+" WHERE 1 != 1", &sqltypes.Result{
 			Fields: rowTypes,
 		})
-		query := fmt.Sprintf(mysqlctl.GetColumnNamesQuery, "database()", sqlescape.UnescapeID(table))
+		query := fmt.Sprintf(mysqlctl.GetColumnNamesQuery, "database()", sqltypes.EncodeStringSQL(sanitizedTable))
 		tEnv.addResult(query, &sqltypes.Result{
 			Fields: colTypes,
 			Rows:   colValues,
@@ -496,6 +537,30 @@ func (t *explainTablet) HandleQuery(c *mysql.Conn, query string, callback func(*
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	// If query is part of rejected list then return error right away.
+	if err := t.db.GetRejectedQueryResult(query); err != nil {
+		return err
+	}
+
+	// If query is expected to have a specific result then return the result.
+	if result := t.db.GetQueryResult(query); result != nil {
+		if f := result.BeforeFunc; f != nil {
+			f()
+		}
+		return callback(result.Result)
+	}
+
+	// return result if query is part of defined pattern.
+	if userCallback, expResult, ok, err := t.db.GetQueryPatternResult(query); ok {
+		if userCallback != nil {
+			userCallback(query)
+		}
+		if err != nil {
+			return err
+		}
+		return callback(expResult.Result)
+	}
+
 	if !strings.Contains(query, "1 != 1") {
 		t.mysqlQueries = append(t.mysqlQueries, &MysqlQuery{
 			Time: t.currentTime,
@@ -506,13 +571,10 @@ func (t *explainTablet) HandleQuery(c *mysql.Conn, query string, callback func(*
 	// return the pre-computed results for any schema introspection queries
 	tEnv := t.vte.getGlobalTabletEnv()
 	result := tEnv.getResult(query)
-	emptyResult := &sqltypes.Result{}
-	if sidecardb.MatchesInitQuery(query) {
-		return callback(emptyResult)
-	}
 	if result != nil {
 		return callback(result)
 	}
+
 	switch sqlparser.Preview(query) {
 	case sqlparser.StmtSelect:
 		var err error
@@ -540,7 +602,7 @@ func (t *explainTablet) handleSelect(query string) (*sqltypes.Result, error) {
 	// Parse the select statement to figure out the table and columns
 	// that were referenced so that the synthetic response has the
 	// expected field names and types.
-	stmt, err := sqlparser.Parse(query)
+	stmt, err := t.vte.env.Parser().Parse(query)
 	if err != nil {
 		return nil, err
 	}
@@ -557,7 +619,7 @@ func (t *explainTablet) handleSelect(query string) (*sqltypes.Result, error) {
 
 	// Gen4 supports more complex queries so we now need to
 	// handle multiple FROM clauses
-	tables := make([]*sqlparser.AliasedTableExpr, len(selStmt.From))
+	tables := make([]*sqlparser.AliasedTableExpr, 0, len(selStmt.From))
 	for _, from := range selStmt.From {
 		tables = append(tables, getTables(from)...)
 	}
@@ -605,9 +667,12 @@ func (t *explainTablet) handleSelect(query string) (*sqltypes.Result, error) {
 	rows := make([][]sqltypes.Value, 0, rowCount)
 	for i, col := range colNames {
 		colType := colTypes[i]
+		cs := collations.CollationForType(colType, t.collationEnv.DefaultConnectionCharset())
 		fields[i] = &querypb.Field{
-			Name: col,
-			Type: colType,
+			Name:    col,
+			Type:    colType,
+			Charset: uint32(cs),
+			Flags:   mysql.FlagsForColumn(colType, cs),
 		}
 	}
 
@@ -676,13 +741,13 @@ func (t *explainTablet) analyzeWhere(selStmt *sqlparser.Select, tableColumnMap m
 		if !ok {
 			continue
 		}
-		value, err := evalengine.LiteralToValue(lit)
+		value, err := sqlparser.LiteralToValue(lit)
 		if err != nil {
 			return "", nil, 0, nil, err
 		}
 
 		// Cast the value in the tuple to the expected value of the column
-		castedValue, err := evalengine.Cast(value, colType)
+		castedValue, err := sqltypes.Cast(value, colType)
 		if err != nil {
 			return "", nil, 0, nil, err
 		}
@@ -690,7 +755,7 @@ func (t *explainTablet) analyzeWhere(selStmt *sqlparser.Select, tableColumnMap m
 		// Check if we have a duplicate value
 		isNewValue := true
 		for _, v := range inVal {
-			result, err := evalengine.NullsafeCompare(v, value, collations.Default())
+			result, err := evalengine.NullsafeCompare(v, value, t.collationEnv, t.collationEnv.DefaultConnectionCharset())
 			if err != nil {
 				return "", nil, 0, nil, err
 			}
@@ -802,7 +867,7 @@ func inferColTypeFromExpr(node sqlparser.Expr, tableColumnMap map[sqlparser.Iden
 			fallthrough
 		case sqlparser.HexVal:
 			fallthrough
-		case sqlparser.BitVal:
+		case sqlparser.BitNum:
 			colTypes = append(colTypes, querypb.Type_INT32)
 		case sqlparser.StrVal:
 			colTypes = append(colTypes, querypb.Type_VARCHAR)

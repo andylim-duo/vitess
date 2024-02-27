@@ -28,7 +28,8 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/replication"
+
 	"vitess.io/vitess/go/protoutil"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/hook"
@@ -52,6 +53,31 @@ type fakeRPCTM struct {
 	slow bool
 	// mu guards accesses of "slow".
 	mu sync.Mutex
+}
+
+func (fra *fakeRPCTM) CreateVReplicationWorkflow(ctx context.Context, req *tabletmanagerdatapb.CreateVReplicationWorkflowRequest) (*tabletmanagerdatapb.CreateVReplicationWorkflowResponse, error) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (fra *fakeRPCTM) DeleteVReplicationWorkflow(ctx context.Context, req *tabletmanagerdatapb.DeleteVReplicationWorkflowRequest) (*tabletmanagerdatapb.DeleteVReplicationWorkflowResponse, error) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (fra *fakeRPCTM) ReadVReplicationWorkflow(ctx context.Context, req *tabletmanagerdatapb.ReadVReplicationWorkflowRequest) (*tabletmanagerdatapb.ReadVReplicationWorkflowResponse, error) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (fra *fakeRPCTM) UpdateVReplicationWorkflow(ctx context.Context, req *tabletmanagerdatapb.UpdateVReplicationWorkflowRequest) (*tabletmanagerdatapb.UpdateVReplicationWorkflowResponse, error) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (fra *fakeRPCTM) ResetSequences(ctx context.Context, tables []string) error {
+	//TODO implement me
+	panic("implement me")
 }
 
 func (fra *fakeRPCTM) VDiff(ctx context.Context, req *tabletmanagerdatapb.VDiffRequest) (*tabletmanagerdatapb.VDiffResponse, error) {
@@ -277,7 +303,6 @@ var testGetSchemaReply = &tabletmanagerdatapb.SchemaDefinition{
 			RowCount:          6,
 		},
 	},
-	Version: "xxx",
 }
 
 func (fra *fakeRPCTM) GetSchema(ctx context.Context, request *tabletmanagerdatapb.GetSchemaRequest) (*tabletmanagerdatapb.SchemaDefinition, error) {
@@ -728,8 +753,8 @@ func tmRPCTestExecuteFetchPanic(ctx context.Context, t *testing.T, client tmclie
 
 var testReplicationStatus = &replicationdatapb.Status{
 	Position:              "MariaDB/1-345-789",
-	IoState:               int32(mysql.ReplicationStateRunning),
-	SqlState:              int32(mysql.ReplicationStateRunning),
+	IoState:               int32(replication.ReplicationStateRunning),
+	SqlState:              int32(replication.ReplicationStateRunning),
 	ReplicationLagSeconds: 654,
 	SourceHost:            "source.host",
 	SourcePort:            3366,
@@ -901,14 +926,6 @@ func tmRPCTestGetReplicasPanic(ctx context.Context, t *testing.T, client tmclien
 	expectHandleRPCPanic(t, "GetReplicas", false /*verbose*/, err)
 }
 
-func (fra *fakeRPCTM) VExec(ctx context.Context, query, workflow, keyspace string) (*querypb.QueryResult, error) {
-	if fra.panics {
-		panic(fmt.Errorf("test-triggered panic"))
-	}
-	compare(fra.t, "VExec query", query, "query")
-	return testExecuteFetchResult, nil
-}
-
 var testVRQuery = "query"
 
 func (fra *fakeRPCTM) VReplicationExec(ctx context.Context, query string) (*querypb.QueryResult, error) {
@@ -1022,7 +1039,12 @@ func tmRPCTestPopulateReparentJournal(ctx context.Context, t *testing.T, client 
 
 func tmRPCTestPopulateReparentJournalPanic(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet) {
 	err := client.PopulateReparentJournal(ctx, tablet, testTimeCreatedNS, testActionName, testPrimaryAlias, testReplicationPosition)
-	expectHandleRPCPanic(t, "PopulateReparentJournal", false /*verbose*/, err)
+	expectHandleRPCPanic(t, "PopulateReparentJournal", true /*verbose*/, err)
+}
+
+func tmRPCTestWaitForPositionPanic(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet) {
+	err := client.WaitForPosition(ctx, tablet, testReplicationPosition)
+	expectHandleRPCPanic(t, "WaitForPosition", true /*verbose*/, err)
 }
 
 var testInitReplicaCalled = false
@@ -1222,7 +1244,7 @@ func tmRPCTestPromoteReplicaPanic(ctx context.Context, t *testing.T, client tmcl
 // Backup / restore related methods
 //
 
-var testBackupConcurrency = int64(24)
+var testBackupConcurrency = int32(24)
 var testBackupAllowPrimary = false
 var testBackupCalled = false
 var testRestoreFromBackupCalled = false
@@ -1239,7 +1261,7 @@ func (fra *fakeRPCTM) Backup(ctx context.Context, logger logutil.Logger, request
 }
 
 func tmRPCTestBackup(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet) {
-	req := &tabletmanagerdatapb.BackupRequest{Concurrency: int64(testBackupConcurrency), AllowPrimary: testBackupAllowPrimary}
+	req := &tabletmanagerdatapb.BackupRequest{Concurrency: testBackupConcurrency, AllowPrimary: testBackupAllowPrimary}
 	stream, err := client.Backup(ctx, tablet, req)
 	if err != nil {
 		t.Fatalf("Backup failed: %v", err)
@@ -1249,7 +1271,7 @@ func tmRPCTestBackup(ctx context.Context, t *testing.T, client tmclient.TabletMa
 }
 
 func tmRPCTestBackupPanic(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet) {
-	req := &tabletmanagerdatapb.BackupRequest{Concurrency: int64(testBackupConcurrency), AllowPrimary: testBackupAllowPrimary}
+	req := &tabletmanagerdatapb.BackupRequest{Concurrency: testBackupConcurrency, AllowPrimary: testBackupAllowPrimary}
 	stream, err := client.Backup(ctx, tablet, req)
 	if err != nil {
 		t.Fatalf("Backup failed: %v", err)
@@ -1268,6 +1290,15 @@ func (fra *fakeRPCTM) RestoreFromBackup(ctx context.Context, logger logutil.Logg
 	logStuff(logger, 10)
 	testRestoreFromBackupCalled = true
 	return nil
+}
+
+func (fra *fakeRPCTM) CheckThrottler(ctx context.Context, req *tabletmanagerdatapb.CheckThrottlerRequest) (*tabletmanagerdatapb.CheckThrottlerResponse, error) {
+	if fra.panics {
+		panic(fmt.Errorf("test-triggered panic"))
+	}
+
+	//TODO implement me
+	panic("implement me")
 }
 
 func tmRPCTestRestoreFromBackup(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet, req *tabletmanagerdatapb.RestoreFromBackupRequest) {
@@ -1289,6 +1320,11 @@ func tmRPCTestRestoreFromBackupPanic(ctx context.Context, t *testing.T, client t
 		t.Fatalf("Unexpected RestoreFromBackup logs: %v", e)
 	}
 	expectHandleRPCPanic(t, "RestoreFromBackup", true /*verbose*/, err)
+}
+
+func tmRPCTestCheckThrottler(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet, req *tabletmanagerdatapb.CheckThrottlerRequest) {
+	_, err := client.CheckThrottler(ctx, tablet, req)
+	expectHandleRPCPanic(t, "CheckThrottler", false /*verbose*/, err)
 }
 
 //
@@ -1314,6 +1350,9 @@ func Run(t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.T
 
 	restoreFromBackupRequest := &tabletmanagerdatapb.RestoreFromBackupRequest{
 		BackupTime: protoutil.TimeToProto(time.Time{}),
+	}
+	checkThrottlerRequest := &tabletmanagerdatapb.CheckThrottlerRequest{
+		AppName: "test",
 	}
 
 	// Test RPC specific methods of the interface.
@@ -1372,6 +1411,9 @@ func Run(t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.T
 	tmRPCTestBackup(ctx, t, client, tablet)
 	tmRPCTestRestoreFromBackup(ctx, t, client, tablet, restoreFromBackupRequest)
 
+	// Throttler related methods
+	tmRPCTestCheckThrottler(ctx, t, client, tablet, checkThrottlerRequest)
+
 	//
 	// Tests panic handling everywhere now
 	//
@@ -1410,6 +1452,7 @@ func Run(t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.T
 	tmRPCTestResetReplicationPanic(ctx, t, client, tablet)
 	tmRPCTestInitPrimaryPanic(ctx, t, client, tablet)
 	tmRPCTestPopulateReparentJournalPanic(ctx, t, client, tablet)
+	tmRPCTestWaitForPositionPanic(ctx, t, client, tablet)
 	tmRPCTestDemotePrimaryPanic(ctx, t, client, tablet)
 	tmRPCTestUndoDemotePrimaryPanic(ctx, t, client, tablet)
 	tmRPCTestSetReplicationSourcePanic(ctx, t, client, tablet)

@@ -17,17 +17,17 @@ limitations under the License.
 package binlog
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
 
-	"context"
-
-	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/replication"
 	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/tb"
 	"vitess.io/vitess/go/vt/dbconfigs"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
 
@@ -71,47 +71,6 @@ type UpdateStreamControl interface {
 	IsEnabled() bool
 }
 
-// UpdateStreamControlMock is an implementation of UpdateStreamControl
-// to be used in tests
-type UpdateStreamControlMock struct {
-	enabled bool
-	sync.Mutex
-}
-
-// NewUpdateStreamControlMock creates a new UpdateStreamControlMock
-func NewUpdateStreamControlMock() *UpdateStreamControlMock {
-	return &UpdateStreamControlMock{}
-}
-
-// InitDBConfig is part of UpdateStreamControl
-func (m *UpdateStreamControlMock) InitDBConfig(*dbconfigs.DBConfigs) {
-}
-
-// RegisterService is part of UpdateStreamControl
-func (m *UpdateStreamControlMock) RegisterService() {
-}
-
-// Enable is part of UpdateStreamControl
-func (m *UpdateStreamControlMock) Enable() {
-	m.Lock()
-	m.enabled = true
-	m.Unlock()
-}
-
-// Disable is part of UpdateStreamControl
-func (m *UpdateStreamControlMock) Disable() {
-	m.Lock()
-	m.enabled = false
-	m.Unlock()
-}
-
-// IsEnabled is part of UpdateStreamControl
-func (m *UpdateStreamControlMock) IsEnabled() bool {
-	m.Lock()
-	defer m.Unlock()
-	return m.enabled
-}
-
 // UpdateStreamImpl is the real implementation of UpdateStream
 // and UpdateStreamControl
 type UpdateStreamImpl struct {
@@ -127,6 +86,7 @@ type UpdateStreamImpl struct {
 	state          atomic.Int64
 	stateWaitGroup sync.WaitGroup
 	streams        StreamList
+	parser         *sqlparser.Parser
 }
 
 // StreamList is a map of context.CancelFunc to mass-interrupt ongoing
@@ -180,12 +140,13 @@ type RegisterUpdateStreamServiceFunc func(UpdateStream)
 var RegisterUpdateStreamServices []RegisterUpdateStreamServiceFunc
 
 // NewUpdateStream returns a new UpdateStreamImpl object
-func NewUpdateStream(ts *topo.Server, keyspace string, cell string, se *schema.Engine) *UpdateStreamImpl {
+func NewUpdateStream(ts *topo.Server, keyspace string, cell string, se *schema.Engine, parser *sqlparser.Parser) *UpdateStreamImpl {
 	return &UpdateStreamImpl{
 		ts:       ts,
 		keyspace: keyspace,
 		cell:     cell,
 		se:       se,
+		parser:   parser,
 	}
 }
 
@@ -250,7 +211,7 @@ func (updateStream *UpdateStreamImpl) IsEnabled() bool {
 
 // StreamKeyRange is part of the UpdateStream interface
 func (updateStream *UpdateStreamImpl) StreamKeyRange(ctx context.Context, position string, keyRange *topodatapb.KeyRange, charset *binlogdatapb.Charset, callback func(trans *binlogdatapb.BinlogTransaction) error) (err error) {
-	pos, err := mysql.DecodePosition(position)
+	pos, err := replication.DecodePosition(position)
 	if err != nil {
 		return err
 	}
@@ -276,7 +237,7 @@ func (updateStream *UpdateStreamImpl) StreamKeyRange(ctx context.Context, positi
 		return callback(trans)
 	})
 	bls := NewStreamer(updateStream.cp, updateStream.se, charset, pos, 0, f)
-	bls.resolverFactory, err = newKeyspaceIDResolverFactory(ctx, updateStream.ts, updateStream.keyspace, updateStream.cell)
+	bls.resolverFactory, err = newKeyspaceIDResolverFactory(ctx, updateStream.ts, updateStream.keyspace, updateStream.cell, updateStream.parser)
 	if err != nil {
 		return fmt.Errorf("newKeyspaceIDResolverFactory failed: %v", err)
 	}
@@ -290,7 +251,7 @@ func (updateStream *UpdateStreamImpl) StreamKeyRange(ctx context.Context, positi
 
 // StreamTables is part of the UpdateStream interface
 func (updateStream *UpdateStreamImpl) StreamTables(ctx context.Context, position string, tables []string, charset *binlogdatapb.Charset, callback func(trans *binlogdatapb.BinlogTransaction) error) (err error) {
-	pos, err := mysql.DecodePosition(position)
+	pos, err := replication.DecodePosition(position)
 	if err != nil {
 		return err
 	}

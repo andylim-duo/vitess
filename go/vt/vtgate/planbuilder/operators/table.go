@@ -17,9 +17,11 @@ limitations under the License.
 package operators
 
 import (
+	"fmt"
+
+	"vitess.io/vitess/go/slice"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
-	"vitess.io/vitess/go/vt/vtgate/planbuilder/operators/ops"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 	"vitess.io/vitess/go/vt/vtgate/semantics"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
@@ -34,18 +36,13 @@ type (
 		noInputs
 	}
 	ColNameColumns interface {
-		GetColumns() []*sqlparser.ColName
+		GetColNames() []*sqlparser.ColName
 		AddCol(*sqlparser.ColName)
 	}
 )
 
-var _ ops.PhysicalOperator = (*Table)(nil)
-
-// IPhysical implements the PhysicalOperator interface
-func (to *Table) IPhysical() {}
-
 // Clone implements the Operator interface
-func (to *Table) Clone([]ops.Operator) ops.Operator {
+func (to *Table) Clone([]Operator) Operator {
 	var columns []*sqlparser.ColName
 	for _, name := range to.Columns {
 		columns = append(columns, sqlparser.CloneRefOfColName(name))
@@ -58,22 +55,50 @@ func (to *Table) Clone([]ops.Operator) ops.Operator {
 }
 
 // Introduces implements the PhysicalOperator interface
-func (to *Table) Introduces() semantics.TableSet {
+func (to *Table) introducesTableID() semantics.TableSet {
 	return to.QTable.ID
 }
 
 // AddPredicate implements the PhysicalOperator interface
-func (to *Table) AddPredicate(_ *plancontext.PlanningContext, expr sqlparser.Expr) (ops.Operator, error) {
-	return newFilter(to, expr), nil
+func (to *Table) AddPredicate(_ *plancontext.PlanningContext, expr sqlparser.Expr) Operator {
+	return newFilter(to, expr)
 }
 
-func (to *Table) AddColumn(_ *plancontext.PlanningContext, e sqlparser.Expr) (int, error) {
-	return addColumn(to, e)
+func (to *Table) AddColumn(*plancontext.PlanningContext, bool, bool, *sqlparser.AliasedExpr) int {
+	panic(vterrors.VT13001("did not expect this method to be called"))
 }
 
-func (to *Table) GetColumns() []*sqlparser.ColName {
+func (to *Table) FindCol(ctx *plancontext.PlanningContext, expr sqlparser.Expr, underRoute bool) int {
+	colToFind, ok := expr.(*sqlparser.ColName)
+	if !ok {
+		return -1
+	}
+
+	for idx, colName := range to.Columns {
+		if colName.Name.Equal(colToFind.Name) {
+			return idx
+		}
+	}
+
+	return -1
+}
+
+func (to *Table) GetColumns(*plancontext.PlanningContext) []*sqlparser.AliasedExpr {
+	return slice.Map(to.Columns, colNameToExpr)
+}
+
+func (to *Table) GetSelectExprs(ctx *plancontext.PlanningContext) sqlparser.SelectExprs {
+	return transformColumnsToSelectExprs(ctx, to)
+}
+
+func (to *Table) GetOrdering(*plancontext.PlanningContext) []OrderBy {
+	return nil
+}
+
+func (to *Table) GetColNames() []*sqlparser.ColName {
 	return to.Columns
 }
+
 func (to *Table) AddCol(col *sqlparser.ColName) {
 	to.Columns = append(to.Columns, col)
 }
@@ -85,18 +110,32 @@ func (to *Table) TablesUsed() []string {
 	return SingleQualifiedIdentifier(to.VTable.Keyspace, to.VTable.Name)
 }
 
-func addColumn(op ColNameColumns, e sqlparser.Expr) (int, error) {
+func addColumn(ctx *plancontext.PlanningContext, op ColNameColumns, e sqlparser.Expr) int {
 	col, ok := e.(*sqlparser.ColName)
 	if !ok {
-		return 0, vterrors.VT13001("cannot push this expression to a table/vindex")
+		panic(vterrors.VT09018(fmt.Sprintf("cannot add '%s' expression to a table/vindex", sqlparser.String(e))))
 	}
-	cols := op.GetColumns()
-	for idx, column := range cols {
-		if col.Name.Equal(column.Name) {
-			return idx, nil
-		}
+	sqlparser.RemoveKeyspaceInCol(col)
+	cols := op.GetColNames()
+	colAsExpr := func(c *sqlparser.ColName) sqlparser.Expr { return c }
+	if offset, found := canReuseColumn(ctx, cols, e, colAsExpr); found {
+		return offset
 	}
 	offset := len(cols)
 	op.AddCol(col)
-	return offset, nil
+	return offset
+}
+
+func (to *Table) ShortDescription() string {
+	tbl := to.VTable.String()
+	var alias, where string
+	if to.QTable.Alias.As.NotEmpty() {
+		alias = " AS " + to.QTable.Alias.As.String()
+	}
+
+	if len(to.QTable.Predicates) > 0 {
+		where = " WHERE " + sqlparser.String(sqlparser.AndExpressions(to.QTable.Predicates...))
+	}
+
+	return tbl + alias + where
 }

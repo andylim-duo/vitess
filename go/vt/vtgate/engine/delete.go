@@ -20,9 +20,8 @@ import (
 	"context"
 	"fmt"
 
-	"vitess.io/vitess/go/vt/vtgate/evalengine"
-
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/sqlparser"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/srvtopo"
@@ -108,11 +107,7 @@ func (del *Delete) deleteVindexEntries(ctx context.Context, vcursor VCursor, bin
 			return err
 		}
 		colnum := del.KsidLength
-		vindexTable, err := del.GetSingleTable()
-		if err != nil {
-			return err
-		}
-		for _, colVindex := range vindexTable.Owned {
+		for _, colVindex := range del.Vindexes {
 			// Fetch the column values. colnum must keep incrementing.
 			fromIds := make([]sqltypes.Value, 0, len(colVindex.Columns))
 			for range colVindex.Columns {
@@ -135,6 +130,7 @@ func (del *Delete) description() PrimitiveDescription {
 		"OwnedVindexQuery":     del.OwnedVindexQuery,
 		"MultiShardAutocommit": del.MultiShardAutocommit,
 		"QueryTimeout":         del.QueryTimeout,
+		"NoAutoCommit":         del.PreventAutoCommit,
 	}
 
 	addFieldsIfNotEmpty(del.DML, other)
@@ -159,7 +155,7 @@ func addFieldsIfNotEmpty(dml *DML, other map[string]any) {
 	if len(dml.Values) > 0 {
 		s := []string{}
 		for _, value := range dml.Values {
-			s = append(s, evalengine.FormatExpr(value))
+			s = append(s, sqlparser.String(value))
 		}
 		other["Values"] = s
 	}

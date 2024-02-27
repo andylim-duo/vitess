@@ -123,14 +123,56 @@ func testTabletStatus(t *testing.T) {
 	require.NoError(t, err)
 	result := string(respByte)
 	log.Infof("Tablet status response: %v", result)
-	assert.True(t, strings.Contains(result, `Alias: <a href="http://localhost:`))
+	assert.True(t, strings.Contains(result, `/debug/health`))
 	assert.True(t, strings.Contains(result, `</html>`))
 }
 
 func testExecuteAsDba(t *testing.T) {
-	result, err := clusterInstance.VtctlclientProcess.ExecuteCommandWithOutput("ExecuteFetchAsDba", clusterInstance.Keyspaces[0].Shards[0].Vttablets[0].Alias, `SELECT 1 AS a`)
-	require.NoError(t, err)
-	assert.Equal(t, result, oneTableOutput)
+	tcases := []struct {
+		query     string
+		result    string
+		expectErr bool
+	}{
+		{
+			query:     "",
+			expectErr: true,
+		},
+		{
+			query:  "SELECT 1 AS a",
+			result: oneTableOutput,
+		},
+		{
+			query:     "SELECT 1 AS a; SELECT 1 AS a",
+			expectErr: true,
+		},
+		{
+			query:  "create table t(id int)",
+			result: "",
+		},
+		{
+			query:  "create table if not exists t(id int)",
+			result: "",
+		},
+		{
+			query:  "create table if not exists t(id int); create table if not exists t(id int);",
+			result: "",
+		},
+		{
+			query:     "create table if not exists t(id int); create table if not exists t(id int); SELECT 1 AS a",
+			expectErr: true,
+		},
+	}
+	for _, tcase := range tcases {
+		t.Run(tcase.query, func(t *testing.T) {
+			result, err := clusterInstance.VtctlclientProcess.ExecuteCommandWithOutput("ExecuteFetchAsDba", clusterInstance.Keyspaces[0].Shards[0].Vttablets[0].Alias, tcase.query)
+			if tcase.expectErr {
+				assert.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tcase.result, result)
+			}
+		})
+	}
 }
 
 func testExecuteAsApp(t *testing.T) {

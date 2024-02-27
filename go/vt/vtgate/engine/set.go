@@ -17,12 +17,12 @@ limitations under the License.
 package engine
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
 
+	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/sysvars"
 
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
@@ -45,10 +45,10 @@ import (
 type (
 	// Set contains the instructions to perform set.
 	Set struct {
+		noTxNeeded
+
 		Ops   []SetOp
 		Input Primitive
-
-		noTxNeeded
 	}
 
 	// SetOp is an interface that different type of set operations implements.
@@ -127,9 +127,8 @@ func (s *Set) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[stri
 	if len(input.Rows) != 1 {
 		return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "should get a single row")
 	}
-	env := evalengine.EnvWithBindVars(bindVars, vcursor.ConnCollation())
+	env := evalengine.NewExpressionEnv(ctx, bindVars, vcursor)
 	env.Row = input.Rows[0]
-	env.Fields = input.Fields
 	for _, setOp := range s.Ops {
 		err := setOp.Execute(ctx, vcursor, env)
 		if err != nil {
@@ -154,8 +153,8 @@ func (s *Set) GetFields(context.Context, VCursor, map[string]*querypb.BindVariab
 }
 
 // Inputs implements the Primitive interface
-func (s *Set) Inputs() []Primitive {
-	return []Primitive{s.Input}
+func (s *Set) Inputs() ([]Primitive, []map[string]any) {
+	return []Primitive{s.Input}, nil
 }
 
 func (s *Set) description() PrimitiveDescription {
@@ -179,9 +178,8 @@ func (u *UserDefinedVariable) MarshalJSON() ([]byte, error) {
 	}{
 		Type: "UserDefinedVariable",
 		Name: u.Name,
-		Expr: evalengine.FormatExpr(u.Expr),
+		Expr: sqlparser.String(u.Expr),
 	})
-
 }
 
 // VariableName implements the SetOp interface method.
@@ -195,7 +193,7 @@ func (u *UserDefinedVariable) Execute(ctx context.Context, vcursor VCursor, env 
 	if err != nil {
 		return err
 	}
-	return vcursor.Session().SetUDV(u.Name, value.Value())
+	return vcursor.Session().SetUDV(u.Name, value.Value(vcursor.ConnCollation()))
 }
 
 var _ SetOp = (*SysVarIgnore)(nil)
@@ -209,7 +207,6 @@ func (svi *SysVarIgnore) MarshalJSON() ([]byte, error) {
 		Type:         "SysVarIgnore",
 		SysVarIgnore: *svi,
 	})
-
 }
 
 // VariableName implements the SetOp interface method.
@@ -219,7 +216,6 @@ func (svi *SysVarIgnore) VariableName() string {
 
 // Execute implements the SetOp interface method.
 func (svi *SysVarIgnore) Execute(context.Context, VCursor, *evalengine.ExpressionEnv) error {
-	log.Infof("Ignored inapplicable SET %v = %v", svi.Name, svi.Expr)
 	return nil
 }
 
@@ -234,7 +230,6 @@ func (svci *SysVarCheckAndIgnore) MarshalJSON() ([]byte, error) {
 		Type:                 "SysVarCheckAndIgnore",
 		SysVarCheckAndIgnore: *svci,
 	})
-
 }
 
 // VariableName implements the SetOp interface method
@@ -253,16 +248,13 @@ func (svci *SysVarCheckAndIgnore) Execute(ctx context.Context, vcursor VCursor, 
 		return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "Unexpected error, DestinationKeyspaceID mapping to multiple shards: %v", svci.TargetDestination)
 	}
 	checkSysVarQuery := fmt.Sprintf("select 1 from dual where @@%s = %s", svci.Name, svci.Expr)
-	result, err := execShard(ctx, nil, vcursor, checkSysVarQuery, env.BindVars, rss[0], false /* rollbackOnError */, false /* canAutocommit */)
+	_, err = execShard(ctx, nil, vcursor, checkSysVarQuery, env.BindVars, rss[0], false /* rollbackOnError */, false /* canAutocommit */)
 	if err != nil {
 		// Rather than returning the error, we will just log the error
 		// as the intention for executing the query it to validate the current setting and eventually ignore it anyways.
 		// There is no benefit of returning the error back to client.
 		log.Warningf("unable to validate the current settings for '%s': %s", svci.Name, err.Error())
 		return nil
-	}
-	if len(result.Rows) == 0 {
-		log.Infof("Ignored inapplicable SET %v = %v", svci.Name, svci.Expr)
 	}
 	return nil
 }
@@ -278,7 +270,6 @@ func (svs *SysVarReservedConn) MarshalJSON() ([]byte, error) {
 		Type:               "SysVarSet",
 		SysVarReservedConn: *svs,
 	})
-
 }
 
 // VariableName implements the SetOp interface method
@@ -363,8 +354,8 @@ func (svs *SysVarReservedConn) checkAndUpdateSysVar(ctx context.Context, vcursor
 	} else {
 		value = qr.Rows[0][0]
 	}
-	buf := new(bytes.Buffer)
-	value.EncodeSQL(buf)
+	var buf strings.Builder
+	value.EncodeSQL(&buf)
 	s := buf.String()
 	vcursor.Session().SetSysVar(svs.Name, s)
 
@@ -440,7 +431,7 @@ func (svss *SysVarSetAware) MarshalJSON() ([]byte, error) {
 	}{
 		Type: "SysVarAware",
 		Name: svss.Name,
-		Expr: evalengine.FormatExpr(svss.Expr),
+		Expr: sqlparser.String(svss.Expr),
 	})
 }
 
@@ -460,13 +451,13 @@ func (svss *SysVarSetAware) Execute(ctx context.Context, vcursor VCursor, env *e
 		noop := func(context.Context, bool) error { return nil }
 		err = svss.setBoolSysVar(ctx, env, noop)
 	case sysvars.SQLSelectLimit.Name:
-		intValue, err := svss.evalAsInt64(env)
+		intValue, err := svss.evalAsInt64(env, vcursor)
 		if err != nil {
 			return err
 		}
 		vcursor.Session().SetSQLSelectLimit(intValue) // nolint:errcheck
 	case sysvars.TransactionMode.Name:
-		str, err := svss.evalAsString(env)
+		str, err := svss.evalAsString(env, vcursor)
 		if err != nil {
 			return err
 		}
@@ -476,7 +467,7 @@ func (svss *SysVarSetAware) Execute(ctx context.Context, vcursor VCursor, env *e
 		}
 		vcursor.Session().SetTransactionMode(vtgatepb.TransactionMode(out))
 	case sysvars.Workload.Name:
-		str, err := svss.evalAsString(env)
+		str, err := svss.evalAsString(env, vcursor)
 		if err != nil {
 			return err
 		}
@@ -486,7 +477,7 @@ func (svss *SysVarSetAware) Execute(ctx context.Context, vcursor VCursor, env *e
 		}
 		vcursor.Session().SetWorkload(querypb.ExecuteOptions_Workload(out))
 	case sysvars.DDLStrategy.Name:
-		str, err := svss.evalAsString(env)
+		str, err := svss.evalAsString(env, vcursor)
 		if err != nil {
 			return err
 		}
@@ -494,8 +485,17 @@ func (svss *SysVarSetAware) Execute(ctx context.Context, vcursor VCursor, env *e
 			return vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.WrongValueForVar, "invalid DDL strategy: %s", str)
 		}
 		vcursor.Session().SetDDLStrategy(str)
+	case sysvars.MigrationContext.Name:
+		str, err := svss.evalAsString(env, vcursor)
+		if err != nil {
+			return err
+		}
+		if err := schema.ValidateMigrationContext(str); err != nil {
+			return vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.WrongValueForVar, "invalid migration_context: %s", str)
+		}
+		vcursor.Session().SetMigrationContext(str)
 	case sysvars.QueryTimeout.Name:
-		queryTimeout, err := svss.evalAsInt64(env)
+		queryTimeout, err := svss.evalAsInt64(env, vcursor)
 		if err != nil {
 			return err
 		}
@@ -503,7 +503,7 @@ func (svss *SysVarSetAware) Execute(ctx context.Context, vcursor VCursor, env *e
 	case sysvars.SessionEnableSystemSettings.Name:
 		err = svss.setBoolSysVar(ctx, env, vcursor.Session().SetSessionEnableSystemSettings)
 	case sysvars.Charset.Name, sysvars.Names.Name:
-		str, err := svss.evalAsString(env)
+		str, err := svss.evalAsString(env, vcursor)
 		if err != nil {
 			return err
 		}
@@ -515,19 +515,19 @@ func (svss *SysVarSetAware) Execute(ctx context.Context, vcursor VCursor, env *e
 			return vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "charset/name %v is not supported", str)
 		}
 	case sysvars.ReadAfterWriteGTID.Name:
-		str, err := svss.evalAsString(env)
+		str, err := svss.evalAsString(env, vcursor)
 		if err != nil {
 			return err
 		}
 		vcursor.Session().SetReadAfterWriteGTID(str)
 	case sysvars.ReadAfterWriteTimeOut.Name:
-		val, err := svss.evalAsFloat(env)
+		val, err := svss.evalAsFloat(env, vcursor)
 		if err != nil {
 			return err
 		}
 		vcursor.Session().SetReadAfterWriteTimeout(val)
 	case sysvars.SessionTrackGTIDs.Name:
-		str, err := svss.evalAsString(env)
+		str, err := svss.evalAsString(env, vcursor)
 		if err != nil {
 			return err
 		}
@@ -546,15 +546,15 @@ func (svss *SysVarSetAware) Execute(ctx context.Context, vcursor VCursor, env *e
 	return err
 }
 
-func (svss *SysVarSetAware) evalAsInt64(env *evalengine.ExpressionEnv) (int64, error) {
+func (svss *SysVarSetAware) evalAsInt64(env *evalengine.ExpressionEnv, vcursor VCursor) (int64, error) {
 	value, err := env.Evaluate(svss.Expr)
 	if err != nil {
 		return 0, err
 	}
 
-	v := value.Value()
+	v := value.Value(vcursor.ConnCollation())
 	if !v.IsIntegral() {
-		return 0, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.WrongTypeForVar, "incorrect argument type to variable '%s': %s", svss.Name, value.Value().Type().String())
+		return 0, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.WrongTypeForVar, "incorrect argument type to variable '%s': %s", svss.Name, v.Type().String())
 	}
 	intValue, err := v.ToInt64()
 	if err != nil {
@@ -563,28 +563,28 @@ func (svss *SysVarSetAware) evalAsInt64(env *evalengine.ExpressionEnv) (int64, e
 	return intValue, nil
 }
 
-func (svss *SysVarSetAware) evalAsFloat(env *evalengine.ExpressionEnv) (float64, error) {
+func (svss *SysVarSetAware) evalAsFloat(env *evalengine.ExpressionEnv, vcursor VCursor) (float64, error) {
 	value, err := env.Evaluate(svss.Expr)
 	if err != nil {
 		return 0, err
 	}
 
-	v := value.Value()
+	v := value.Value(vcursor.ConnCollation())
 	floatValue, err := v.ToFloat64()
 	if err != nil {
-		return 0, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.WrongTypeForVar, "incorrect argument type to variable '%s': %s", svss.Name, value.Value().Type().String())
+		return 0, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.WrongTypeForVar, "incorrect argument type to variable '%s': %s", svss.Name, v.Type().String())
 	}
 	return floatValue, nil
 }
 
-func (svss *SysVarSetAware) evalAsString(env *evalengine.ExpressionEnv) (string, error) {
+func (svss *SysVarSetAware) evalAsString(env *evalengine.ExpressionEnv, vcursor VCursor) (string, error) {
 	value, err := env.Evaluate(svss.Expr)
 	if err != nil {
 		return "", err
 	}
-	v := value.Value()
+	v := value.Value(vcursor.ConnCollation())
 	if !v.IsText() && !v.IsBinary() {
-		return "", vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.WrongTypeForVar, "incorrect argument type to variable '%s': %s", svss.Name, value.Value().Type().String())
+		return "", vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.WrongTypeForVar, "incorrect argument type to variable '%s': %s", svss.Name, v.Type().String())
 	}
 
 	return v.ToString(), nil

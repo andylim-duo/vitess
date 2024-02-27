@@ -34,12 +34,21 @@ type NodeFormatter func(buf *TrackedBuffer, node SQLNode)
 // want to generate a query that's different from the default.
 type TrackedBuffer struct {
 	*strings.Builder
-	bindLocations []bindLocation
+	bindLocations []BindLocation
 	nodeFormatter NodeFormatter
 	literal       func(string) (int, error)
-	escape        bool
 	fast          bool
+
+	escape escapeType
 }
+
+type escapeType int
+
+const (
+	escapeKeywords escapeType = iota
+	escapeAllIdentifiers
+	escapeNoIdentifiers
+)
 
 // NewTrackedBuffer creates a new TrackedBuffer.
 func NewTrackedBuffer(nodeFormatter NodeFormatter) *TrackedBuffer {
@@ -77,13 +86,25 @@ func (buf *TrackedBuffer) SetUpperCase(enable bool) {
 	}
 }
 
+func (buf *TrackedBuffer) WriteLiteral(lit string) {
+	_, _ = buf.literal(lit)
+}
+
 // SetEscapeAllIdentifiers sets whether ALL identifiers in the serialized SQL query should be quoted
 // and escaped. By default, identifiers are only escaped if they match the name of a SQL keyword or they
 // contain characters that must be escaped.
 // Enabling this option will prevent the optimized fastFormat routines from running.
-func (buf *TrackedBuffer) SetEscapeAllIdentifiers(enable bool) {
+func (buf *TrackedBuffer) SetEscapeAllIdentifiers() {
 	buf.fast = false
-	buf.escape = enable
+	buf.escape = escapeAllIdentifiers
+}
+
+// SetEscapeNoIdentifier sets whether NO identifiers in the serialized SQL query should be quoted and escaped.
+// Warning: this can lead to query output that is not valid SQL
+// Enabling this option will prevent the optimized fastFormat routines from running.
+func (buf *TrackedBuffer) SetEscapeNoIdentifier() {
+	buf.fast = false
+	buf.escape = escapeNoIdentifiers
 }
 
 // WriteNode function, initiates the writing of a single SQLNode tree by passing
@@ -109,13 +130,13 @@ func (buf *TrackedBuffer) Myprintf(format string, values ...any) {
 
 func (buf *TrackedBuffer) printExpr(currentExpr Expr, expr Expr, left bool) {
 	if precedenceFor(currentExpr) == Syntactic {
-		expr.formatFast(buf)
+		expr.FormatFast(buf)
 	} else {
 		needParens := needParens(currentExpr, expr, left)
 		if needParens {
 			buf.WriteByte('(')
 		}
-		expr.formatFast(buf)
+		expr.FormatFast(buf)
 		if needParens {
 			buf.WriteByte(')')
 		}
@@ -214,7 +235,7 @@ func getExpressionForParensEval(checkParens bool, value any) Expr {
 func (buf *TrackedBuffer) formatter(node SQLNode) {
 	switch {
 	case buf.fast:
-		node.formatFast(buf)
+		node.FormatFast(buf)
 	case buf.nodeFormatter != nil:
 		buf.nodeFormatter(buf, node)
 	default:
@@ -267,9 +288,9 @@ func areBothISExpr(op Expr, val Expr) bool {
 // WriteArg writes a value argument into the buffer along with
 // tracking information for future substitutions.
 func (buf *TrackedBuffer) WriteArg(prefix, arg string) {
-	buf.bindLocations = append(buf.bindLocations, bindLocation{
-		offset: buf.Len(),
-		length: len(prefix) + len(arg),
+	buf.bindLocations = append(buf.bindLocations, BindLocation{
+		Offset: buf.Len(),
+		Length: len(prefix) + len(arg),
 	})
 	buf.WriteString(prefix)
 	buf.WriteString(arg)
@@ -300,8 +321,21 @@ func String(node SQLNode) string {
 	}
 
 	buf := NewTrackedBuffer(nil)
-	node.formatFast(buf)
+	node.FormatFast(buf)
 	return buf.String()
+}
+
+// UnescapedString will return a string where no identifiers have been escaped.
+func UnescapedString(node SQLNode) string {
+	if node == nil {
+		return "" // do not return '<nil>', which is Go syntax.
+	}
+
+	buf := NewTrackedBuffer(nil)
+	buf.SetEscapeNoIdentifier()
+	node.Format(buf)
+	return buf.String()
+
 }
 
 // CanonicalString returns a canonical string representation of an SQLNode where all identifiers
@@ -313,7 +347,7 @@ func CanonicalString(node SQLNode) string {
 
 	buf := NewTrackedBuffer(nil)
 	buf.SetUpperCase(true)
-	buf.SetEscapeAllIdentifiers(true)
+	buf.SetEscapeAllIdentifiers()
 	node.Format(buf)
 	return buf.String()
 }

@@ -17,10 +17,10 @@ limitations under the License.
 package operators
 
 import (
+	fuzz "github.com/AdaLogics/go-fuzz-headers"
+
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vtgate/semantics"
-
-	fuzz "github.com/AdaLogics/go-fuzz-headers"
 )
 
 // FuzzAnalyse implements the fuzzer
@@ -30,7 +30,7 @@ func FuzzAnalyse(data []byte) int {
 	if err != nil {
 		return 0
 	}
-	tree, err := sqlparser.Parse(query)
+	tree, err := sqlparser.NewTestParser().Parse(query)
 	if err != nil {
 		return -1
 	}

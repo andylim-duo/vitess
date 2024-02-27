@@ -17,7 +17,6 @@ limitations under the License.
 package tabletenv
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -25,6 +24,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/safehtml/testconversions"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/streamlog"
@@ -52,7 +53,7 @@ func TestLogStats(t *testing.T) {
 }
 
 func testFormat(stats *LogStats, params url.Values) string {
-	var b bytes.Buffer
+	var b strings.Builder
 	stats.Logf(&b, params)
 	return b.String()
 }
@@ -181,7 +182,6 @@ func TestLogStatsFilter(t *testing.T) {
 	if got != want {
 		t.Errorf("logstats format: got:\n%q\nwant:\n%q\n", got, want)
 	}
-
 }
 
 func TestLogStatsFormatQuerySources(t *testing.T) {
@@ -204,12 +204,12 @@ func TestLogStatsFormatQuerySources(t *testing.T) {
 func TestLogStatsContextHTML(t *testing.T) {
 	html := "HtmlContext"
 	callInfo := &fakecallinfo.FakeCallInfo{
-		Html: html,
+		Html: testconversions.MakeHTMLForTest(html),
 	}
 	ctx := callinfo.NewContext(context.Background(), callInfo)
 	logStats := NewLogStats(ctx, "test")
-	if string(logStats.ContextHTML()) != html {
-		t.Fatalf("expect to get html: %s, but got: %s", html, string(logStats.ContextHTML()))
+	if logStats.ContextHTML().String() != html {
+		t.Fatalf("expect to get html: %s, but got: %s", html, logStats.ContextHTML().String())
 	}
 }
 

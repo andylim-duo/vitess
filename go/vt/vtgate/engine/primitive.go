@@ -18,16 +18,19 @@ package engine
 
 import (
 	"context"
+	"time"
 
 	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/srvtopo"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
 )
 
@@ -53,7 +56,6 @@ type (
 		// if the max memory rows override directive is set to true
 		ExceedsMaxMemoryRows(numRows int) bool
 
-		// V3 functions.
 		Execute(ctx context.Context, method string, query string, bindVars map[string]*querypb.BindVariable, rollbackOnError bool, co vtgatepb.CommitOrder) (*sqltypes.Result, error)
 		AutocommitApproval() bool
 
@@ -86,6 +88,9 @@ type (
 		Session() SessionActions
 
 		ConnCollation() collations.ID
+		Environment() *vtenv.Environment
+		TimeZone() *time.Location
+		SQLMode() string
 
 		ExecuteLock(ctx context.Context, rs *srvtopo.ResolvedShard, query *querypb.BoundQuery, lockFuncType sqlparser.LockingFuncType) (*sqltypes.Result, error)
 
@@ -109,12 +114,23 @@ type (
 		ShowExec(ctx context.Context, command sqlparser.ShowCommandType, filter *sqlparser.ShowFilter) (*sqltypes.Result, error)
 		// SetExec takes in k,v pair and use executor to set them in topo metadata.
 		SetExec(ctx context.Context, name string, value string) error
+		// ThrottleApp sets a ThrottlerappRule in topo
+		ThrottleApp(ctx context.Context, throttleAppRule *topodatapb.ThrottledAppRule) error
 
 		// CanUseSetVar returns true if system_settings can use SET_VAR hint.
 		CanUseSetVar() bool
 
 		// ReleaseLock releases all the held advisory locks.
 		ReleaseLock(ctx context.Context) error
+
+		// GetWarmingReadsPercent gets the percentage of queries to clone to replicas for bufferpool warming
+		GetWarmingReadsPercent() int
+
+		// GetWarmingReadsChannel returns the channel for executing warming reads against replicas
+		GetWarmingReadsChannel() chan bool
+
+		// CloneForReplicaWarming clones the VCursor for re-use in warming queries to replicas
+		CloneForReplicaWarming(ctx context.Context) VCursor
 	}
 
 	// SessionActions gives primitives ability to interact with the session state
@@ -125,6 +141,7 @@ type (
 		SetTarget(target string) error
 
 		SetUDV(key string, value any) error
+		GetUDV(key string) *querypb.BindVariable
 
 		SetSysVar(name string, expr string)
 
@@ -145,10 +162,14 @@ type (
 		SetWorkload(querypb.ExecuteOptions_Workload)
 		SetPlannerVersion(querypb.ExecuteOptions_PlannerVersion)
 		SetConsolidator(querypb.ExecuteOptions_Consolidator)
+		SetWorkloadName(string)
+		SetPriority(string)
 		SetFoundRows(uint64)
 
 		SetDDLStrategy(string)
 		GetDDLStrategy() string
+		SetMigrationContext(string)
+		GetMigrationContext() string
 
 		GetSessionUUID() string
 
@@ -194,6 +215,8 @@ type (
 		// InTransaction returns true if the session has already opened transaction or
 		// will start a transaction on the query execution.
 		InTransaction() bool
+
+		Commit(ctx context.Context) error
 	}
 
 	// Match is used to check if a Primitive matches
@@ -213,8 +236,9 @@ type (
 		TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error)
 		TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error
 
-		// Inputs is a slice containing the inputs to this Primitive
-		Inputs() []Primitive
+		// Inputs is a slice containing the inputs to this Primitive.
+		// The returned map has additional information about the inputs, that is used in the description.
+		Inputs() ([]Primitive, []map[string]any)
 
 		// description is the description, sans the inputs, of this Primitive.
 		// to get the plan description with all children, use PrimitiveToPlanDescription()
@@ -229,12 +253,6 @@ type (
 
 	// txNeeded is a default implementation for Primitives that need transaction handling
 	txNeeded struct{}
-
-	// Gen4Comparer interfaces all Primitive used to compare Gen4 with other planners (V3, MySQL, ...).
-	Gen4Comparer interface {
-		Primitive
-		GetGen4Primitive() Primitive
-	}
 )
 
 // Find will return the first Primitive that matches the evaluate function. If no match is found, nil will be returned
@@ -242,7 +260,8 @@ func Find(isMatch Match, start Primitive) Primitive {
 	if isMatch(start) {
 		return start
 	}
-	for _, input := range start.Inputs() {
+	inputs, _ := start.Inputs()
+	for _, input := range inputs {
 		result := Find(isMatch, input)
 		if result != nil {
 			return result
@@ -257,8 +276,8 @@ func Exists(m Match, p Primitive) bool {
 }
 
 // Inputs implements no inputs
-func (noInputs) Inputs() []Primitive {
-	return nil
+func (noInputs) Inputs() ([]Primitive, []map[string]any) {
+	return nil, nil
 }
 
 func (noTxNeeded) NeedsTransaction() bool {

@@ -35,10 +35,14 @@ import (
 	"testing"
 	"time"
 
+	"vitess.io/vitess/go/constants/sidecar"
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
+
+const vttabletStateTimeout = 60 * time.Second
 
 // VttabletProcess is a generic handle for a running vttablet .
 // It can be spawned manually
@@ -54,6 +58,7 @@ type VttabletProcess struct {
 	Shard                       string
 	CommonArg                   VtctlProcess
 	LogDir                      string
+	ErrorLog                    string
 	TabletHostname              string
 	Keyspace                    string
 	TabletType                  string
@@ -67,15 +72,16 @@ type VttabletProcess struct {
 	QueryzURL                   string
 	StatusDetailsURL            string
 	SupportsBackup              bool
+	ExplicitServingStatus       bool
 	ServingStatus               string
 	DbPassword                  string
 	DbPort                      int
-	VreplicationTabletType      string
 	DbFlavor                    string
 	Charset                     string
 	ConsolidationsURL           string
+	IsPrimary                   bool
 
-	//Extra Args to be set before starting the vttablet process
+	// Extra Args to be set before starting the vttablet process
 	ExtraArgs []string
 
 	proc *exec.Cmd
@@ -84,7 +90,6 @@ type VttabletProcess struct {
 
 // Setup starts vttablet process with required arguements
 func (vttablet *VttabletProcess) Setup() (err error) {
-
 	vttablet.proc = exec.Command(
 		vttablet.Binary,
 		"--topo_implementation", vttablet.CommonArg.TopoImplementation,
@@ -104,11 +109,15 @@ func (vttablet *VttabletProcess) Setup() (err error) {
 		"--backup_storage_implementation", vttablet.BackupStorageImplementation,
 		"--file_backup_storage_root", vttablet.FileBackupStorageRoot,
 		"--service_map", vttablet.ServiceMap,
-		"--vtctld_addr", vttablet.VtctldAddress,
-		"--vtctld_addr", vttablet.VtctldAddress,
-		"--vreplication_tablet_type", vttablet.VreplicationTabletType,
 		"--db_charset", vttablet.Charset,
 	)
+	if v, err := GetMajorVersion("vttablet"); err != nil {
+		return err
+	} else if v >= 18 {
+		vttablet.proc.Args = append(vttablet.proc.Args, "--bind-address", "127.0.0.1")
+		vttablet.proc.Args = append(vttablet.proc.Args, "--grpc_bind_address", "127.0.0.1")
+	}
+
 	if *isCoverage {
 		vttablet.proc.Args = append(vttablet.proc.Args, "--test.coverprofile="+getCoveragePath("vttablet.out"))
 	}
@@ -127,8 +136,10 @@ func (vttablet *VttabletProcess) Setup() (err error) {
 	fname := path.Join(vttablet.LogDir, vttablet.TabletPath+"-vttablet-stderr.txt")
 	errFile, _ := os.Create(fname)
 	vttablet.proc.Stderr = errFile
+	vttablet.ErrorLog = errFile.Name()
 
 	vttablet.proc.Env = append(vttablet.proc.Env, os.Environ()...)
+	vttablet.proc.Env = append(vttablet.proc.Env, DefaultVttestEnv)
 
 	log.Infof("Running vttablet with command: %v", strings.Join(vttablet.proc.Args, " "))
 
@@ -146,7 +157,15 @@ func (vttablet *VttabletProcess) Setup() (err error) {
 	}()
 
 	if vttablet.ServingStatus != "" {
-		if err = vttablet.WaitForTabletStatus(vttablet.ServingStatus); err != nil {
+		// If the tablet has an explicit serving status we use the serving status
+		// otherwise we wait for any serving status to show up in the healthcheck.
+		var servingStatus []string
+		if vttablet.ExplicitServingStatus {
+			servingStatus = append(servingStatus, vttablet.ServingStatus)
+		} else {
+			servingStatus = append(servingStatus, "SERVING", "NOT_SERVING")
+		}
+		if err = vttablet.WaitForTabletStatuses(servingStatus); err != nil {
 			errFileContent, _ := os.ReadFile(fname)
 			if errFileContent != nil {
 				log.Infof("vttablet error:\n%s\n", string(errFileContent))
@@ -268,19 +287,19 @@ func (vttablet *VttabletProcess) GetTabletType() string {
 	return ""
 }
 
-// WaitForTabletStatus waits for 10 second till expected status is reached
+// WaitForTabletStatus waits for one of the expected statuses to be reached
 func (vttablet *VttabletProcess) WaitForTabletStatus(expectedStatus string) error {
-	return vttablet.WaitForTabletStatusesForTimeout([]string{expectedStatus}, 10*time.Second)
+	return vttablet.WaitForTabletStatusesForTimeout([]string{expectedStatus}, vttabletStateTimeout)
 }
 
-// WaitForTabletStatuses waits for 10 second till one of expected statuses is reached
+// WaitForTabletStatuses waits for one of expected statuses is reached
 func (vttablet *VttabletProcess) WaitForTabletStatuses(expectedStatuses []string) error {
-	return vttablet.WaitForTabletStatusesForTimeout(expectedStatuses, 10*time.Second)
+	return vttablet.WaitForTabletStatusesForTimeout(expectedStatuses, vttabletStateTimeout)
 }
 
-// WaitForTabletTypes waits for 10 second till one of expected statuses is reached
+// WaitForTabletTypes waits for one of expected statuses is reached
 func (vttablet *VttabletProcess) WaitForTabletTypes(expectedTypes []string) error {
-	return vttablet.WaitForTabletTypesForTimeout(expectedTypes, 10*time.Second)
+	return vttablet.WaitForTabletTypesForTimeout(expectedTypes, vttabletStateTimeout)
 }
 
 // WaitForTabletStatusesForTimeout waits till the tablet reaches to any of the provided statuses
@@ -294,6 +313,12 @@ func (vttablet *VttabletProcess) WaitForTabletStatusesForTimeout(expectedStatuse
 		}
 		select {
 		case err := <-vttablet.exit:
+			errBytes, ferr := os.ReadFile(vttablet.ErrorLog)
+			if ferr == nil {
+				log.Errorf("vttablet error log contents:\n%s", string(errBytes))
+			} else {
+				log.Errorf("Failed to read the vttablet error log file %q: %v", vttablet.ErrorLog, ferr)
+			}
 			return fmt.Errorf("process '%s' exited prematurely (err: %s)", vttablet.Name, err)
 		default:
 			time.Sleep(300 * time.Millisecond)
@@ -334,7 +359,7 @@ func contains(arr []string, str string) bool {
 
 // WaitForBinLogPlayerCount waits till binlog player count var matches
 func (vttablet *VttabletProcess) WaitForBinLogPlayerCount(expectedCount int) error {
-	timeout := time.Now().Add(10 * time.Second)
+	timeout := time.Now().Add(vttabletStateTimeout)
 	for time.Now().Before(timeout) {
 		if vttablet.getVReplStreamCount() == fmt.Sprintf("%d", expectedCount) {
 			return nil
@@ -351,19 +376,23 @@ func (vttablet *VttabletProcess) WaitForBinLogPlayerCount(expectedCount int) err
 
 // WaitForBinlogServerState wait for the tablet's binlog server to be in the provided state.
 func (vttablet *VttabletProcess) WaitForBinlogServerState(expectedStatus string) error {
-	timeout := time.Now().Add(10 * time.Second)
-	for time.Now().Before(timeout) {
+	ctx, cancel := context.WithTimeout(context.Background(), vttabletStateTimeout)
+	defer cancel()
+	t := time.NewTicker(300 * time.Millisecond)
+	defer t.Stop()
+	for {
 		if vttablet.getVarValue("UpdateStreamState") == expectedStatus {
 			return nil
 		}
 		select {
 		case err := <-vttablet.exit:
 			return fmt.Errorf("process '%s' exited prematurely (err: %s)", vttablet.Name, err)
-		default:
-			time.Sleep(300 * time.Millisecond)
+		case <-ctx.Done():
+			return fmt.Errorf("vttablet %s, expected status of %s not reached before timeout of %v",
+				vttablet.TabletPath, expectedStatus, vttabletStateTimeout)
+		case <-t.C:
 		}
 	}
-	return fmt.Errorf("vttablet %s, expected status not reached", vttablet.TabletPath)
 }
 
 func (vttablet *VttabletProcess) getVReplStreamCount() string {
@@ -376,9 +405,20 @@ func (vttablet *VttabletProcess) getVarValue(keyname string) string {
 	return fmt.Sprintf("%v", object)
 }
 
-// TearDown shuts down the running vttablet service and fails after 10 seconds
+// TearDown shuts down the running vttablet service and fails after a timeout
 func (vttablet *VttabletProcess) TearDown() error {
-	return vttablet.TearDownWithTimeout(10 * time.Second)
+	return vttablet.TearDownWithTimeout(vttabletStateTimeout)
+}
+
+// Kill shuts down the running vttablet service immediately.
+func (vttablet *VttabletProcess) Kill() error {
+	if vttablet.proc == nil || vttablet.exit == nil {
+		return nil
+	}
+	vttablet.proc.Process.Kill()
+	err := <-vttablet.exit
+	vttablet.proc = nil
+	return err
 }
 
 // TearDownWithTimeout shuts down the running vttablet service and fails once the given
@@ -396,10 +436,7 @@ func (vttablet *VttabletProcess) TearDownWithTimeout(timeout time.Duration) erro
 		return nil
 
 	case <-time.After(timeout):
-		vttablet.proc.Process.Kill()
-		err := <-vttablet.exit
-		vttablet.proc = nil
-		return err
+		return vttablet.Kill()
 	}
 }
 
@@ -412,16 +449,40 @@ func (vttablet *VttabletProcess) CreateDB(keyspace string) error {
 
 // QueryTablet lets you execute a query in this tablet and get the result
 func (vttablet *VttabletProcess) QueryTablet(query string, keyspace string, useDb bool) (*sqltypes.Result, error) {
-	if !useDb {
-		keyspace = ""
-	}
-	dbParams := NewConnParams(vttablet.DbPort, vttablet.DbPassword, path.Join(vttablet.Directory, "mysql.sock"), keyspace)
-	conn, err := vttablet.conn(&dbParams)
+	conn, err := vttablet.TabletConn(keyspace, useDb)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
 	return executeQuery(conn, query)
+}
+
+// QueryTabletMultiple lets you execute multiple queries -- without any
+// results -- against the tablet.
+func (vttablet *VttabletProcess) QueryTabletMultiple(queries []string, keyspace string, useDb bool) error {
+	conn, err := vttablet.TabletConn(keyspace, useDb)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	for _, query := range queries {
+		log.Infof("Executing query %s (on %s)", query, vttablet.Name)
+		_, err := executeQuery(conn, query)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// TabletConn opens a MySQL connection on this tablet
+func (vttablet *VttabletProcess) TabletConn(keyspace string, useDb bool) (*mysql.Conn, error) {
+	if !useDb {
+		keyspace = ""
+	}
+	dbParams := NewConnParams(vttablet.DbPort, vttablet.DbPassword, path.Join(vttablet.Directory, "mysql.sock"), keyspace)
+	return vttablet.conn(&dbParams)
 }
 
 func (vttablet *VttabletProcess) defaultConn(dbname string) (*mysql.Conn, error) {
@@ -451,6 +512,16 @@ func (vttablet *VttabletProcess) QueryTabletWithDB(query string, dbname string) 
 	return executeQuery(conn, query)
 }
 
+// MultiQueryTabletWithDB lets you execute multiple queries on a specific DB in this tablet.
+func (vttablet *VttabletProcess) MultiQueryTabletWithDB(query string, dbname string) error {
+	conn, err := vttablet.defaultConn(dbname)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return executeMultiQuery(conn, query)
+}
+
 // executeQuery will retry the query up to 10 times with a small sleep in between each try.
 // This allows the tests to be more robust in the face of transient failures.
 func executeQuery(dbConn *mysql.Conn, query string) (*sqltypes.Result, error) {
@@ -475,6 +546,26 @@ func executeQuery(dbConn *mysql.Conn, query string) (*sqltypes.Result, error) {
 	return result, err
 }
 
+// executeMultiQuery will retry the given multi query up to 10 times with a small sleep in between each try.
+// This allows the tests to be more robust in the face of transient failures.
+func executeMultiQuery(dbConn *mysql.Conn, query string) (err error) {
+	retries := 10
+	retryDelay := 1 * time.Second
+	for i := 0; i < retries; i++ {
+		if i > 0 {
+			// We only audit from 2nd attempt and onwards, otherwise this is just too verbose.
+			log.Infof("Executing query %s (attempt %d of %d)", query, (i + 1), retries)
+		}
+		err = dbConn.ExecuteFetchMultiDrain(query)
+		if err == nil {
+			break
+		}
+		time.Sleep(retryDelay)
+	}
+
+	return err
+}
+
 // GetDBVar returns first matching database variable's value
 func (vttablet *VttabletProcess) GetDBVar(varName string, ksName string) (string, error) {
 	return vttablet.getDBSystemValues("variables", varName, ksName)
@@ -496,17 +587,20 @@ func (vttablet *VttabletProcess) getDBSystemValues(placeholder string, value str
 	return "", nil
 }
 
-// ToggleProfiling enables or disables the configured CPU profiler on this vttablet
-func (vttablet *VttabletProcess) ToggleProfiling() error {
-	return vttablet.proc.Process.Signal(syscall.SIGUSR1)
-}
-
 // WaitForVReplicationToCatchup waits for "workflow" to finish copying
-func (vttablet *VttabletProcess) WaitForVReplicationToCatchup(t testing.TB, workflow, database string, duration time.Duration) {
+func (vttablet *VttabletProcess) WaitForVReplicationToCatchup(t testing.TB, workflow, database string, sidecarDBName string, duration time.Duration) {
+	if sidecarDBName == "" {
+		sidecarDBName = sidecar.DefaultName
+	}
+	// Escape it if/as needed
+	ics := sqlparser.NewIdentifierCS(sidecarDBName)
+	sdbi := sqlparser.String(ics)
 	queries := [3]string{
-		fmt.Sprintf(`select count(*) from _vt.vreplication where workflow = "%s" and db_name = "%s" and pos = ''`, workflow, database),
-		"select count(*) from information_schema.tables where table_schema='_vt' and table_name='copy_state' limit 1;",
-		fmt.Sprintf(`select count(*) from _vt.copy_state where vrepl_id in (select id from _vt.vreplication where workflow = "%s" and db_name = "%s" )`, workflow, database),
+		sqlparser.BuildParsedQuery(`select count(*) from %s.vreplication where workflow = "%s" and db_name = "%s" and pos = ''`,
+			sdbi, workflow, database).Query,
+		sqlparser.BuildParsedQuery("select count(*) from information_schema.tables where table_schema='%s' and table_name='copy_state' limit 1", sidecarDBName).Query,
+		sqlparser.BuildParsedQuery(`select count(*) from %s.copy_state where vrepl_id in (select id from %s.vreplication where workflow = "%s" and db_name = "%s" )`,
+			sdbi, sdbi, workflow, database).Query,
 	}
 	results := [3]string{"[INT64(0)]", "[INT64(1)]", "[INT64(0)]"}
 
@@ -613,7 +707,6 @@ func VttabletProcessInstance(port, grpcPort, tabletUID int, cell, shard, keyspac
 		ServingStatus:               "NOT_SERVING",
 		BackupStorageImplementation: "file",
 		FileBackupStorageRoot:       path.Join(os.Getenv("VTDATAROOT"), "/backups"),
-		VreplicationTabletType:      "replica",
 		TabletUID:                   tabletUID,
 		Charset:                     charset,
 	}

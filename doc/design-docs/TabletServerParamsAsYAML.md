@@ -95,21 +95,18 @@ oltpReadPool:
   timeoutSeconds: 0        # queryserver-config-query-pool-timeout
   idleTimeoutSeconds: 1800 # queryserver-config-idle-timeout
   prefillParallelism: 0    # queryserver-config-pool-prefill-parallelism
-  maxWaiters: 50000        # queryserver-config-query-pool-waiter-cap
 
 olapReadPool:
   size: 200                # queryserver-config-stream-pool-size
   timeoutSeconds: 0        # queryserver-config-query-pool-timeout
   idleTimeoutSeconds: 1800 # queryserver-config-idle-timeout
   prefillParallelism: 0    # queryserver-config-stream-pool-prefill-parallelism
-  maxWaiters: 0
 
 txPool:
   size: 20                 # queryserver-config-transaction-cap
   timeoutSeconds: 1        # queryserver-config-txpool-timeout
   idleTimeoutSeconds: 1800 # queryserver-config-idle-timeout
   prefillParallelism: 0    # queryserver-config-transaction-prefill-parallelism
-  maxWaiters: 50000        # queryserver-config-txpool-waiter-cap
 
 oltp:
   queryTimeoutSeconds: 30 # queryserver-config-query-timeout
@@ -134,7 +131,6 @@ schemaReloadIntervalSeconds: 1800        # queryserver-config-schema-reload-time
 watchReplication: false                  # watch_replication_stream
 terseErrors: false                       # queryserver-config-terse-errors
 messagePostponeParallelism: 4            # queryserver-config-message-postpone-cap
-cacheResultFields: true                  # enable-query-plan-field-caching
 sanitizeLogMessages: false               # sanitize_log_messages
 
 
@@ -146,6 +142,7 @@ sanitizeLogMessages: false               # sanitize_log_messages
 # enable-tx-throttler
 # tx-throttler-config
 # tx-throttler-healthcheck-cells
+# tx-throttler-tablet-types
 # enable_transaction_limit
 # enable_transaction_limit_dry_run
 # transaction_limit_per_user

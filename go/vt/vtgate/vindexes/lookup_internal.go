@@ -24,25 +24,53 @@ import (
 	"strconv"
 	"strings"
 
-	"vitess.io/vitess/go/vt/vterrors"
-
 	"vitess.io/vitess/go/sqltypes"
-
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
-var (
+const (
 	readLockExclusive = "exclusive"
 	readLockShared    = "shared"
 	readLockNone      = "none"
 	readLockDefault   = readLockExclusive
 
+	lookupCommonParamAutocommit           = "autocommit"
+	lookupCommonParamMultiShardAutocommit = "multi_shard_autocommit"
+
+	lookupInternalParamTable       = "table"
+	lookupInternalParamFrom        = "from"
+	lookupInternalParamTo          = "to"
+	lookupInternalParamIgnoreNulls = "ignore_nulls"
+	lookupInternalParamBatchLookup = "batch_lookup"
+	lookupInternalParamReadLock    = "read_lock"
+)
+
+var (
 	readLockExprs = map[string]string{
 		readLockExclusive: "for update",
 		readLockShared:    "lock in share mode",
 		readLockNone:      "",
+	}
+
+	// lookupCommonParams are used only by lookup_* vindexes.
+	lookupCommonParams = append(
+		append(make([]string, 0), lookupInternalParams...),
+		lookupCommonParamAutocommit,
+		lookupCommonParamMultiShardAutocommit,
+	)
+
+	// lookupInternalParams are used by both lookup_* vindexes and the newer
+	// consistent_lookup_* vindexes.
+	lookupInternalParams = []string{
+		lookupInternalParamTable,
+		lookupInternalParamFrom,
+		lookupInternalParamTo,
+		lookupInternalParamIgnoreNulls,
+		lookupInternalParamBatchLookup,
+		lookupInternalParamReadLock,
 	}
 )
 
@@ -61,26 +89,26 @@ type lookupInternal struct {
 }
 
 func (lkp *lookupInternal) Init(lookupQueryParams map[string]string, autocommit, upsert, multiShardAutocommit bool) error {
-	lkp.Table = lookupQueryParams["table"]
-	lkp.To = lookupQueryParams["to"]
+	lkp.Table = lookupQueryParams[lookupInternalParamTable]
+	lkp.To = lookupQueryParams[lookupInternalParamTo]
 	var fromColumns []string
-	for _, from := range strings.Split(lookupQueryParams["from"], ",") {
+	for _, from := range strings.Split(lookupQueryParams[lookupInternalParamFrom], ",") {
 		fromColumns = append(fromColumns, strings.TrimSpace(from))
 	}
 	lkp.FromColumns = fromColumns
 
 	var err error
-	lkp.IgnoreNulls, err = boolFromMap(lookupQueryParams, "ignore_nulls")
+	lkp.IgnoreNulls, err = boolFromMap(lookupQueryParams, lookupInternalParamIgnoreNulls)
 	if err != nil {
 		return err
 	}
-	lkp.BatchLookup, err = boolFromMap(lookupQueryParams, "batch_lookup")
+	lkp.BatchLookup, err = boolFromMap(lookupQueryParams, lookupInternalParamBatchLookup)
 	if err != nil {
 		return err
 	}
-	if readLock, ok := lookupQueryParams["read_lock"]; ok {
+	if readLock, ok := lookupQueryParams[lookupInternalParamReadLock]; ok {
 		if _, valid := readLockExprs[readLock]; !valid {
-			return fmt.Errorf("invalid read_lock value: %s", readLock)
+			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "invalid %s value: %s", lookupInternalParamReadLock, readLock)
 		}
 		lkp.ReadLock = readLock
 	}
@@ -113,7 +141,7 @@ func (lkp *lookupInternal) Init(lookupQueryParams map[string]string, autocommit,
 // Lookup performs a lookup for the ids.
 func (lkp *lookupInternal) Lookup(ctx context.Context, vcursor VCursor, ids []sqltypes.Value, co vtgatepb.CommitOrder) ([]*sqltypes.Result, error) {
 	if vcursor == nil {
-		return nil, fmt.Errorf("cannot perform lookup: no vcursor provided")
+		return nil, vterrors.VT13001("cannot perform lookup: no vcursor provided")
 	}
 	results := make([]*sqltypes.Result, 0, len(ids))
 	if lkp.Autocommit {
@@ -129,14 +157,14 @@ func (lkp *lookupInternal) Lookup(ctx context.Context, vcursor VCursor, ids []sq
 		// for integral types, batch query all ids and then map them back to the input order
 		vars, err := sqltypes.BuildBindVariable(ids)
 		if err != nil {
-			return nil, fmt.Errorf("lookup.Map: %v", err)
+			return nil, err
 		}
 		bindVars := map[string]*querypb.BindVariable{
 			lkp.FromColumns[0]: vars,
 		}
 		result, err := vcursor.Execute(ctx, "VindexLookup", sel, bindVars, false /* rollbackOnError */, co)
 		if err != nil {
-			return nil, fmt.Errorf("lookup.Map: %v", err)
+			return nil, vterrors.Wrap(err, "lookup.Map")
 		}
 		resultMap := make(map[string][][]sqltypes.Value)
 		for _, row := range result.Rows {
@@ -153,7 +181,7 @@ func (lkp *lookupInternal) Lookup(ctx context.Context, vcursor VCursor, ids []sq
 		for _, id := range ids {
 			vars, err := sqltypes.BuildBindVariable([]any{id})
 			if err != nil {
-				return nil, fmt.Errorf("lookup.Map: %v", err)
+				return nil, err
 			}
 			bindVars := map[string]*querypb.BindVariable{
 				lkp.FromColumns[0]: vars,
@@ -161,7 +189,7 @@ func (lkp *lookupInternal) Lookup(ctx context.Context, vcursor VCursor, ids []sq
 			var result *sqltypes.Result
 			result, err = vcursor.Execute(ctx, "VindexLookup", sel, bindVars, false /* rollbackOnError */, co)
 			if err != nil {
-				return nil, fmt.Errorf("lookup.Map: %v", err)
+				return nil, vterrors.Wrap(err, "lookup.Map")
 			}
 			rows := make([][]sqltypes.Value, 0, len(result.Rows))
 			for _, row := range result.Rows {
@@ -193,7 +221,7 @@ func (lkp *lookupInternal) VerifyCustom(ctx context.Context, vcursor VCursor, id
 		}
 		result, err := vcursor.Execute(ctx, "VindexVerify", lkp.ver, bindVars, false /* rollbackOnError */, co)
 		if err != nil {
-			return nil, fmt.Errorf("lookup.Verify: %v", err)
+			return nil, vterrors.Wrap(err, "lookup.Verify")
 		}
 		out[i] = (len(result.Rows) != 0)
 	}
@@ -260,7 +288,8 @@ nextRow:
 		for j, col := range row {
 			if col.IsNull() {
 				if !lkp.IgnoreNulls {
-					return fmt.Errorf("lookup.Create: input has null values: row: %d, col: %d", i, j)
+					cols := strings.Join(lkp.FromColumns, ",")
+					return vterrors.VT03028(cols, i, j)
 				}
 				continue nextRow
 			}
@@ -274,7 +303,7 @@ nextRow:
 	// We only need to check the first row. Number of cols per row
 	// is guaranteed by the engine to be uniform.
 	if len(trimmedRowsCols[0]) != len(lkp.FromColumns) {
-		return fmt.Errorf("lookup.Create: column vindex count does not match the columns in the lookup: %d vs %v", len(trimmedRowsCols[0]), lkp.FromColumns)
+		return vterrors.VT03030(lkp.FromColumns, len(trimmedRowsCols[0]))
 	}
 	sort.Sort(&sorter{rowsColValues: trimmedRowsCols, toValues: trimmedToValues})
 
@@ -282,16 +311,16 @@ nextRow:
 	if lkp.MultiShardAutocommit {
 		insStmt = "insert /*vt+ MULTI_SHARD_AUTOCOMMIT=1 */"
 	}
-	buf := new(bytes.Buffer)
+	var buf strings.Builder
 	if ignoreMode {
-		fmt.Fprintf(buf, "%s ignore into %s(", insStmt, lkp.Table)
+		fmt.Fprintf(&buf, "%s ignore into %s(", insStmt, lkp.Table)
 	} else {
-		fmt.Fprintf(buf, "%s into %s(", insStmt, lkp.Table)
+		fmt.Fprintf(&buf, "%s into %s(", insStmt, lkp.Table)
 	}
 	for _, col := range lkp.FromColumns {
-		fmt.Fprintf(buf, "%s, ", col)
+		fmt.Fprintf(&buf, "%s, ", col)
 	}
-	fmt.Fprintf(buf, "%s) values(", lkp.To)
+	fmt.Fprintf(&buf, "%s) values(", lkp.To)
 
 	bindVars := make(map[string]*querypb.BindVariable, 2*len(trimmedRowsCols))
 	for rowIdx := range trimmedToValues {
@@ -310,15 +339,15 @@ nextRow:
 	}
 
 	if lkp.Upsert {
-		fmt.Fprintf(buf, " on duplicate key update ")
+		fmt.Fprintf(&buf, " on duplicate key update ")
 		for _, col := range lkp.FromColumns {
-			fmt.Fprintf(buf, "%s=values(%s), ", col, col)
+			fmt.Fprintf(&buf, "%s=values(%s), ", col, col)
 		}
-		fmt.Fprintf(buf, "%s=values(%s)", lkp.To, lkp.To)
+		fmt.Fprintf(&buf, "%s=values(%s)", lkp.To, lkp.To)
 	}
 
 	if _, err := vcursor.Execute(ctx, "VindexCreate", buf.String(), bindVars, true /* rollbackOnError */, co); err != nil {
-		return fmt.Errorf("lookup.Create: %v", err)
+		return vterrors.Wrap(err, "lookup.Create")
 	}
 	return nil
 }
@@ -326,7 +355,7 @@ nextRow:
 // Delete deletes the association between ids and value.
 // rowsColValues contains all the rows that are being deleted.
 // For each row, we store the value of each column defined in the vindex.
-// value cointains the keyspace_id of the vindex entry being deleted.
+// value contains the keyspace_id of the vindex entry being deleted.
 //
 // Given the following information in a vindex table with two columns:
 //
@@ -350,7 +379,7 @@ func (lkp *lookupInternal) Delete(ctx context.Context, vcursor VCursor, rowsColV
 	// We only need to check the first row. Number of cols per row
 	// is guaranteed by the engine to be uniform.
 	if len(rowsColValues[0]) != len(lkp.FromColumns) {
-		return fmt.Errorf("lookup.Delete: column vindex count does not match the columns in the lookup: %d vs %v", len(rowsColValues[0]), lkp.FromColumns)
+		return vterrors.VT03030(lkp.FromColumns, len(rowsColValues[0]))
 	}
 	for _, column := range rowsColValues {
 		bindVars := make(map[string]*querypb.BindVariable, len(rowsColValues))
@@ -360,7 +389,7 @@ func (lkp *lookupInternal) Delete(ctx context.Context, vcursor VCursor, rowsColV
 		bindVars[lkp.To] = sqltypes.ValueBindVariable(value)
 		_, err := vcursor.Execute(ctx, "VindexDelete", lkp.del, bindVars, true /* rollbackOnError */, co)
 		if err != nil {
-			return fmt.Errorf("lookup.Delete: %v", err)
+			return vterrors.Wrap(err, "lookup.Delete")
 		}
 	}
 	return nil
@@ -375,7 +404,7 @@ func (lkp *lookupInternal) Update(ctx context.Context, vcursor VCursor, oldValue
 }
 
 func (lkp *lookupInternal) initDelStmt() string {
-	var delBuffer bytes.Buffer
+	var delBuffer strings.Builder
 	fmt.Fprintf(&delBuffer, "delete from %s where ", lkp.Table)
 	for colIdx, column := range lkp.FromColumns {
 		if colIdx != 0 {
@@ -399,10 +428,10 @@ type commonConfig struct {
 func parseCommonConfig(m map[string]string) (*commonConfig, error) {
 	var c commonConfig
 	var err error
-	if c.autocommit, err = boolFromMap(m, "autocommit"); err != nil {
+	if c.autocommit, err = boolFromMap(m, lookupCommonParamAutocommit); err != nil {
 		return nil, err
 	}
-	if c.multiShardAutocommit, err = boolFromMap(m, "multi_shard_autocommit"); err != nil {
+	if c.multiShardAutocommit, err = boolFromMap(m, lookupCommonParamMultiShardAutocommit); err != nil {
 		return nil, err
 	}
 	return &c, nil

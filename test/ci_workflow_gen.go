@@ -76,24 +76,19 @@ var (
 		"18",
 		"xb_backup",
 		"backup_pitr",
+		"backup_pitr_xtrabackup",
 		"21",
 		"22",
 		"mysql_server_vault",
-		"vstream_failover",
-		"vstream_stoponreshard_true",
-		"vstream_stoponreshard_false",
-		"vstream_with_keyspaces_to_watch",
+		"vstream",
 		"onlineddl_ghost",
 		"onlineddl_vrepl",
 		"onlineddl_vrepl_stress",
 		"onlineddl_vrepl_stress_suite",
 		"onlineddl_vrepl_suite",
-		"vreplication_migrate_vdiff2_convert_tz",
 		"onlineddl_revert",
 		"onlineddl_scheduler",
-		"tabletmanager_throttler",
 		"tabletmanager_throttler_topo",
-		"tabletmanager_throttler_custom_config",
 		"tabletmanager_tablegc",
 		"tabletmanager_consul",
 		"vtgate_concurrentdml",
@@ -112,14 +107,17 @@ var (
 		"vtgate_vschema",
 		"vtgate_queries",
 		"vtgate_schema_tracker",
+		"vtgate_foreignkey_stress",
 		"vtorc",
 		"xb_recovery",
 		"mysql80",
 		"vreplication_across_db_versions",
-		"vreplication_multicell",
-		"vreplication_cellalias",
 		"vreplication_basic",
+		"vreplication_cellalias",
 		"vreplication_v2",
+		"vreplication_partial_movetables_and_materialize",
+		"vreplication_foreign_key_stress",
+		"vreplication_migrate_vdiff2_convert_tz",
 		"schemadiff_vrepl",
 		"topo_connection_cache",
 		"vtgate_partial_keyspace",
@@ -131,12 +129,24 @@ var (
 	clustersRequiringXtraBackup = []string{
 		"xb_backup",
 		"xb_recovery",
+		"backup_pitr_xtrabackup",
 	}
 	clustersRequiringMakeTools = []string{
 		"18",
 		"mysql_server_vault",
 		"vtgate_topo_consul",
 		"tabletmanager_consul",
+	}
+	clustersRequiringMemoryCheck = []string{
+		"vtorc",
+	}
+	clusterRequiring16CoresMachines = []string{
+		"onlineddl_vrepl",
+		"onlineddl_vrepl_stress",
+		"onlineddl_vrepl_stress_suite",
+		"onlineddl_vrepl_suite",
+		"vreplication_basic",
+		"vreplication_migrate_vdiff2_convert_tz",
 	}
 )
 
@@ -145,12 +155,15 @@ type unitTest struct {
 }
 
 type clusterTest struct {
-	Name, Shard, Platform        string
-	FileName                     string
-	MakeTools, InstallXtraBackup bool
-	Docker                       bool
-	LimitResourceUsage           bool
-	PartialKeyspace              bool
+	Name, Shard, Platform              string
+	FileName                           string
+	MemoryCheck                        bool
+	MakeTools, InstallXtraBackup       bool
+	Docker                             bool
+	LimitResourceUsage                 bool
+	EnableBinlogTransactionCompression bool
+	PartialKeyspace                    bool
+	Cores16                            bool
 }
 
 type selfHostedTest struct {
@@ -167,6 +180,8 @@ func clusterMySQLVersions(clusterName string) mysqlVersions {
 	case clusterName == "schemadiff_vrepl":
 		return allMySQLVersions
 	case clusterName == "backup_pitr":
+		return allMySQLVersions
+	case clusterName == "backup_pitr_xtrabackup":
 		return allMySQLVersions
 	case clusterName == "tabletmanager_tablegc":
 		return allMySQLVersions
@@ -326,10 +341,24 @@ func generateClusterWorkflows(list []string, tpl string) {
 				Name:  fmt.Sprintf("Cluster (%s)", cluster),
 				Shard: cluster,
 			}
+			cores16Clusters := canonnizeList(clusterRequiring16CoresMachines)
+			for _, cores16Cluster := range cores16Clusters {
+				if cores16Cluster == cluster {
+					test.Cores16 = true
+					break
+				}
+			}
 			makeToolClusters := canonnizeList(clustersRequiringMakeTools)
 			for _, makeToolCluster := range makeToolClusters {
 				if makeToolCluster == cluster {
 					test.MakeTools = true
+					break
+				}
+			}
+			memoryCheckClusters := canonnizeList(clustersRequiringMemoryCheck)
+			for _, memCheckCluster := range memoryCheckClusters {
+				if memCheckCluster == cluster {
+					test.MemoryCheck = true
 					break
 				}
 			}
@@ -345,6 +374,9 @@ func generateClusterWorkflows(list []string, tpl string) {
 			}
 			if strings.HasPrefix(cluster, "vreplication") || strings.HasSuffix(cluster, "heavy") {
 				test.LimitResourceUsage = true
+			}
+			if strings.Contains(cluster, "vrepl") {
+				test.EnableBinlogTransactionCompression = true
 			}
 			mysqlVersionIndicator := ""
 			if mysqlVersion != defaultMySQLVersion && len(clusterMySQLVersions(cluster)) > 1 {

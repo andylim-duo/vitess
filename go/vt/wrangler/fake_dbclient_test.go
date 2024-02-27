@@ -20,11 +20,13 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/sqlparser"
 
 	"vitess.io/vitess/go/sqltypes"
 )
@@ -63,6 +65,7 @@ func (dbrs *dbResults) exhausted() bool {
 
 // fakeDBClient fakes a binlog_player.DBClient.
 type fakeDBClient struct {
+	mu         sync.Mutex
 	name       string
 	queries    map[string]*dbResults
 	queriesRE  map[string]*dbResults
@@ -87,9 +90,8 @@ func newFakeDBClient(name string) *fakeDBClient {
 }
 
 func (dc *fakeDBClient) addQuery(query string, result *sqltypes.Result, err error) {
-	if testMode == "debug" {
-		log.Infof("%s::addQuery %s\n\n", dc.id(), query)
-	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
 	dbr := &dbResult{result: result, err: err}
 	if dbrs, ok := dc.queries[query]; ok {
 		dbrs.results = append(dbrs.results, dbr)
@@ -99,9 +101,8 @@ func (dc *fakeDBClient) addQuery(query string, result *sqltypes.Result, err erro
 }
 
 func (dc *fakeDBClient) addQueryRE(query string, result *sqltypes.Result, err error) {
-	if testMode == "debug" {
-		log.Infof("%s::addQueryRE %s\n\n", dc.id(), query)
-	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
 	dbr := &dbResult{result: result, err: err}
 	if dbrs, ok := dc.queriesRE[query]; ok {
 		dbrs.results = append(dbrs.results, dbr)
@@ -111,14 +112,15 @@ func (dc *fakeDBClient) addQueryRE(query string, result *sqltypes.Result, err er
 }
 
 func (dc *fakeDBClient) getInvariant(query string) *sqltypes.Result {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
 	return dc.invariants[query]
 }
 
 // note: addInvariant will replace a previous result for a query with the provided one: this is used in the tests
 func (dc *fakeDBClient) addInvariant(query string, result *sqltypes.Result) {
-	if testMode == "debug" {
-		log.Infof("%s::addInvariant %s\n\n", dc.id(), query)
-	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
 	dc.invariants[query] = result
 }
 
@@ -151,17 +153,28 @@ func (dc *fakeDBClient) Rollback() error {
 func (dc *fakeDBClient) Close() {
 }
 
-func (dc *fakeDBClient) id() string {
-	return fmt.Sprintf("FakeDBClient(%s)", dc.name)
-}
-
 // ExecuteFetch is part of the DBClient interface
 func (dc *fakeDBClient) ExecuteFetch(query string, maxrows int) (*sqltypes.Result, error) {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
 	qr, err := dc.executeFetch(query, maxrows)
-	if testMode == "debug" {
-		log.Infof("%s::ExecuteFetch for >>>%s<<< returns >>>%v<<< error >>>%+v<<< ", dc.id(), query, qr, err)
-	}
 	return qr, err
+}
+
+func (dc *fakeDBClient) ExecuteFetchMulti(query string, maxrows int) ([]*sqltypes.Result, error) {
+	queries, err := sqlparser.NewTestParser().SplitStatementToPieces(query)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]*sqltypes.Result, 0, len(queries))
+	for _, query := range queries {
+		qr, err := dc.executeFetch(query, maxrows)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, qr)
+	}
+	return results, nil
 }
 
 // ExecuteFetch is part of the DBClient interface
@@ -188,6 +201,8 @@ func (dc *fakeDBClient) executeFetch(query string, maxrows int) (*sqltypes.Resul
 }
 
 func (dc *fakeDBClient) verifyQueries(t *testing.T) {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
 	t.Helper()
 	for query, dbrs := range dc.queries {
 		if !dbrs.exhausted() {

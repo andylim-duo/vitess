@@ -17,6 +17,7 @@ limitations under the License.
 package vstreamer
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"testing"
@@ -26,6 +27,7 @@ import (
 	_flag "vitess.io/vitess/go/internal/flag"
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/vstreamer/testenv"
 )
@@ -35,6 +37,7 @@ var (
 	env    *testenv.Env
 
 	ignoreKeyspaceShardInFieldAndRowEvents bool
+	testRowEventFlags                      bool
 )
 
 func TestMain(m *testing.M) {
@@ -43,7 +46,9 @@ func TestMain(m *testing.M) {
 
 	exitCode := func() int {
 		var err error
-		env, err = testenv.Init()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		env, err = testenv.Init(ctx)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%v", err)
 			return 1
@@ -62,15 +67,44 @@ func TestMain(m *testing.M) {
 	os.Exit(exitCode)
 }
 
+func newEngine(t *testing.T, ctx context.Context, binlogRowImage string) {
+	if engine != nil {
+		engine.Close()
+	}
+	if env != nil {
+		env.Close()
+	}
+	var err error
+	env, err = testenv.Init(ctx)
+	require.NoError(t, err)
+
+	setBinlogRowImage(t, binlogRowImage)
+
+	// engine cannot be initialized in testenv because it introduces
+	// circular dependencies
+	engine = NewEngine(env.TabletEnv, env.SrvTopo, env.SchemaEngine, nil, env.Cells[0])
+	engine.InitDBConfig(env.KeyspaceName, env.ShardName)
+	engine.Open()
+}
+
 func customEngine(t *testing.T, modifier func(mysql.ConnParams) mysql.ConnParams) *Engine {
 	original, err := env.Dbcfgs.AppWithDB().MysqlParams()
 	require.NoError(t, err)
 	modified := modifier(*original)
-	config := env.TabletEnv.Config().Clone()
-	config.DB = dbconfigs.NewTestDBConfigs(modified, modified, modified.DbName)
+	cfg := env.TabletEnv.Config().Clone()
+	cfg.DB = dbconfigs.NewTestDBConfigs(modified, modified, modified.DbName)
 
-	engine := NewEngine(tabletenv.NewEnv(config, "VStreamerTest"), env.SrvTopo, env.SchemaEngine, nil, env.Cells[0])
+	engine := NewEngine(tabletenv.NewEnv(vtenv.NewTestEnv(), cfg, "VStreamerTest"), env.SrvTopo, env.SchemaEngine, nil, env.Cells[0])
 	engine.InitDBConfig(env.KeyspaceName, env.ShardName)
 	engine.Open()
 	return engine
+}
+
+func setBinlogRowImage(t *testing.T, mode string) {
+	execStatements(t, []string{
+		fmt.Sprintf("set @@binlog_row_image='%s'", mode),
+		fmt.Sprintf("set @@session.binlog_row_image='%s'", mode),
+		fmt.Sprintf("set @@global.binlog_row_image='%s'", mode),
+	})
+
 }

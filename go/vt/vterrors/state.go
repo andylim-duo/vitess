@@ -46,6 +46,9 @@ const (
 	DupFieldName
 	WrongValueCountOnRow
 	WrongValue
+	WrongArguments
+	BadNullError
+	InvalidGroupFuncUse
 
 	// failed precondition
 	NoDB
@@ -54,6 +57,10 @@ const (
 	CantDoThisInTransaction
 	RequiresPrimaryKey
 	OperandColumns
+	RowIsReferenced2
+	NoReferencedRow2
+	UnknownStmtHandler
+	KeyDoesNotExist
 
 	// not found
 	BadDb
@@ -79,9 +86,38 @@ const (
 
 	// permission denied
 	AccessDeniedError
+	KillDeniedError
 
 	// server not available
 	ServerNotAvailable
+
+	// unknown timezone
+	UnknownTimeZone
+
+	// regexp errors
+	RegexpStringNotTerminated
+	RegexpBufferOverflow
+	RegexpIllegalArgument
+	RegexpIndexOutOfBounds
+	RegexpInternal
+	RegexpRuleSyntax
+	RegexpBadEscapeSequence
+	RegexpUnimplemented
+	RegexpMismatchParen
+	RegexpBadInterval
+	RegexpMaxLtMin
+	RegexpInvalidBackRef
+	RegexpLookBehindLimit
+	RegexpMissingCloseBracket
+	RegexpInvalidRange
+	RegexpStackOverflow
+	RegexpTimeOut
+	RegexpPatternTooBig
+	RegexpInvalidCaptureGroup
+	RegexpInvalidFlag
+
+	CharacterSetMismatch
+	WrongParametersToNativeFct
 
 	// No state should be added below NumOfStates
 	NumOfStates

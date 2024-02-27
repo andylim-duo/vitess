@@ -28,12 +28,14 @@ import (
 	"time"
 
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/config"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/schema"
 	"vitess.io/vitess/go/vt/sqlparser"
 
 	"vitess.io/vitess/go/test/endtoend/cluster"
 	"vitess.io/vitess/go/test/endtoend/onlineddl"
+	"vitess.io/vitess/go/test/endtoend/throttler"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -57,8 +59,7 @@ var (
 )
 
 const (
-	testDataPath   = "testdata"
-	defaultSQLMode = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+	testDataPath = "testdata"
 )
 
 func TestMain(m *testing.M) {
@@ -78,13 +79,10 @@ func TestMain(m *testing.M) {
 		clusterInstance.VtctldExtraArgs = []string{
 			"--schema_change_dir", schemaChangeDirectory,
 			"--schema_change_controller", "local",
-			"--schema_change_check_interval", "1",
+			"--schema_change_check_interval", "1s",
 		}
 
 		clusterInstance.VtTabletExtraArgs = []string{
-			"--enable-lag-throttler",
-			"--throttle_threshold", "1s",
-			"--heartbeat_enable",
 			"--heartbeat_interval", "250ms",
 			"--heartbeat_on_demand_duration", "5s",
 			"--migration_check_interval", "5s",
@@ -134,6 +132,8 @@ func TestSchemaChange(t *testing.T) {
 	shards := clusterInstance.Keyspaces[0].Shards
 	require.Equal(t, 1, len(shards))
 
+	throttler.EnableLagThrottlerAndWaitForStatus(t, clusterInstance, time.Second)
+
 	files, err := os.ReadDir(testDataPath)
 	require.NoError(t, err)
 	for _, f := range files {
@@ -178,7 +178,7 @@ func testSingle(t *testing.T, testName string) {
 		}
 	}
 
-	sqlMode := defaultSQLMode
+	sqlMode := config.DefaultSQLMode
 	if overrideSQLMode, exists := readTestFile(t, testName, "sql_mode"); exists {
 		sqlMode = overrideSQLMode
 	}

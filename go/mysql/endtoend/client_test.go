@@ -25,6 +25,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"vitess.io/vitess/go/mysql/sqlerror"
+
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/mysql"
@@ -73,9 +75,9 @@ func TestKill(t *testing.T) {
 	// will differ.
 	err = <-errChan
 	if strings.Contains(err.Error(), "EOF") {
-		assertSQLError(t, err, mysql.CRServerLost, mysql.SSUnknownSQLState, "EOF", "select sleep(10) from dual")
+		assertSQLError(t, err, sqlerror.CRServerLost, sqlerror.SSUnknownSQLState, "EOF", "select sleep(10) from dual")
 	} else {
-		assertSQLError(t, err, mysql.CRServerLost, mysql.SSUnknownSQLState, "", "connection reset by peer")
+		assertSQLError(t, err, sqlerror.CRServerLost, sqlerror.SSUnknownSQLState, "", "connection reset by peer")
 	}
 }
 
@@ -104,7 +106,7 @@ func TestKill2006(t *testing.T) {
 	// unix socket, we will get a broken pipe when the server
 	// closes the connection and we are trying to write the command.
 	_, err = conn.ExecuteFetch("select sleep(10) from dual", 1000, false)
-	assertSQLError(t, err, mysql.CRServerGone, mysql.SSUnknownSQLState, "broken pipe", "select sleep(10) from dual")
+	assertSQLError(t, err, sqlerror.CRServerGone, sqlerror.SSUnknownSQLState, "broken pipe", "select sleep(10) from dual")
 }
 
 // TestDupEntry tests a duplicate key is properly raised.
@@ -123,7 +125,7 @@ func TestDupEntry(t *testing.T) {
 		t.Fatalf("first insert failed: %v", err)
 	}
 	_, err = conn.ExecuteFetch("insert into dup_entry(id, name) values(2, 10)", 0, false)
-	assertSQLError(t, err, mysql.ERDupEntry, mysql.SSConstraintViolation, "Duplicate entry", "insert into dup_entry(id, name) values(2, 10)")
+	assertSQLError(t, err, sqlerror.ERDupEntry, sqlerror.SSConstraintViolation, "Duplicate entry", "insert into dup_entry(id, name) values(2, 10)")
 }
 
 // TestClientFoundRows tests if the CLIENT_FOUND_ROWS flag works.
@@ -208,7 +210,11 @@ func doTestMultiResult(t *testing.T, disableClientDeprecateEOF bool) {
 		assert.EqualValues(t, 1, result.RowsAffected, "insert into returned RowsAffected")
 	}
 
-	qr, more, err = conn.ExecuteFetchMulti("update a set name = concat(name, ' updated'); select * from a; select count(*) from a", 300, true)
+	// Verify that a ExecuteFetchMultiDrain leaves the connection/packet in valid state.
+	err = conn.ExecuteFetchMultiDrain("update a set name = concat(name, ', multi drain 1'); select * from a; select count(*) from a")
+	expectNoError(t, err)
+	// If the previous command leaves packet in invalid state, this will fail.
+	qr, more, err = conn.ExecuteFetchMulti("update a set name = concat(name, ', fetch multi'); select * from a; select count(*) from a", 300, true)
 	expectNoError(t, err)
 	expectFlag(t, "ExecuteMultiFetch(multi result)", more, true)
 	assert.EqualValues(t, 255, qr.RowsAffected)
@@ -222,6 +228,13 @@ func doTestMultiResult(t *testing.T, disableClientDeprecateEOF bool) {
 	expectNoError(t, err)
 	expectFlag(t, "ReadQueryResult(2)", more, false)
 	assert.EqualValues(t, 1, len(qr.Rows), "ReadQueryResult(1)")
+
+	// Verify that a ExecuteFetchMultiDrain is happy to operate again after all the above.
+	err = conn.ExecuteFetchMultiDrain("update a set name = concat(name, ', multi drain 2'); select * from a; select count(*) from a")
+	expectNoError(t, err)
+
+	err = conn.ExecuteFetchMultiDrain("update b set name = concat(name, ' nonexistent table'); select * from a; select count(*) from a")
+	require.Error(t, err)
 
 	_, err = conn.ExecuteFetch("drop table a", 10, true)
 	require.NoError(t, err)

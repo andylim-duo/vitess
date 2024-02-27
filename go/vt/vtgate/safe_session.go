@@ -25,6 +25,8 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"vitess.io/vitess/go/mysql/datetime"
+
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/srvtopo"
 	"vitess.io/vitess/go/vt/sysvars"
@@ -71,6 +73,7 @@ type (
 		mu      sync.Mutex
 		entries []engine.ExecuteEntry
 		lastID  int
+		parser  *sqlparser.Parser
 	}
 
 	// autocommitState keeps track of whether a single round-trip
@@ -133,7 +136,7 @@ func NewSafeSession(sessn *vtgatepb.Session) *SafeSession {
 // NewAutocommitSession returns a SafeSession based on the original
 // session, but with autocommit enabled.
 func NewAutocommitSession(sessn *vtgatepb.Session) *SafeSession {
-	newSession := proto.Clone(sessn).(*vtgatepb.Session)
+	newSession := sessn.CloneVT()
 	newSession.InTransaction = false
 	newSession.ShardSessions = nil
 	newSession.PreSessions = nil
@@ -149,11 +152,22 @@ func (session *SafeSession) ResetTx() {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	session.resetCommonLocked()
-	if !session.Session.InReservedConn {
-		session.ShardSessions = nil
-		session.PreSessions = nil
-		session.PostSessions = nil
+	// If settings pools is enabled on the vttablet.
+	// This variable will be true but there will not be a shard session with reserved connection id.
+	// So, we should check the shard session and not just this variable.
+	if session.Session.InReservedConn {
+		allSessions := append(session.ShardSessions, append(session.PreSessions, session.PostSessions...)...)
+		for _, ss := range allSessions {
+			if ss.ReservedId != 0 {
+				// found that reserved connection exists.
+				// abort here, we should keep the shard sessions.
+				return
+			}
+		}
 	}
+	session.ShardSessions = nil
+	session.PreSessions = nil
+	session.PostSessions = nil
 }
 
 // Reset clears the session
@@ -422,7 +436,7 @@ func (session *SafeSession) AppendOrUpdate(shardSession *vtgatepb.Session_ShardS
 		if session.queryFromVindex {
 			break
 		}
-		// isSingle is enforced only for normmal commit order operations.
+		// isSingle is enforced only for normal commit order operations.
 		if session.isSingleDB(txMode) && len(session.ShardSessions) > 1 {
 			count := actualNoOfShardSession(session.ShardSessions)
 			if count <= 1 {
@@ -545,6 +559,38 @@ func (session *SafeSession) HasSystemVariables() (found bool) {
 		found = true
 	})
 	return
+}
+
+func (session *SafeSession) TimeZone() *time.Location {
+	session.mu.Lock()
+	tz, ok := session.SystemVariables["time_zone"]
+	session.mu.Unlock()
+
+	if !ok {
+		return nil
+	}
+	loc, _ := datetime.ParseTimeZone(tz)
+	return loc
+}
+
+// ForeignKeyChecks returns the foreign_key_checks stored in system_variables map in the session.
+func (session *SafeSession) ForeignKeyChecks() *bool {
+	session.mu.Lock()
+	fkVal, ok := session.SystemVariables[sysvars.ForeignKeyChecks]
+	session.mu.Unlock()
+
+	if !ok {
+		return nil
+	}
+	switch strings.ToLower(fkVal) {
+	case "off", "0":
+		fkCheckBool := false
+		return &fkCheckBool
+	case "on", "1":
+		fkCheckBool := true
+		return &fkCheckBool
+	}
+	return nil
 }
 
 // SetOptions sets the options
@@ -689,6 +735,20 @@ func (session *SafeSession) GetDDLStrategy() string {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	return session.DDLStrategy
+}
+
+// SetMigrationContext set the migration_context setting.
+func (session *SafeSession) SetMigrationContext(migrationContext string) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	session.MigrationContext = migrationContext
+}
+
+// GetMigrationContext returns the migration_context value.
+func (session *SafeSession) GetMigrationContext() string {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.MigrationContext
 }
 
 // GetSessionUUID returns the SessionUUID value.
@@ -882,11 +942,46 @@ func (session *SafeSession) ClearAdvisoryLock() {
 	session.AdvisoryLock = nil
 }
 
-func (session *SafeSession) EnableLogging() {
+func (session *SafeSession) EnableLogging(parser *sqlparser.Parser) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
-	session.logging = &executeLogger{}
+	session.logging = &executeLogger{
+		parser: parser,
+	}
+}
+
+// GetUDV returns the bind variable value for the user defined variable.
+func (session *SafeSession) GetUDV(name string) *querypb.BindVariable {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	if session.UserDefinedVariables == nil {
+		return nil
+	}
+	return session.UserDefinedVariables[name]
+}
+
+// StorePrepareData stores the prepared data information for the given key.
+func (session *SafeSession) StorePrepareData(key string, value *vtgatepb.PrepareData) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	if session.PrepareStatement == nil {
+		session.PrepareStatement = map[string]*vtgatepb.PrepareData{}
+	}
+	session.PrepareStatement[key] = value
+}
+
+// GetPrepareData returns the prepared data information for the given key.
+func (session *SafeSession) GetPrepareData(name string) *vtgatepb.PrepareData {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	if session.PrepareStatement == nil {
+		return nil
+	}
+	return session.PrepareStatement[name]
 }
 
 func (l *executeLogger) log(primitive engine.Primitive, target *querypb.Target, gateway srvtopo.Gateway, query string, begin bool, bv map[string]*querypb.BindVariable) {
@@ -906,7 +1001,7 @@ func (l *executeLogger) log(primitive engine.Primitive, target *querypb.Target, 
 			FiredFrom: primitive,
 		})
 	}
-	ast, err := sqlparser.Parse(query)
+	ast, err := l.parser.Parse(query)
 	if err != nil {
 		panic("query not able to parse. this should not happen")
 	}

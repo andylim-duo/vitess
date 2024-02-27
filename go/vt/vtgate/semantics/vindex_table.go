@@ -67,8 +67,12 @@ func (v *VindexTable) Name() (sqlparser.TableName, error) {
 }
 
 // GetExpr implements the TableInfo interface
-func (v *VindexTable) getExpr() *sqlparser.AliasedTableExpr {
-	return v.Table.getExpr()
+func (v *VindexTable) GetAliasedTableExpr() *sqlparser.AliasedTableExpr {
+	return v.Table.GetAliasedTableExpr()
+}
+
+func (v *VindexTable) canShortCut() shortCut {
+	return cannotShortCut
 }
 
 // GetColumns implements the TableInfo interface

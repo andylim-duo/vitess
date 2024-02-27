@@ -19,14 +19,17 @@ package command
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
-	"vitess.io/vitess/go/cmd/vtctldclient/cli"
-	"vitess.io/vitess/go/vt/logutil"
-	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/mysql/sqlerror"
+	"vitess.io/vitess/go/protoutil"
 
+	"vitess.io/vitess/go/cmd/vtctldclient/cli"
+	"vitess.io/vitess/go/constants/sidecar"
+	"vitess.io/vitess/go/mysql"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vtctldatapb "vitess.io/vitess/go/vt/proto/vtctldata"
 	"vitess.io/vitess/go/vt/proto/vttime"
@@ -35,7 +38,7 @@ import (
 var (
 	// CreateKeyspace makes a CreateKeyspace gRPC call to a vtctld.
 	CreateKeyspace = &cobra.Command{
-		Use:   "CreateKeyspace <keyspace> [--force|-f] [--type KEYSPACE_TYPE] [--base-keyspace KEYSPACE --snapshot-timestamp TIME] [--served-from DB_TYPE:KEYSPACE ...]  [--durability-policy <policy_name>]",
+		Use:   "CreateKeyspace <keyspace> [--force|-f] [--type KEYSPACE_TYPE] [--base-keyspace KEYSPACE --snapshot-timestamp TIME] [--served-from DB_TYPE:KEYSPACE ...] [--durability-policy <policy_name>] [--sidecar-db-name <db_name>]",
 		Short: "Creates the specified keyspace in the topology.",
 		Long: `Creates the specified keyspace in the topology.
 	
@@ -130,12 +133,11 @@ var createKeyspaceOptions = struct {
 	Force             bool
 	AllowEmptyVSchema bool
 
-	ServedFromsMap cli.StringMapValue
-
 	KeyspaceType      cli.KeyspaceTypeFlag
 	BaseKeyspace      string
 	SnapshotTimestamp string
 	DurabilityPolicy  string
+	SidecarDBName     string
 }{
 	KeyspaceType: cli.KeyspaceTypeFlag(topodatapb.KeyspaceType_NORMAL),
 }
@@ -172,7 +174,16 @@ func commandCreateKeyspace(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("--snapshot-time cannot be in the future; snapshot = %v, now = %v", t, now)
 		}
 
-		snapshotTime = logutil.TimeToProto(t)
+		snapshotTime = protoutil.TimeToProto(t)
+	}
+
+	createKeyspaceOptions.SidecarDBName = strings.TrimSpace(createKeyspaceOptions.SidecarDBName)
+	if createKeyspaceOptions.SidecarDBName == "" {
+		return errors.New("--sidecar-db-name cannot be empty when creating a keyspace")
+	}
+	if len(createKeyspaceOptions.SidecarDBName) > mysql.MaxIdentifierLength {
+		return sqlerror.NewSQLError(sqlerror.ERTooLongIdent, sqlerror.SSDataTooLong, "--sidecar-db-name identifier value of %q is too long (%d chars), max length for database identifiers is %d characters",
+			createKeyspaceOptions.SidecarDBName, len(createKeyspaceOptions.SidecarDBName), mysql.MaxIdentifierLength)
 	}
 
 	cli.FinishedParsing(cmd)
@@ -185,18 +196,7 @@ func commandCreateKeyspace(cmd *cobra.Command, args []string) error {
 		BaseKeyspace:      createKeyspaceOptions.BaseKeyspace,
 		SnapshotTime:      snapshotTime,
 		DurabilityPolicy:  createKeyspaceOptions.DurabilityPolicy,
-	}
-
-	for n, v := range createKeyspaceOptions.ServedFromsMap.StringMapValue {
-		tt, err := topo.ParseServingTabletType(n)
-		if err != nil {
-			return err
-		}
-
-		req.ServedFroms = append(req.ServedFroms, &topodatapb.Keyspace_ServedFrom{
-			TabletType: tt,
-			Keyspace:   v,
-		})
+		SidecarDbName:     createKeyspaceOptions.SidecarDBName,
 	}
 
 	resp, err := client.CreateKeyspace(commandCtx, req)
@@ -406,11 +406,11 @@ func commandValidateVersionKeyspace(cmd *cobra.Command, args []string) error {
 func init() {
 	CreateKeyspace.Flags().BoolVarP(&createKeyspaceOptions.Force, "force", "f", false, "Proceeds even if the keyspace already exists. Does not overwrite the existing keyspace record.")
 	CreateKeyspace.Flags().BoolVarP(&createKeyspaceOptions.AllowEmptyVSchema, "allow-empty-vschema", "e", false, "Allows a new keyspace to have no vschema.")
-	CreateKeyspace.Flags().Var(&createKeyspaceOptions.ServedFromsMap, "served-from", "Specifies a set of db_type:keyspace pairs used to serve traffic for the keyspace.")
 	CreateKeyspace.Flags().Var(&createKeyspaceOptions.KeyspaceType, "type", "The type of the keyspace.")
 	CreateKeyspace.Flags().StringVar(&createKeyspaceOptions.BaseKeyspace, "base-keyspace", "", "The base keyspace for a snapshot keyspace.")
 	CreateKeyspace.Flags().StringVar(&createKeyspaceOptions.SnapshotTimestamp, "snapshot-timestamp", "", "The snapshot time for a snapshot keyspace, as a timestamp in RFC3339 format.")
 	CreateKeyspace.Flags().StringVar(&createKeyspaceOptions.DurabilityPolicy, "durability-policy", "none", "Type of durability to enforce for this keyspace. Default is none. Possible values include 'semi_sync' and others as dictated by registered plugins.")
+	CreateKeyspace.Flags().StringVar(&createKeyspaceOptions.SidecarDBName, "sidecar-db-name", sidecar.DefaultName, "(Experimental) Name of the Vitess sidecar database that tablets in this keyspace will use for internal metadata.")
 	Root.AddCommand(CreateKeyspace)
 
 	DeleteKeyspace.Flags().BoolVarP(&deleteKeyspaceOptions.Recursive, "recursive", "r", false, "Recursively delete all shards in the keyspace, and all tablets in those shards.")

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-CREATE TABLE IF NOT EXISTS _vt.vreplication_log
+CREATE TABLE IF NOT EXISTS vreplication_log
 (
     `id`         bigint         NOT NULL AUTO_INCREMENT,
     `vrepl_id`   int            NOT NULL,
@@ -24,5 +24,6 @@ CREATE TABLE IF NOT EXISTS _vt.vreplication_log
     `updated_at` timestamp      NULL     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     `message`    text           NOT NULL,
     `count`      bigint         NOT NULL DEFAULT '1',
-    PRIMARY KEY (`id`)
+    PRIMARY KEY (`id`),
+    KEY `vrepl_id_idx` (`vrepl_id`)
 ) ENGINE = InnoDB

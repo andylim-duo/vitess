@@ -18,7 +18,12 @@ package mysqlctl
 
 import (
 	"os"
+	"strconv"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type testcase struct {
@@ -107,35 +112,89 @@ func TestParseVersionString(t *testing.T) {
 
 }
 
-func TestAssumeVersionString(t *testing.T) {
-
-	// In these cases, the versionstring is nonsensical or unspecified.
-	// MYSQL_FLAVOR is used instead.
-
-	var testcases = []testcase{
-		{
-			versionString: "MySQL80",
-			version:       ServerVersion{8, 0, 11},
-			flavor:        FlavorMySQL,
-		},
-		{
-			versionString: "MySQL56",
-			version:       ServerVersion{5, 7, 10}, // Yes, this has to lie!
-			flavor:        FlavorMySQL,             // There was no MySQL57 option
-		},
-		{
-			versionString: "MariaDB",
-			version:       ServerVersion{10, 6, 11},
-			flavor:        FlavorMariaDB,
-		},
+func TestRegexps(t *testing.T) {
+	{
+		submatch := binlogEntryTimestampGTIDRegexp.FindStringSubmatch(`#230608 13:14:31 server id 484362839  end_log_pos 259 CRC32 0xc07510d0 	GTID	last_committed=0	sequence_number=1	rbr_only=yes`)
+		require.NotEmpty(t, submatch)
+		assert.Equal(t, "230608 13:14:31", submatch[1])
+		_, err := ParseBinlogTimestamp(submatch[1])
+		assert.NoError(t, err)
+	}
+	{
+		submatch := binlogEntryTimestampGTIDRegexp.FindStringSubmatch(`#230608 13:14:31 server id 484362839  end_log_pos 322 CRC32 0x651af842 	Query	thread_id=62	exec_time=0	error_code=0`)
+		assert.Empty(t, submatch)
 	}
 
-	for _, testcase := range testcases {
-		os.Setenv("MYSQL_FLAVOR", testcase.versionString)
-		f, v, err := GetVersionFromEnv()
-		if v != testcase.version || f != testcase.flavor || err != nil {
-			t.Errorf("GetVersionFromEnv() failed for: %#v, Got: %#v, %#v Expected: %#v, %#v", testcase.versionString, v, f, testcase.version, testcase.flavor)
-		}
+	{
+		submatch := binlogEntryCommittedTimestampRegex.FindStringSubmatch(`#230605 16:06:34 server id 22233  end_log_pos 1037 CRC32 0xa4707c5b 	GTID	last_committed=4	sequence_number=5	rbr_only=no	original_committed_timestamp=1685970394031366	immediate_commit_timestamp=1685970394032458	transaction_length=186`)
+		require.NotEmpty(t, submatch)
+		assert.Equal(t, "1685970394031366", submatch[1])
+	}
+	{
+		submatch := binlogEntryCommittedTimestampRegex.FindStringSubmatch(`#230608 13:14:31 server id 484362839  end_log_pos 322 CRC32 0x651af842 	Query	thread_id=62	exec_time=0	error_code=0`)
+		assert.Empty(t, submatch)
 	}
 
+}
+
+func TestParseBinlogEntryTimestamp(t *testing.T) {
+	tcases := []struct {
+		name  string
+		entry string
+		tm    time.Time
+	}{
+		{
+			name:  "empty",
+			entry: "",
+		},
+		{
+			name:  "irrelevant",
+			entry: "/*!80001 SET @@session.original_commit_timestamp=1685970394031366*//*!*/;",
+		},
+		{
+			name:  "irrelevant 2",
+			entry: "#230605 16:06:34 server id 22233  end_log_pos 1139 CRC32 0x9fa6f3c8 	Query	thread_id=21	exec_time=0	error_code=0",
+		},
+		{
+			name:  "mysql80",
+			entry: "#230605 16:06:34 server id 22233  end_log_pos 1037 CRC32 0xa4707c5b 	GTID	last_committed=4	sequence_number=5	rbr_only=no	original_committed_timestamp=1685970394031366	immediate_commit_timestamp=1685970394032458	transaction_length=186",
+			tm:    time.UnixMicro(1685970394031366),
+		},
+		{
+			name:  "mysql57",
+			entry: "#230608 13:14:31 server id 484362839  end_log_pos 259 CRC32 0xc07510d0 	GTID	last_committed=0	sequence_number=1	rbr_only=yes",
+			tm:    time.Date(2023, time.June, 8, 13, 14, 31, 0, time.UTC),
+		},
+	}
+	for _, tcase := range tcases {
+		t.Run(tcase.name, func(t *testing.T) {
+			tm, err := parseBinlogEntryTimestamp(tcase.entry)
+			assert.NoError(t, err)
+			assert.Equal(t, tcase.tm, tm)
+		})
+	}
+}
+
+func TestCleanupLockfile(t *testing.T) {
+	t.Cleanup(func() {
+		os.Remove("mysql.sock.lock")
+	})
+	ts := "prefix"
+	// All good if no lockfile exists
+	assert.NoError(t, cleanupLockfile("mysql.sock", ts))
+
+	// If lockfile exists, but the process is not found, we clean it up.
+	os.WriteFile("mysql.sock.lock", []byte("123456789"), 0o600)
+	assert.NoError(t, cleanupLockfile("mysql.sock", ts))
+	assert.NoFileExists(t, "mysql.sock.lock")
+
+	// If lockfile exists, but the process is not found, we clean it up.
+	os.WriteFile("mysql.sock.lock", []byte("123456789\n"), 0o600)
+	assert.NoError(t, cleanupLockfile("mysql.sock", ts))
+	assert.NoFileExists(t, "mysql.sock.lock")
+
+	// If the lockfile exists, and the process is found, we don't clean it up.
+	os.WriteFile("mysql.sock.lock", []byte(strconv.Itoa(os.Getpid())), 0o600)
+	assert.Error(t, cleanupLockfile("mysql.sock", ts))
+	assert.FileExists(t, "mysql.sock.lock")
 }

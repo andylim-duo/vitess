@@ -18,53 +18,52 @@ package operators
 
 import (
 	"vitess.io/vitess/go/vt/sqlparser"
-	"vitess.io/vitess/go/vt/vtgate/planbuilder/operators/ops"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 	"vitess.io/vitess/go/vt/vtgate/semantics"
 )
 
 type JoinOp interface {
-	ops.Operator
-	GetLHS() ops.Operator
-	GetRHS() ops.Operator
-	SetLHS(ops.Operator)
-	SetRHS(ops.Operator)
+	Operator
+	GetLHS() Operator
+	GetRHS() Operator
+	SetLHS(Operator)
+	SetRHS(Operator)
 	MakeInner()
 	IsInner() bool
-	AddJoinPredicate(ctx *plancontext.PlanningContext, expr sqlparser.Expr) error
+	AddJoinPredicate(ctx *plancontext.PlanningContext, expr sqlparser.Expr)
 }
 
-func AddPredicate(join JoinOp, ctx *plancontext.PlanningContext, expr sqlparser.Expr, joinPredicates bool, newFilter func(ops.Operator, sqlparser.Expr) ops.Operator) (ops.Operator, error) {
+func AddPredicate(
+	ctx *plancontext.PlanningContext,
+	join JoinOp,
+	expr sqlparser.Expr,
+	joinPredicates bool,
+	newFilter func(Operator, sqlparser.Expr) Operator,
+) Operator {
 	deps := ctx.SemTable.RecursiveDeps(expr)
 	switch {
 	case deps.IsSolvedBy(TableID(join.GetLHS())):
 		// predicates can always safely be pushed down to the lhs if that is all they depend on
-		lhs, err := join.GetLHS().AddPredicate(ctx, expr)
-		if err != nil {
-			return nil, err
-		}
+		lhs := join.GetLHS().AddPredicate(ctx, expr)
 		join.SetLHS(lhs)
-		return join, err
+		return join
 	case deps.IsSolvedBy(TableID(join.GetRHS())):
 		// if we are dealing with an outer join, always start by checking if this predicate can turn
 		// the join into an inner join
-		if !join.IsInner() && canConvertToInner(ctx, expr, TableID(join.GetRHS())) {
+		if !joinPredicates && !join.IsInner() && canConvertToInner(ctx, expr, TableID(join.GetRHS())) {
 			join.MakeInner()
 		}
 
 		if !joinPredicates && !join.IsInner() {
 			// if we still are dealing with an outer join
 			// we need to filter after the join has been evaluated
-			return newFilter(join, expr), nil
+			return newFilter(join, expr)
 		}
 
 		// For inner joins, we can just push the filtering on the RHS
-		rhs, err := join.GetRHS().AddPredicate(ctx, expr)
-		if err != nil {
-			return nil, err
-		}
+		rhs := join.GetRHS().AddPredicate(ctx, expr)
 		join.SetRHS(rhs)
-		return join, err
+		return join
 
 	case deps.IsSolvedBy(TableID(join)):
 		// if we are dealing with an outer join, always start by checking if this predicate can turn
@@ -76,17 +75,14 @@ func AddPredicate(join JoinOp, ctx *plancontext.PlanningContext, expr sqlparser.
 		if !joinPredicates && !join.IsInner() {
 			// if we still are dealing with an outer join
 			// we need to filter after the join has been evaluated
-			return newFilter(join, expr), nil
+			return newFilter(join, expr)
 		}
 
-		err := join.AddJoinPredicate(ctx, expr)
-		if err != nil {
-			return nil, err
-		}
+		join.AddJoinPredicate(ctx, expr)
 
-		return join, nil
+		return join
 	}
-	return nil, nil
+	return nil
 }
 
 // we are looking for predicates like `tbl.col = <>` or `<> = tbl.col`,
@@ -100,7 +96,7 @@ func AddPredicate(join JoinOp, ctx *plancontext.PlanningContext, expr sqlparser.
 // matched no rows on the right-hand, if we are later going to remove all the rows where the right-hand
 // side did not match, we might as well turn the join into an inner join.
 //
-// This is based on the paper "Canonical Abstraction for Outerjoin Optimization" by J Rao et al
+// This is based on the paper "Canonical Abstraction for Outerjoin Optimization" by J Rao et al.
 func canConvertToInner(ctx *plancontext.PlanningContext, expr sqlparser.Expr, rhs semantics.TableSet) bool {
 	isColNameFromRHS := func(e sqlparser.Expr) bool {
 		return sqlparser.IsColName(e) && ctx.SemTable.RecursiveDeps(e).IsSolvedBy(rhs)

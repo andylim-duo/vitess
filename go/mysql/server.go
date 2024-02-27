@@ -25,20 +25,20 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pires/go-proxyproto"
+
 	"vitess.io/vitess/go/mysql/collations"
-	"vitess.io/vitess/go/vt/servenv"
-
-	"vitess.io/vitess/go/sqlescape"
-
-	proxyproto "github.com/pires/go-proxyproto"
-
+	"vitess.io/vitess/go/mysql/replication"
+	"vitess.io/vitess/go/mysql/sqlerror"
 	"vitess.io/vitess/go/netutil"
+	"vitess.io/vitess/go/sqlescape"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/tb"
 	"vitess.io/vitess/go/vt/log"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vterrors"
 )
 
@@ -122,7 +122,7 @@ type Handler interface {
 	ComBinlogDump(c *Conn, logFile string, binlogPos uint32) error
 
 	// ComBinlogDumpGTID is called when a connection receives a ComBinlogDumpGTID request
-	ComBinlogDumpGTID(c *Conn, logFile string, logPos uint64, gtidSet GTIDSet) error
+	ComBinlogDumpGTID(c *Conn, logFile string, logPos uint64, gtidSet replication.GTIDSet) error
 
 	// WarningCount is called at the end of each query to obtain
 	// the value to be returned to the client in the EOF packet.
@@ -132,6 +132,8 @@ type Handler interface {
 	WarningCount(c *Conn) uint16
 
 	ComResetConnection(c *Conn)
+
+	Env() *vtenv.Environment
 }
 
 // UnimplementedHandler implemnts all of the optional callbacks so as to satisy
@@ -196,6 +198,9 @@ type Listener struct {
 	// connBufferPooling configures if vtgate server pools connection buffers
 	connBufferPooling bool
 
+	// connKeepAlivePeriod is period between tcp keep-alives.
+	connKeepAlivePeriod time.Duration
+
 	// shutdown indicates that Shutdown method was called.
 	shutdown atomic.Bool
 
@@ -208,6 +213,14 @@ type Listener struct {
 	// handled further by the MySQL handler. An non-nil error will stop
 	// processing the connection by the MySQL handler.
 	PreHandleFunc func(context.Context, net.Conn, uint32) (net.Conn, error)
+
+	// flushDelay is the delay after which buffered response will be flushed to the client.
+	flushDelay time.Duration
+
+	// charset is the default server side character set to use for the connection
+	charset collations.ID
+	// parser to use for this listener, configured with the correct version.
+	truncateErrLen int
 }
 
 // NewFromListener creates a new mysql listener from an existing net.Listener
@@ -218,15 +231,19 @@ func NewFromListener(
 	connReadTimeout time.Duration,
 	connWriteTimeout time.Duration,
 	connBufferPooling bool,
+	keepAlivePeriod time.Duration,
+	flushDelay time.Duration,
 ) (*Listener, error) {
 	cfg := ListenerConfig{
-		Listener:           l,
-		AuthServer:         authServer,
-		Handler:            handler,
-		ConnReadTimeout:    connReadTimeout,
-		ConnWriteTimeout:   connWriteTimeout,
-		ConnReadBufferSize: connBufferSize,
-		ConnBufferPooling:  connBufferPooling,
+		Listener:            l,
+		AuthServer:          authServer,
+		Handler:             handler,
+		ConnReadTimeout:     connReadTimeout,
+		ConnWriteTimeout:    connWriteTimeout,
+		ConnReadBufferSize:  connBufferSize,
+		ConnBufferPooling:   connBufferPooling,
+		ConnKeepAlivePeriod: keepAlivePeriod,
+		FlushDelay:          flushDelay,
 	}
 	return NewListenerWithConfig(cfg)
 }
@@ -240,6 +257,8 @@ func NewListener(
 	connWriteTimeout time.Duration,
 	proxyProtocol bool,
 	connBufferPooling bool,
+	keepAlivePeriod time.Duration,
+	flushDelay time.Duration,
 ) (*Listener, error) {
 	listener, err := net.Listen(protocol, address)
 	if err != nil {
@@ -247,24 +266,26 @@ func NewListener(
 	}
 	if proxyProtocol {
 		proxyListener := &proxyproto.Listener{Listener: listener}
-		return NewFromListener(proxyListener, authServer, handler, connReadTimeout, connWriteTimeout, connBufferPooling)
+		return NewFromListener(proxyListener, authServer, handler, connReadTimeout, connWriteTimeout, connBufferPooling, keepAlivePeriod, flushDelay)
 	}
 
-	return NewFromListener(listener, authServer, handler, connReadTimeout, connWriteTimeout, connBufferPooling)
+	return NewFromListener(listener, authServer, handler, connReadTimeout, connWriteTimeout, connBufferPooling, keepAlivePeriod, flushDelay)
 }
 
 // ListenerConfig should be used with NewListenerWithConfig to specify listener parameters.
 type ListenerConfig struct {
 	// Protocol-Address pair and Listener are mutually exclusive parameters
-	Protocol           string
-	Address            string
-	Listener           net.Listener
-	AuthServer         AuthServer
-	Handler            Handler
-	ConnReadTimeout    time.Duration
-	ConnWriteTimeout   time.Duration
-	ConnReadBufferSize int
-	ConnBufferPooling  bool
+	Protocol            string
+	Address             string
+	Listener            net.Listener
+	AuthServer          AuthServer
+	Handler             Handler
+	ConnReadTimeout     time.Duration
+	ConnWriteTimeout    time.Duration
+	ConnReadBufferSize  int
+	ConnBufferPooling   bool
+	ConnKeepAlivePeriod time.Duration
+	FlushDelay          time.Duration
 }
 
 // NewListenerWithConfig creates new listener using provided config. There are
@@ -282,15 +303,19 @@ func NewListenerWithConfig(cfg ListenerConfig) (*Listener, error) {
 	}
 
 	return &Listener{
-		authServer:         cfg.AuthServer,
-		handler:            cfg.Handler,
-		listener:           l,
-		ServerVersion:      servenv.AppVersion.MySQLVersion(),
-		connectionID:       1,
-		connReadTimeout:    cfg.ConnReadTimeout,
-		connWriteTimeout:   cfg.ConnWriteTimeout,
-		connReadBufferSize: cfg.ConnReadBufferSize,
-		connBufferPooling:  cfg.ConnBufferPooling,
+		authServer:          cfg.AuthServer,
+		handler:             cfg.Handler,
+		listener:            l,
+		ServerVersion:       cfg.Handler.Env().MySQLVersion(),
+		connectionID:        1,
+		connReadTimeout:     cfg.ConnReadTimeout,
+		connWriteTimeout:    cfg.ConnWriteTimeout,
+		connReadBufferSize:  cfg.ConnReadBufferSize,
+		connBufferPooling:   cfg.ConnBufferPooling,
+		connKeepAlivePeriod: cfg.ConnKeepAlivePeriod,
+		flushDelay:          cfg.FlushDelay,
+		truncateErrLen:      cfg.Handler.Env().TruncateErrLen(),
+		charset:             cfg.Handler.Env().CollationEnv().DefaultConnectionCharset(),
 	}, nil
 }
 
@@ -366,7 +391,7 @@ func (l *Listener) handle(conn net.Conn, connectionID uint32, acceptTime time.Ti
 	defer connCount.Add(-1)
 
 	// First build and send the server handshake packet.
-	serverAuthPluginData, err := c.writeHandshakeV10(l.ServerVersion, l.authServer, l.TLSConfig.Load() != nil)
+	serverAuthPluginData, err := c.writeHandshakeV10(l.ServerVersion, l.authServer, uint8(l.charset), l.TLSConfig.Load() != nil)
 	if err != nil {
 		if err != io.EOF {
 			log.Errorf("Cannot send HandshakeV10 packet to %s: %v", c, err)
@@ -449,12 +474,12 @@ func (l *Listener) handle(conn net.Conn, connectionID uint32, acceptTime time.Ti
 		}
 
 		if negotiatedAuthMethod == nil {
-			c.writeErrorPacket(CRServerHandshakeErr, SSUnknownSQLState, "No authentication methods available for authentication.")
+			c.writeErrorPacket(sqlerror.CRServerHandshakeErr, sqlerror.SSUnknownSQLState, "No authentication methods available for authentication.")
 			return
 		}
 
 		if !l.AllowClearTextWithoutTLS.Load() && !c.TLSEnabled() && !negotiatedAuthMethod.AllowClearTextWithoutTLS() {
-			c.writeErrorPacket(CRServerHandshakeErr, SSUnknownSQLState, "Cannot use clear text authentication over non-SSL connections.")
+			c.writeErrorPacket(sqlerror.CRServerHandshakeErr, sqlerror.SSUnknownSQLState, "Cannot use clear text authentication over non-SSL connections.")
 			return
 		}
 
@@ -525,7 +550,8 @@ func (l *Listener) handle(conn net.Conn, connectionID uint32, acceptTime time.Ti
 
 	for {
 		kontinue := c.handleNextCommand(l.handler)
-		if !kontinue {
+		// before going for next command check if the connection should be closed or not.
+		if !kontinue || c.IsMarkedForClose() {
 			return
 		}
 	}
@@ -546,7 +572,7 @@ func (l *Listener) Shutdown() {
 
 // writeHandshakeV10 writes the Initial Handshake Packet, server side.
 // It returns the salt data.
-func (c *Conn) writeHandshakeV10(serverVersion string, authServer AuthServer, enableTLS bool) ([]byte, error) {
+func (c *Conn) writeHandshakeV10(serverVersion string, authServer AuthServer, charset uint8, enableTLS bool) ([]byte, error) {
 	capabilities := CapabilityClientLongPassword |
 		CapabilityClientFoundRows |
 		CapabilityClientLongFlag |
@@ -621,7 +647,7 @@ func (c *Conn) writeHandshakeV10(serverVersion string, authServer AuthServer, en
 	pos = writeUint16(data, pos, uint16(capabilities))
 
 	// Character set.
-	pos = writeByte(data, pos, collations.Local().DefaultConnectionCharset())
+	pos = writeByte(data, pos, charset)
 
 	// Status flag.
 	pos = writeUint16(data, pos, c.StatusFlags)

@@ -20,10 +20,19 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode"
+
+	"vitess.io/vitess/go/sqltypes"
+
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 var (
-	delimitedListRegexp = regexp.MustCompile(`[ ,;]+`)
+	delimitedListRegexp      = regexp.MustCompile(`[ ,;]+`)
+	SimulatedNullString      = sqltypes.NULL.String()
+	SimulatedNullStringSlice = []string{sqltypes.NULL.String()}
+	SimulatedNullInt         = -1
 )
 
 // SplitDelimitedList splits a given string by comma, semi-colon or space, and returns non-empty strings
@@ -72,4 +81,55 @@ func SingleWordCamel(w string) string {
 		return w
 	}
 	return strings.ToUpper(w[0:1]) + strings.ToLower(w[1:])
+}
+
+// ValueIsSimulatedNull returns true if the value represents
+// a NULL or unknown/unspecified value. This is used to
+// distinguish between a zero value / default and a user
+// provided value that is equivalent (e.g. an empty string
+// or slice).
+func ValueIsSimulatedNull(val any) bool {
+	switch cval := val.(type) {
+	case string:
+		return cval == SimulatedNullString
+	case []string:
+		return len(cval) == 1 && cval[0] == sqltypes.NULL.String()
+	case binlogdatapb.OnDDLAction:
+		return int32(cval) == int32(SimulatedNullInt)
+	case int:
+		return cval == SimulatedNullInt
+	case int32:
+		return int32(cval) == int32(SimulatedNullInt)
+	case int64:
+		return int64(cval) == int64(SimulatedNullInt)
+	case []topodatapb.TabletType:
+		return len(cval) == 1 && cval[0] == topodatapb.TabletType(SimulatedNullInt)
+	case binlogdatapb.VReplicationWorkflowState:
+		return int32(cval) == int32(SimulatedNullInt)
+	default:
+		return false
+	}
+}
+
+// Title returns a copy of the string s with all Unicode letters that begin words
+// mapped to their Unicode title case.
+//
+// This is a simplified version of `strings.ToTitle` which is deprecated as it doesn't
+// handle all Unicode characters correctly. But we don't care about those, so we can
+// use this. This avoids having all of `x/text` as a dependency.
+func Title(s string) string {
+	// Use a closure here to remember state.
+	// Hackish but effective. Depends on Map scanning in order and calling
+	// the closure once per rune.
+	prev := ' '
+	return strings.Map(
+		func(r rune) rune {
+			if unicode.IsSpace(prev) {
+				prev = r
+				return unicode.ToTitle(r)
+			}
+			prev = r
+			return r
+		},
+		s)
 }

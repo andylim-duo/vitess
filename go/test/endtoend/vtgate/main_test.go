@@ -73,18 +73,18 @@ func TestMain(m *testing.M) {
 			VSchema:   VSchema,
 		}
 		clusterInstance.VtGateExtraArgs = []string{"--schema_change_signal"}
-		clusterInstance.VtTabletExtraArgs = []string{"--queryserver-config-schema-change-signal", "--queryserver-config-schema-change-signal-interval", "0.1", "--queryserver-config-max-result-size", "100", "--queryserver-config-terse-errors"}
+		clusterInstance.VtTabletExtraArgs = []string{"--queryserver-config-schema-change-signal", "--queryserver-config-max-result-size", "100", "--queryserver-config-terse-errors"}
 		err = clusterInstance.StartKeyspace(*keyspace, []string{"-80", "80-"}, 0, false)
 		if err != nil {
 			return 1
 		}
 
-		err = clusterInstance.VtctlclientProcess.ApplyRoutingRules(routingRules)
+		err = clusterInstance.VtctldClientProcess.ApplyRoutingRules(routingRules)
 		if err != nil {
 			return 1
 		}
 
-		_, err = clusterInstance.VtctlclientProcess.ExecuteCommandWithOutput("RebuildVSchemaGraph")
+		_, err = clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("RebuildVSchemaGraph")
 		if err != nil {
 			return 1
 		}

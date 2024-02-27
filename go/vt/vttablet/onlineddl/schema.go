@@ -66,7 +66,8 @@ const (
 			migration_uuid=%a
 	`
 	sqlUpdateMigrationStatusFailedOrCancelled = `UPDATE _vt.schema_migrations
-			SET migration_status=IF(cancelled_timestamp IS NULL, 'failed', 'cancelled')
+			SET migration_status=IF(cancelled_timestamp IS NULL, 'failed', 'cancelled'),
+			completed_timestamp=NOW(6)
 		WHERE
 			migration_uuid=%a
 	`
@@ -95,8 +96,14 @@ const (
 		WHERE
 			migration_uuid=%a
 	`
-	sqlUpdateMigrationReadyToComplete = `UPDATE _vt.schema_migrations
-			SET ready_to_complete=%a
+	sqlSetMigrationReadyToComplete = `UPDATE _vt.schema_migrations SET
+			ready_to_complete=1,
+			ready_to_complete_timestamp=IFNULL(ready_to_complete_timestamp, NOW(6))
+		WHERE
+			migration_uuid=%a
+	`
+	sqlClearMigrationReadyToComplete = `UPDATE _vt.schema_migrations SET
+			ready_to_complete=0
 		WHERE
 			migration_uuid=%a
 	`
@@ -132,7 +139,7 @@ const (
 			migration_uuid=%a
 	`
 	sqlClearSingleArtifact = `UPDATE _vt.schema_migrations
-			SET artifacts=replace(artifacts, concat(%a, ','), ''), cleanup_timestamp=NULL
+			SET artifacts=replace(artifacts, concat(%a, ','), '')
 		WHERE
 			migration_uuid=%a
 	`
@@ -152,12 +159,18 @@ const (
 			migration_uuid=%a
 	`
 	sqlIncrementCutoverAttempts = `UPDATE _vt.schema_migrations
-			SET cutover_attempts=cutover_attempts+1
+			SET cutover_attempts=cutover_attempts+1,
+			last_cutover_attempt_timestamp=NOW()
 		WHERE
 			migration_uuid=%a
 	`
 	sqlUpdateReadyForCleanup = `UPDATE _vt.schema_migrations
 			SET retain_artifacts_seconds=-1
+		WHERE
+			migration_uuid=%a
+	`
+	sqlUpdateForceCutOver = `UPDATE _vt.schema_migrations
+			SET force_cutover=1
 		WHERE
 			migration_uuid=%a
 	`
@@ -167,7 +180,7 @@ const (
 			migration_uuid=%a
 			AND postpone_launch != 0
 	`
-	sqlUpdateCompleteMigration = `UPDATE _vt.schema_migrations
+	sqlClearPostponeCompletion = `UPDATE _vt.schema_migrations
 			SET postpone_completion=0
 		WHERE
 			migration_uuid=%a
@@ -195,6 +208,7 @@ const (
 	`
 	sqlUpdateSchemaAnalysis = `UPDATE _vt.schema_migrations
 			SET added_unique_keys=%a, removed_unique_keys=%a, removed_unique_key_names=%a,
+			removed_foreign_key_names=%a,
 			dropped_no_default_column_names=%a, expanded_column_names=%a,
 			revertible_notes=%a
 		WHERE
@@ -207,6 +221,7 @@ const (
 	`
 	sqlUpdateMigrationProgressByRowsCopied = `UPDATE _vt.schema_migrations
 			SET
+				table_rows=GREATEST(table_rows, %a),
 				progress=CASE
 					WHEN table_rows=0 THEN 100
 					ELSE LEAST(100, 100*%a/table_rows)
@@ -227,7 +242,7 @@ const (
 			migration_uuid=%a
 	`
 	sqlUpdateLastThrottled = `UPDATE _vt.schema_migrations
-			SET last_throttled_timestamp=FROM_UNIXTIME(%a), component_throttled=%a
+			SET last_throttled_timestamp=%a, component_throttled=%a
 		WHERE
 			migration_uuid=%a
 	`
@@ -245,6 +260,7 @@ const (
 			liveness_timestamp=NULL,
 			cancelled_timestamp=NULL,
 			completed_timestamp=NULL,
+			last_cutover_attempt_timestamp=NULL,
 			cleanup_timestamp=NULL
 		WHERE
 			migration_status IN ('failed', 'cancelled')
@@ -265,6 +281,7 @@ const (
 			liveness_timestamp=NULL,
 			cancelled_timestamp=NULL,
 			completed_timestamp=NULL,
+			last_cutover_attempt_timestamp=NULL,
 			cleanup_timestamp=NULL
 		WHERE
 			migration_status IN ('failed', 'cancelled')
@@ -278,6 +295,10 @@ const (
 	sqlSelectRunningMigrations = `SELECT
 			migration_uuid,
 			postpone_completion,
+			force_cutover,
+			cutover_attempts,
+			ifnull(timestampdiff(second, ready_to_complete_timestamp, now()), 0) as seconds_since_ready_to_complete,
+			ifnull(timestampdiff(second, last_cutover_attempt_timestamp, now()), 0) as seconds_since_last_cutover_attempt,
 			timestampdiff(second, started_timestamp, now()) as elapsed_seconds
 		FROM _vt.schema_migrations
 		WHERE
@@ -338,7 +359,7 @@ const (
 			log_path
 		FROM _vt.schema_migrations
 		WHERE
-			migration_status IN ('complete', 'failed')
+			migration_status IN ('complete', 'cancelled', 'failed')
 			AND cleanup_timestamp IS NULL
 			AND completed_timestamp <= IF(retain_artifacts_seconds=0,
 				NOW() - INTERVAL %a SECOND,
@@ -349,9 +370,13 @@ const (
 		SET
 			completed_timestamp=NOW(6)
 		WHERE
-			migration_status='failed'
+			migration_status IN ('cancelled', 'failed')
 			AND cleanup_timestamp IS NULL
 			AND completed_timestamp IS NULL
+	`
+	sqlShowMigrationsWhere = `SELECT *
+		FROM _vt.schema_migrations
+		%s
 	`
 	sqlSelectMigration = `SELECT
 			id,
@@ -381,6 +406,7 @@ const (
 			retain_artifacts_seconds,
 			is_view,
 			ready_to_complete,
+			ready_to_complete_timestamp is not null as was_ready_to_complete,
 			reverted_uuid,
 			rows_copied,
 			vitess_liveness_indicator,
@@ -451,6 +477,7 @@ const (
 		COLUMNS.CHARACTER_SET_NAME as character_set_name,
 		LOCATE('auto_increment', EXTRA) > 0 as is_auto_increment,
 		(DATA_TYPE='float' OR DATA_TYPE='double') AS is_float,
+		has_subpart,
 		has_nullable
 	FROM INFORMATION_SCHEMA.COLUMNS INNER JOIN (
 		SELECT
@@ -460,6 +487,7 @@ const (
 			COUNT(*) AS COUNT_COLUMN_IN_INDEX,
 			GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX ASC) AS COLUMN_NAMES,
 			SUBSTRING_INDEX(GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX ASC), ',', 1) AS FIRST_COLUMN_NAME,
+			SUM(SUB_PART IS NOT NULL) > 0 AS has_subpart,
 			SUM(NULLABLE='YES') > 0 AS has_nullable
 		FROM INFORMATION_SCHEMA.STATISTICS
 		WHERE
@@ -484,6 +512,10 @@ const (
 			WHEN 0 THEN 0
 			ELSE 1
 		END,
+		CASE has_subpart
+			WHEN 0 THEN 0
+			ELSE 1
+		END,
 		CASE IFNULL(CHARACTER_SET_NAME, '')
 				WHEN '' THEN 0
 				ELSE 1
@@ -497,14 +529,19 @@ const (
 		END,
 		COUNT_COLUMN_IN_INDEX
 	`
-	sqlDropTrigger       = "DROP TRIGGER IF EXISTS `%a`.`%a`"
-	sqlShowTablesLike    = "SHOW TABLES LIKE '%a'"
-	sqlDropTable         = "DROP TABLE `%a`"
-	sqlDropTableIfExists = "DROP TABLE IF EXISTS `%a`"
-	sqlShowColumnsFrom   = "SHOW COLUMNS FROM `%a`"
-	sqlShowTableStatus   = "SHOW TABLE STATUS LIKE '%a'"
-	sqlShowCreateTable   = "SHOW CREATE TABLE `%a`"
-	sqlGetAutoIncrement  = `
+	sqlDropTrigger                         = "DROP TRIGGER IF EXISTS `%a`.`%a`"
+	sqlShowTablesLike                      = "SHOW TABLES LIKE '%a'"
+	sqlDropTable                           = "DROP TABLE `%a`"
+	sqlDropTableIfExists                   = "DROP TABLE IF EXISTS `%a`"
+	sqlShowColumnsFrom                     = "SHOW COLUMNS FROM `%a`"
+	sqlShowTableStatus                     = "SHOW TABLE STATUS LIKE '%a'"
+	sqlAnalyzeTable                        = "ANALYZE NO_WRITE_TO_BINLOG TABLE `%a`"
+	sqlShowCreateTable                     = "SHOW CREATE TABLE `%a`"
+	sqlShowVariablesLikePreserveForeignKey = "show global variables like 'rename_table_preserve_foreign_key'"
+	sqlShowVariablesLikeFastAnalyzeTable   = "show global variables like 'fast_analyze_table'"
+	sqlEnableFastAnalyzeTable              = "set @@fast_analyze_table = 1"
+	sqlDisableFastAnalyzeTable             = "set @@fast_analyze_table = 0"
+	sqlGetAutoIncrement                    = `
 		SELECT
 			AUTO_INCREMENT
 		FROM INFORMATION_SCHEMA.TABLES
@@ -543,19 +580,22 @@ const (
 			_vt.copy_state
 		WHERE vrepl_id=%a
 		`
-	sqlSwapTables         = "RENAME TABLE `%a` TO `%a`, `%a` TO `%a`, `%a` TO `%a`"
-	sqlRenameTable        = "RENAME TABLE `%a` TO `%a`"
-	sqlLockTwoTablesWrite = "LOCK TABLES `%a` WRITE, `%a` WRITE"
-	sqlUnlockTables       = "UNLOCK TABLES"
-	sqlCreateSentryTable  = "CREATE TABLE IF NOT EXISTS `%a` (id INT PRIMARY KEY)"
-	sqlFindProcess        = "SELECT id, Info as info FROM information_schema.processlist WHERE id=%a AND Info LIKE %a"
-)
-
-const (
-	retryMigrationHint     = "retry"
-	cancelMigrationHint    = "cancel"
-	cancelAllMigrationHint = "cancel-all"
-	completeMigrationHint  = "complete"
+	sqlSwapTables              = "RENAME TABLE `%a` TO `%a`, `%a` TO `%a`, `%a` TO `%a`"
+	sqlRenameTable             = "RENAME TABLE `%a` TO `%a`"
+	sqlLockTwoTablesWrite      = "LOCK TABLES `%a` WRITE, `%a` WRITE"
+	sqlUnlockTables            = "UNLOCK TABLES"
+	sqlCreateSentryTable       = "CREATE TABLE IF NOT EXISTS `%a` (id INT PRIMARY KEY)"
+	sqlFindProcess             = "SELECT id, Info as info FROM information_schema.processlist WHERE id=%a AND Info LIKE %a"
+	sqlFindProcessByInfo       = "SELECT id, Info as info FROM information_schema.processlist WHERE Info LIKE %a and id != connection_id()"
+	sqlProcessWithLocksOnTable = `
+		SELECT
+			DISTINCT innodb_trx.trx_mysql_thread_id
+		from
+			performance_schema.data_locks
+			join information_schema.innodb_trx on (data_locks.ENGINE_TRANSACTION_ID=innodb_trx.trx_id)
+		where
+			data_locks.OBJECT_SCHEMA=database() AND data_locks.OBJECT_NAME=%a
+	`
 )
 
 var (

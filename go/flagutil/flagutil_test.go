@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -19,7 +19,6 @@ package flagutil
 import (
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
@@ -40,12 +39,9 @@ func TestStringList(t *testing.T) {
 			t.Errorf("v.Set(%v): %v", in, err)
 			continue
 		}
-		if strings.Join(p, ".") != out {
-			t.Errorf("want %#v, got %#v", strings.Split(out, "."), p)
-		}
-		if p.String() != in {
-			t.Errorf("v.String(): want %#v, got %#v", in, p.String())
-		}
+		assert.Equal(t, out, strings.Join(p, "."))
+		assert.Equal(t, in, p.String())
+
 	}
 }
 
@@ -110,52 +106,16 @@ func TestStringMap(t *testing.T) {
 	}
 }
 
-func TestDurationOrIntVar(t *testing.T) {
-	getflag := func() *DurationOrIntVar { return NewDurationOrIntVar("test-flag", time.Minute, time.Second) }
+func TestStringListValue(t *testing.T) {
+	strListVal := StringListValue{"temp", "val"}
+	require.Equal(t, []string([]string{"temp", "val"}), strListVal.Get())
+	require.Equal(t, "strings", strListVal.Type())
+}
 
-	tests := []struct {
-		name    string
-		arg     string
-		want    time.Duration
-		wantErr bool
-	}{
-		{
-			name: "duration format",
-			arg:  "1h",
-			want: time.Hour,
-		},
-		{
-			name: "legacy format",
-			arg:  "10",
-			want: 10 * time.Second,
-		},
-		{
-			name:    "invalid",
-			arg:     "this is not a duration or an int",
-			want:    0,
-			wantErr: true,
-		},
-		{
-			name: "default value",
-			arg:  "",
-			want: time.Minute,
-		},
+func TestStringMapValue(t *testing.T) {
+	strMapVal := StringMapValue{
+		"key": "val",
 	}
-
-	for _, tt := range tests {
-		flag := getflag()
-		if tt.arg == "" {
-			assert.Equal(t, tt.want, flag.Value())
-			return
-		}
-
-		err := flag.Set(tt.arg)
-		if tt.wantErr {
-			assert.Error(t, err)
-			return
-		}
-
-		require.NoError(t, err)
-		assert.Equal(t, tt.want, flag.Value())
-	}
+	require.Equal(t, "StringMap", strMapVal.Type())
+	require.Equal(t, map[string]string(map[string]string{"key": "val"}), strMapVal.Get())
 }

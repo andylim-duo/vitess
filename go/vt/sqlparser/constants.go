@@ -16,6 +16,8 @@ limitations under the License.
 
 package sqlparser
 
+import "vitess.io/vitess/go/mysql/datetime"
+
 // String constants to be used in ast.
 const (
 	// Select.Distinct
@@ -25,9 +27,14 @@ const (
 	SQLCalcFoundRowsStr = "sql_calc_found_rows "
 
 	// Select.Lock
-	NoLockStr    = ""
-	ForUpdateStr = " for update"
-	ShareModeStr = " lock in share mode"
+	NoLockStr              = ""
+	ForUpdateStr           = " for update"
+	ForUpdateNoWaitStr     = " for update nowait"
+	ForUpdateSkipLockedStr = " for update skip locked"
+	ForShareStr            = " for share"
+	ForShareNoWaitStr      = " for share nowait"
+	ForShareSkipLockedStr  = " for share skip locked"
+	ShareModeStr           = " lock in share mode"
 
 	// Select.Cache
 	SQLCacheStr   = "sql_cache "
@@ -63,7 +70,9 @@ const (
 	AddColVindexStr     = "on table add vindex"
 	DropColVindexStr    = "on table drop vindex"
 	AddSequenceStr      = "add sequence"
+	DropSequenceStr     = "drop sequence"
 	AddAutoIncStr       = "add auto_increment"
+	DropAutoIncStr      = "drop auto_increment"
 
 	// ALTER TABLE ALGORITHM string.
 	DefaultStr = "default"
@@ -113,10 +122,15 @@ const (
 	NaturalLeftJoinStr  = "natural left join"
 	NaturalRightJoinStr = "natural right join"
 
-	// Index hints.
-	UseStr    = "use "
+	// IgnoreStr string.
 	IgnoreStr = "ignore "
-	ForceStr  = "force "
+
+	// Index hints.
+	UseStr          = "use index"
+	IgnoreIndexStr  = "ignore index"
+	ForceStr        = "force index"
+	UseVindexStr    = "use vindex"
+	IgnoreVindexStr = "ignore vindex"
 
 	// Index hints For types.
 	JoinForStr    = "join"
@@ -209,7 +223,7 @@ const (
 	Utf16Str    = "_utf16"
 	Utf16leStr  = "_utf16le"
 	Utf32Str    = "_utf32"
-	Utf8Str     = "_utf8"
+	Utf8mb3Str  = "_utf8mb3"
 	Utf8mb4Str  = "_utf8mb4"
 	NStringStr  = "N"
 
@@ -253,10 +267,8 @@ const (
 	EmptyStr       = ""
 	TreeStr        = "tree"
 	JSONStr        = "json"
-	VitessStr      = "vitess"
 	TraditionalStr = "traditional"
 	AnalyzeStr     = "analyze"
-	VTExplainStr   = "vtexplain"
 	QueriesStr     = "queries"
 	AllVExplainStr = "all"
 	PlanStr        = "plan"
@@ -305,6 +317,7 @@ const (
 	VitessTargetStr            = " vitess_target"
 	VitessVariablesStr         = " vitess_metadata variables"
 	VschemaTablesStr           = " vschema tables"
+	VschemaKeyspacesStr        = " vschema keyspaces"
 	VschemaVindexesStr         = " vschema vindexes"
 	WarningsStr                = " warnings"
 
@@ -401,27 +414,70 @@ const (
 	DefaultTypeStr   = "default"
 	ExclusiveTypeStr = "exclusive"
 
-	// IntervalTypes strings
-	DayStr               = "day"
-	WeekStr              = "week"
-	MonthStr             = "month"
-	YearStr              = "year"
-	DayHourStr           = "day_hour"
-	DayMicrosecondStr    = "day_microsecond"
-	DayMinuteStr         = "day_minute"
-	DaySecondStr         = "day_second"
-	HourStr              = "hour"
-	HourMicrosecondStr   = "hour_microsecond"
-	HourMinuteStr        = "hour_minute"
-	HourSecondStr        = "hour_second"
-	MicrosecondStr       = "microsecond"
-	MinuteStr            = "minute"
-	MinuteMicrosecondStr = "minute_microsecond"
-	MinuteSecondStr      = "minute_second"
-	QuarterStr           = "quarter"
-	SecondStr            = "second"
-	SecondMicrosecondStr = "second_microsecond"
-	YearMonthStr         = "year_month"
+	// GeomeFromWktType strings
+	GeometryFromTextStr           = "st_geometryfromtext"
+	GeometryCollectionFromTextStr = "st_geometrycollectionfromtext"
+	PointFromTextStr              = "st_pointfromtext"
+	MultiPointFromTextStr         = "st_multipointfromtext"
+	LineStringFromTextStr         = "st_linestringfromtext"
+	MultiLinestringFromTextStr    = "st_multilinestringfromtext"
+	PolygonFromTextStr            = "st_polygonfromtext"
+	MultiPolygonFromTextStr       = "st_multipolygonfromtext"
+
+	// GeomeFromWktType strings
+	GeometryFromWKBStr           = "st_geometryfromwkb"
+	GeometryCollectionFromWKBStr = "st_geometrycollectionfromwkb"
+	PointFromWKBStr              = "st_pointfromwkb"
+	MultiPointFromWKBStr         = "st_multipointfromwkb"
+	LineStringFromWKBStr         = "st_linestringfromwkb"
+	MultiLinestringFromWKBStr    = "st_multilinestringfromwkb"
+	PolygonFromWKBStr            = "st_polygonfromwkb"
+	MultiPolygonFromWKBStr       = "st_multipolygonfromwkb"
+
+	// GeomFormatExpr strings
+	TextFormatStr   = "st_astext"
+	BinaryFormatStr = "st_asbinary"
+
+	// GeomPropertyType strings
+	IsSimpleStr     = "st_issimple"
+	IsEmptyStr      = "st_isempty"
+	EnvelopeStr     = "st_envelope"
+	DimensionStr    = "st_dimension"
+	GeometryTypeStr = "st_geometrytype"
+
+	// PointPropertyType strings
+	XCordinateStr = "st_x"
+	YCordinateStr = "st_y"
+	LatitudeStr   = "st_latitude"
+	LongitudeStr  = "st_longitude"
+
+	// LinestringPropertyType strings
+	EndPointStr   = "st_endpoint"
+	IsClosedStr   = "st_isclosed"
+	LengthStr     = "st_length"
+	NumPointsStr  = "st_numpoints"
+	PointNStr     = "st_pointn"
+	StartPointStr = "st_startpoint"
+
+	// PolygonPropertyType strings
+	AreaStr             = "st_area"
+	CentroidStr         = "st_centroid"
+	ExteriorRingStr     = "st_exteriorring"
+	InteriorRingNStr    = "st_interiorringN"
+	NumInteriorRingsStr = "st_numinteriorrings"
+
+	// GeomCollPropType strings
+	NumGeometriesStr = "st_numgeometries"
+	GeometryNStr     = "st_geometryn"
+
+	// GeomFromGeoHash strings
+	LatitudeFromHashStr  = "st_latfromgeohash"
+	LongitudeFromHashStr = "st_longfromgeohash"
+	PointFromHashStr     = "st_pointfromgeohash"
+
+	// KillType strings
+	ConnectionStr = "connection"
+	QueryStr      = "query"
 )
 
 // Constants for Enum Type - Insert.Action
@@ -444,7 +500,9 @@ const (
 	AddColVindexDDLAction
 	DropColVindexDDLAction
 	AddSequenceDDLAction
+	DropSequenceDDLAction
 	AddAutoIncDDLAction
+	DropAutoIncDDLAction
 	RevertDDLAction
 )
 
@@ -466,6 +524,11 @@ const (
 	NoLock Lock = iota
 	ForUpdateLock
 	ShareModeLock
+	ForShareLock
+	ForShareLockNoWait
+	ForShareLockSkipLocked
+	ForUpdateLockNoWait
+	ForUpdateLockSkipLocked
 )
 
 // Constants for Enum Type - TrimType
@@ -614,6 +677,38 @@ const (
 	NotRegexpOp
 )
 
+func Inverse(in ComparisonExprOperator) ComparisonExprOperator {
+	switch in {
+	case EqualOp:
+		return NotEqualOp
+	case LessThanOp:
+		return GreaterEqualOp
+	case GreaterThanOp:
+		return LessEqualOp
+	case LessEqualOp:
+		return GreaterThanOp
+	case GreaterEqualOp:
+		return LessThanOp
+	case NotEqualOp:
+		return EqualOp
+	case NullSafeEqualOp:
+		return NotEqualOp
+	case InOp:
+		return NotInOp
+	case NotInOp:
+		return InOp
+	case LikeOp:
+		return NotLikeOp
+	case NotLikeOp:
+		return LikeOp
+	case RegexpOp:
+		return NotRegexpOp
+	case NotRegexpOp:
+		return RegexpOp
+	}
+	panic("unreachable")
+}
+
 // Constant for Enum Type - IsExprOperator
 const (
 	IsNullOp IsExprOperator = iota
@@ -670,6 +765,8 @@ const (
 	UseOp IndexHintType = iota
 	IgnoreOp
 	ForceOp
+	UseVindexOp
+	IgnoreVindexOp
 )
 
 // Constant for Enum Type - IndexHintForType
@@ -718,8 +815,6 @@ const (
 	EmptyType ExplainType = iota
 	TreeType
 	JSONType
-	VitessType
-	VTExplainType
 	TraditionalType
 	AnalyzeType
 )
@@ -736,12 +831,6 @@ const (
 	IntoOutfile SelectIntoType = iota
 	IntoOutfileS3
 	IntoDumpfile
-)
-
-// Constant for Enum Type - DeallocateStmtType
-const (
-	DeallocateType DeallocateStmtType = iota
-	DropType
 )
 
 // Constant for Enum Type - JtOnResponseType
@@ -806,6 +895,7 @@ const (
 	VitessTarget
 	VitessVariables
 	VschemaTables
+	VschemaKeyspaces
 	VschemaVindexes
 	Warnings
 	Keyspace
@@ -841,6 +931,8 @@ const (
 	ThrottleAllMigrationType
 	UnthrottleMigrationType
 	UnthrottleAllMigrationType
+	ForceCutOverMigrationType
+	ForceCutOverAllMigrationType
 )
 
 // ColumnStorage constants
@@ -857,33 +949,141 @@ const (
 	DefaultFormat
 )
 
-// IntervalTypes constants
-const (
-	IntervalYear IntervalTypes = iota
-	IntervalQuarter
-	IntervalMonth
-	IntervalWeek
-	IntervalDay
-	IntervalHour
-	IntervalMinute
-	IntervalSecond
-	IntervalMicrosecond
-	IntervalYearMonth
-	IntervalDayHour
-	IntervalDayMinute
-	IntervalDaySecond
-	IntervalHourMinute
-	IntervalHourSecond
-	IntervalMinuteSecond
-	IntervalDayMicrosecond
-	IntervalHourMicrosecond
-	IntervalMinuteMicrosecond
-	IntervalSecondMicrosecond
-)
-
 // Transaction access mode
 const (
 	WithConsistentSnapshot TxAccessMode = iota
 	ReadWrite
 	ReadOnly
+)
+
+// Enum Types of WKT functions
+const (
+	GeometryFromText GeomFromWktType = iota
+	GeometryCollectionFromText
+	PointFromText
+	LineStringFromText
+	PolygonFromText
+	MultiPointFromText
+	MultiPolygonFromText
+	MultiLinestringFromText
+)
+
+// Enum Types of WKT functions
+const (
+	GeometryFromWKB GeomFromWkbType = iota
+	GeometryCollectionFromWKB
+	PointFromWKB
+	LineStringFromWKB
+	PolygonFromWKB
+	MultiPointFromWKB
+	MultiPolygonFromWKB
+	MultiLinestringFromWKB
+)
+
+// Enum Types of spatial format functions
+const (
+	TextFormat GeomFormatType = iota
+	BinaryFormat
+)
+
+// Enum Types of spatial property functions
+const (
+	IsSimple GeomPropertyType = iota
+	IsEmpty
+	Dimension
+	GeometryType
+	Envelope
+)
+
+// Enum Types of point property functions
+const (
+	XCordinate PointPropertyType = iota
+	YCordinate
+	Latitude
+	Longitude
+)
+
+// Enum Types of linestring property functions
+const (
+	EndPoint LinestrPropType = iota
+	IsClosed
+	Length
+	NumPoints
+	PointN
+	StartPoint
+)
+
+// Enum Types of linestring property functions
+const (
+	Area PolygonPropType = iota
+	Centroid
+	ExteriorRing
+	InteriorRingN
+	NumInteriorRings
+)
+
+// Enum Types of geom collection property functions
+const (
+	GeometryN GeomCollPropType = iota
+	NumGeometries
+)
+
+// Enum Types of geom from geohash functions
+const (
+	LatitudeFromHash GeomFromHashType = iota
+	LongitudeFromHash
+	PointFromHash
+)
+
+// IntervalType constants
+const (
+	IntervalNone        = datetime.IntervalNone
+	IntervalMicrosecond = datetime.IntervalMicrosecond
+	IntervalSecond      = datetime.IntervalSecond
+	IntervalMinute      = datetime.IntervalMinute
+	IntervalHour        = datetime.IntervalHour
+	IntervalDay         = datetime.IntervalDay
+	IntervalWeek        = datetime.IntervalWeek
+	IntervalMonth       = datetime.IntervalMonth
+	IntervalQuarter     = datetime.IntervalQuarter
+	IntervalYear        = datetime.IntervalYear
+
+	IntervalSecondMicrosecond = datetime.IntervalSecondMicrosecond
+	IntervalMinuteMicrosecond = datetime.IntervalMinuteMicrosecond
+	IntervalMinuteSecond      = datetime.IntervalMinuteSecond
+	IntervalHourMicrosecond   = datetime.IntervalHourMicrosecond
+	IntervalHourSecond        = datetime.IntervalHourSecond
+	IntervalHourMinute        = datetime.IntervalHourMinute
+	IntervalDayMicrosecond    = datetime.IntervalDayMicrosecond
+	IntervalDaySecond         = datetime.IntervalDaySecond
+	IntervalDayMinute         = datetime.IntervalDayMinute
+	IntervalDayHour           = datetime.IntervalDayHour
+	IntervalYearMonth         = datetime.IntervalYearMonth
+)
+
+type IntervalExprSyntax int8
+
+const (
+	IntervalDateExprDateAdd IntervalExprSyntax = iota
+	IntervalDateExprDateSub
+	IntervalDateExprAdddate
+	IntervalDateExprSubdate
+	IntervalDateExprBinaryAdd
+	IntervalDateExprBinaryAddLeft
+	IntervalDateExprBinarySub
+	IntervalDateExprTimestampadd
+)
+
+// Constant for Enum Type - KillType
+const (
+	ConnectionType KillType = iota
+	QueryType
+)
+
+const (
+	IndexTypeDefault IndexType = iota
+	IndexTypePrimary
+	IndexTypeUnique
+	IndexTypeSpatial
+	IndexTypeFullText
 )

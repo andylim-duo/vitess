@@ -21,13 +21,13 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/olekukonko/tablewriter"
+
 	"vitess.io/vitess/go/vt/log"
-	querypb "vitess.io/vitess/go/vt/proto/query"
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
-	"vitess.io/vitess/go/vt/schema"
 	"vitess.io/vitess/go/vt/sqlparser"
 
-	"github.com/olekukonko/tablewriter"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // vexecPlan contains the final query to be sent to the tablets
@@ -78,13 +78,13 @@ func (p vreplicationPlanner) exec(
 	if err != nil {
 		return nil, err
 	}
-	if qr.RowsAffected == 0 {
+	if qr.RowsAffected == 0 && len(qr.Rows) == 0 {
 		log.Infof("no matching streams found for workflow %s, tablet %s, query %s", p.vx.workflow, primaryAlias, query)
 	}
 	return qr, nil
 }
 func (p vreplicationPlanner) dryRun(ctx context.Context) error {
-	rsr, err := p.vx.wr.getStreams(p.vx.ctx, p.vx.workflow, p.vx.keyspace)
+	rsr, err := p.vx.wr.getStreams(p.vx.ctx, p.vx.workflow, p.vx.keyspace, nil)
 	if err != nil {
 		return err
 	}
@@ -109,58 +109,6 @@ func (p vreplicationPlanner) dryRun(ctx context.Context) error {
 	return nil
 }
 
-// schemaMigrationsPlanner is a vexecPlanner implementation, specific to _vt.schema_migrations table
-type schemaMigrationsPlanner struct {
-	vx *vexec
-	d  *vexecPlannerParams
-}
-
-func newSchemaMigrationsPlanner(vx *vexec) vexecPlanner {
-	return &schemaMigrationsPlanner{
-		vx: vx,
-		d: &vexecPlannerParams{
-			dbNameColumn:   "mysql_schema",
-			workflowColumn: "migration_uuid",
-			updateTemplates: []string{
-				`update _vt.schema_migrations set migration_status='val1'`,
-				`update _vt.schema_migrations set migration_status='val1' where migration_uuid='val2'`,
-				`update _vt.schema_migrations set migration_status='val1' where migration_uuid='val2' and shard='val3'`,
-			},
-			insertTemplates: []string{
-				`INSERT IGNORE INTO _vt.schema_migrations (
-					migration_uuid,
-					keyspace,
-					shard,
-					mysql_schema,
-					mysql_table,
-					migration_statement,
-					strategy,
-					options,
-					ddl_action,
-					requested_timestamp,
-					migration_context,
-					migration_status
-				) VALUES (
-					'val', 'val', 'val', 'val', 'val', 'val', 'val', 'val', 'val', FROM_UNIXTIME(0), 'val', 'val'
-				)`,
-			},
-		},
-	}
-}
-func (p schemaMigrationsPlanner) params() *vexecPlannerParams { return p.d }
-func (p schemaMigrationsPlanner) exec(ctx context.Context, primaryAlias *topodatapb.TabletAlias, query string) (*querypb.QueryResult, error) {
-	qr, err := p.vx.wr.GenericVExec(ctx, primaryAlias, query, p.vx.workflow, p.vx.keyspace)
-	if err != nil {
-		return nil, err
-	}
-	return qr, nil
-}
-func (p schemaMigrationsPlanner) dryRun(ctx context.Context) error { return nil }
-
-// make sure these planners implement vexecPlanner interface
-var _ vexecPlanner = vreplicationPlanner{}
-var _ vexecPlanner = schemaMigrationsPlanner{}
-
 const (
 	updateQuery = iota
 	deleteQuery
@@ -172,9 +120,9 @@ const (
 func extractTableName(stmt sqlparser.Statement) (string, error) {
 	switch stmt := stmt.(type) {
 	case *sqlparser.Update:
-		return sqlparser.String(stmt.TableExprs), nil
+		return sqlparser.ToString(stmt.TableExprs), nil
 	case *sqlparser.Delete:
-		return sqlparser.String(stmt.TableExprs), nil
+		return sqlparser.ToString(stmt.TableExprs), nil
 	case *sqlparser.Insert:
 		return sqlparser.String(stmt.Table), nil
 	case *sqlparser.Select:
@@ -191,8 +139,6 @@ func qualifiedTableName(tableName string) string {
 // getPlanner returns a specific planner appropriate for the queried table
 func (vx *vexec) getPlanner(ctx context.Context) error {
 	switch vx.tableName {
-	case qualifiedTableName(schema.SchemaMigrationsTableName):
-		vx.planner = newSchemaMigrationsPlanner(vx)
 	case qualifiedTableName(vreplicationTableName):
 		vx.planner = newVReplicationPlanner(vx)
 	default:
@@ -314,7 +260,7 @@ func (vx *vexec) buildUpdatePlan(ctx context.Context, planner vexecPlanner, upd 
 		}
 	}
 	if templates := plannerParams.updateTemplates; len(templates) > 0 {
-		match, err := sqlparser.QueryMatchesTemplates(vx.query, templates)
+		match, err := vx.wr.env.Parser().QueryMatchesTemplates(vx.query, templates)
 		if err != nil {
 			return nil, err
 		}
@@ -366,7 +312,7 @@ func (vx *vexec) buildInsertPlan(ctx context.Context, planner vexecPlanner, ins 
 		return nil, fmt.Errorf("query not supported by vexec: %s", sqlparser.String(ins))
 	}
 	if len(templates) > 0 {
-		match, err := sqlparser.QueryMatchesTemplates(vx.query, templates)
+		match, err := vx.wr.env.Parser().QueryMatchesTemplates(vx.query, templates)
 		if err != nil {
 			return nil, err
 		}

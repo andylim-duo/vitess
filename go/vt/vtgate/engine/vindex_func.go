@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
@@ -37,6 +38,12 @@ var _ Primitive = (*VindexFunc)(nil)
 
 // VindexFunc is a primitive that performs vindex functions.
 type VindexFunc struct {
+	// VindexFunc does not take inputs
+	noInputs
+
+	// VindexFunc does not need to work inside a tx
+	noTxNeeded
+
 	Opcode VindexOpcode
 	// Fields is the field info for the result.
 	Fields []*querypb.Field
@@ -45,12 +52,6 @@ type VindexFunc struct {
 	// TODO(sougou): add support for MultiColumn.
 	Vindex vindexes.SingleColumn
 	Value  evalengine.Expr
-
-	// VindexFunc does not take inputs
-	noInputs
-
-	// VindexFunc does not need to work inside a tx
-	noTxNeeded
 }
 
 // VindexOpcode is the opcode for a VindexFunc.
@@ -111,16 +112,17 @@ func (vf *VindexFunc) GetFields(ctx context.Context, vcursor VCursor, bindVars m
 }
 
 func (vf *VindexFunc) mapVindex(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	env := evalengine.EnvWithBindVars(bindVars, vcursor.ConnCollation())
+	env := evalengine.NewExpressionEnv(ctx, bindVars, vcursor)
 	k, err := env.Evaluate(vf.Value)
 	if err != nil {
 		return nil, err
 	}
 	var values []sqltypes.Value
-	if k.Value().Type() == querypb.Type_TUPLE {
+	value := k.Value(vcursor.ConnCollation())
+	if value.Type() == querypb.Type_TUPLE {
 		values = k.TupleValues()
 	} else {
-		values = append(values, k.Value())
+		values = append(values, value)
 	}
 	result := &sqltypes.Result{
 		Fields: vf.Fields,
@@ -135,7 +137,7 @@ func (vf *VindexFunc) mapVindex(ctx context.Context, vcursor VCursor, bindVars m
 			len(values), len(destinations))
 	}
 	for i, value := range values {
-		vkey, err := evalengine.Cast(value, sqltypes.VarBinary)
+		vkey, err := sqltypes.Cast(value, sqltypes.VarBinary)
 		if err != nil {
 			return nil, err
 		}
@@ -244,7 +246,7 @@ func (vf *VindexFunc) description() PrimitiveDescription {
 	other := map[string]any{
 		"Fields":  fields,
 		"Columns": vf.Cols,
-		"Value":   evalengine.FormatExpr(vf.Value),
+		"Value":   sqlparser.String(vf.Value),
 	}
 	if vf.Vindex != nil {
 		other["Vindex"] = vf.Vindex.String()

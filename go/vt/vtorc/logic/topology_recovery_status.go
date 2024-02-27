@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -35,13 +35,15 @@ const TopologyRecoveriesTemplate = `
   <tr>
     <th>Recovery ID</th>
     <th>Failure Type</th>
-    <th>Instance</th>
+    <th>Tablet Alias</th>
+    <th>Timestamp</th>
   </tr>
   {{range $i, $recovery := .}}
   <tr>
     <td>{{$recovery.ID}}</td>
     <td>{{$recovery.AnalysisEntry.Analysis}}</td>
-    <td>{{$recovery.AnalysisEntry.AnalyzedInstanceKey}}</td>
+    <td>{{$recovery.AnalysisEntry.AnalyzedInstanceAlias}}</td>
+    <td>{{$recovery.RecoveryStartTimestamp}}</td>
   </tr>
   {{end}}
 </table>

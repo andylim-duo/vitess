@@ -18,47 +18,41 @@ package operators
 
 import (
 	"vitess.io/vitess/go/vt/sqlparser"
-	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 	"vitess.io/vitess/go/vt/vtgate/semantics"
 )
 
-// BreakExpressionInLHSandRHS takes an expression and
+// breakExpressionInLHSandRHSForApplyJoin takes an expression and
 // extracts the parts that are coming from one of the sides into `ColName`s that are needed
-func BreakExpressionInLHSandRHS(
+func breakExpressionInLHSandRHSForApplyJoin(
 	ctx *plancontext.PlanningContext,
 	expr sqlparser.Expr,
 	lhs semantics.TableSet,
-) (bvNames []string, columns []*sqlparser.ColName, rewrittenExpr sqlparser.Expr, err error) {
-	rewrittenExpr = sqlparser.CopyOnRewrite(expr, nil, func(cursor *sqlparser.CopyOnWriteCursor) {
-		node, ok := cursor.Node().(*sqlparser.ColName)
-		if !ok {
+) (col applyJoinColumn) {
+	rewrittenExpr := sqlparser.CopyOnRewrite(expr, nil, func(cursor *sqlparser.CopyOnWriteCursor) {
+		nodeExpr, ok := cursor.Node().(sqlparser.Expr)
+		if !ok || !mustFetchFromInput(nodeExpr) {
 			return
 		}
-		deps := ctx.SemTable.RecursiveDeps(node)
-		if deps.IsEmpty() {
-			err = vterrors.VT13001("unknown column. has the AST been copied?")
-			cursor.StopTreeWalk()
-			return
-		}
+		deps := ctx.SemTable.RecursiveDeps(nodeExpr)
 		if !deps.IsSolvedBy(lhs) {
 			return
 		}
 
-		node.Qualifier.Qualifier = sqlparser.NewIdentifierCS("")
-		columns = append(columns, node)
-		bvName := node.CompliantName()
-		bvNames = append(bvNames, bvName)
+		bvName := ctx.GetReservedArgumentFor(nodeExpr)
+		col.LHSExprs = append(col.LHSExprs, BindVarExpr{
+			Name: bvName,
+			Expr: nodeExpr,
+		})
 		arg := sqlparser.NewArgument(bvName)
 		// we are replacing one of the sides of the comparison with an argument,
 		// but we don't want to lose the type information we have, so we copy it over
-		ctx.SemTable.CopyExprInfo(node, arg)
+		ctx.SemTable.CopyExprInfo(nodeExpr, arg)
 		cursor.Replace(arg)
 	}, nil).(sqlparser.Expr)
 
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	ctx.JoinPredicates[expr] = append(ctx.JoinPredicates[expr], rewrittenExpr)
+	ctx.AddJoinPredicates(expr, rewrittenExpr)
+	col.RHSExpr = rewrittenExpr
+	col.Original = expr
 	return
 }

@@ -51,7 +51,9 @@ import (
 	"testing"
 	"time"
 
+	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/proto/query"
@@ -69,11 +71,11 @@ const (
 	numInitialRows   = 10
 )
 
-type state struct {
+type TestState struct {
 	tables []string
 }
 
-var testState = &state{}
+var testState = &TestState{}
 
 var positions map[string]string
 var allEvents []*binlogdatapb.VEvent
@@ -124,7 +126,7 @@ func TestVStreamCopyFilterValidations(t *testing.T) {
 			require.Error(t, uvs.init(), expectedError)
 			return
 		}
-		require.Equal(t, len(expected), len(uvs.plans))
+		require.Equalf(t, len(expected), len(uvs.plans), "Plans: %+v", uvs.plans)
 		for _, tableName := range expected {
 			require.True(t, uvs.plans[tableName].tablePK.TableName == tableName)
 			if tablePKs == nil {
@@ -152,7 +154,7 @@ func TestVStreamCopyFilterValidations(t *testing.T) {
 
 	tablePKs := []*binlogdatapb.TableLastPK{{
 		TableName: "t1",
-		Lastpk:    getQRFromLastPK([]*query.Field{{Name: "id11", Type: query.Type_INT32}}, []sqltypes.Value{sqltypes.NewInt32(10)}),
+		Lastpk:    getQRFromLastPK([]*query.Field{{Name: "id11", Type: query.Type_INT32, Charset: collations.CollationBinaryID, Flags: uint32(query.MySqlFlag_BINARY_FLAG | query.MySqlFlag_NUM_FLAG)}}, []sqltypes.Value{sqltypes.NewInt32(10)}),
 	}}
 	testCases = append(testCases, &TestCase{[]*binlogdatapb.Rule{{Match: "t1"}}, tablePKs, []string{"t1"}, ""})
 
@@ -238,17 +240,17 @@ func TestVStreamCopyCompleteFlow(t *testing.T) {
 		insertRow(t, "t1", 1, numInitialRows+4)
 		insertRow(t, "t2", 2, numInitialRows+3)
 		// savepoints should not be sent in the event stream
-		execStatement(t, `
-begin;
-insert into t3 (id31, id32) values (12, 360);
-savepoint a;
-insert into t3 (id31, id32) values (13, 390);
-rollback work to savepoint a;
-savepoint b;
-insert into t3 (id31, id32) values (13, 390);
-release savepoint b;
-commit;"
-`)
+		execStatements(t, []string{
+			"begin",
+			"insert into t3 (id31, id32) values (12, 360)",
+			"savepoint a",
+			"insert into t3 (id31, id32) values (13, 390)",
+			"rollback work to savepoint a",
+			"savepoint b",
+			"insert into t3 (id31, id32) values (13, 390)",
+			"release savepoint b",
+			"commit",
+		})
 	}
 
 	numCopyEvents := 3 /*t1,t2,t3*/ * (numInitialRows + 1 /*FieldEvent*/ + 1 /*LastPKEvent*/ + 1 /*TestEvent: Copy Start*/ + 2 /*begin,commit*/ + 3 /* LastPK Completed*/)
@@ -320,6 +322,7 @@ func validateReceivedEvents(t *testing.T) {
 
 func resetMetrics(t *testing.T) {
 	engine.vstreamerEventsStreamed.Reset()
+	engine.vstreamerCompressedTransactionsDecoded.Reset()
 	engine.resultStreamerNumRows.Reset()
 	engine.rowStreamerNumRows.Reset()
 	engine.vstreamerPhaseTimings.Reset()
@@ -405,7 +408,7 @@ func getRule(table string) *binlogdatapb.Rule {
 }
 
 func getTablePK(table string, idx int) *binlogdatapb.TableLastPK {
-	fields := []*query.Field{{Name: fmt.Sprintf("id%d1", idx), Type: query.Type_INT32}}
+	fields := []*query.Field{{Name: fmt.Sprintf("id%d1", idx), Type: query.Type_INT32, Charset: collations.CollationBinaryID, Flags: uint32(query.MySqlFlag_BINARY_FLAG | query.MySqlFlag_NUM_FLAG)}}
 
 	lastPK := []sqltypes.Value{sqltypes.NewInt32(0)}
 	return &binlogdatapb.TableLastPK{
@@ -439,13 +442,16 @@ func getEventCallback(event *binlogdatapb.VEvent) func() {
 func startVStreamCopy(ctx context.Context, t *testing.T, filter *binlogdatapb.Filter, tablePKs []*binlogdatapb.TableLastPK) {
 	pos := ""
 	go func() {
-		err := engine.Stream(ctx, pos, tablePKs, filter, func(evs []*binlogdatapb.VEvent) error {
+		err := engine.Stream(ctx, pos, tablePKs, filter, throttlerapp.VStreamerName, func(evs []*binlogdatapb.VEvent) error {
 			//t.Logf("Received events: %v", evs)
 			muAllEvents.Lock()
 			defer muAllEvents.Unlock()
 			for _, ev := range evs {
 				if ev.Type == binlogdatapb.VEventType_HEARTBEAT {
 					continue
+				}
+				if ev.Type == binlogdatapb.VEventType_ROW {
+					ev.RowEvent.Flags = 0
 				}
 				if ev.Throttled {
 					continue
@@ -477,7 +483,7 @@ var expectedEvents = []string{
 	"type:ROW row_event:{table_name:\"t1\" row_changes:{after:{lengths:1 lengths:2 values:\"880\"}}}",
 	"type:ROW row_event:{table_name:\"t1\" row_changes:{after:{lengths:1 lengths:2 values:\"990\"}}}",
 	"type:ROW row_event:{table_name:\"t1\" row_changes:{after:{lengths:2 lengths:3 values:\"10100\"}}}",
-	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t1\" lastpk:{rows:{lengths:2 values:\"10\"}}}}",
+	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t1\" lastpk:{fields:{name:\"id11\" type:INT32 charset:63 flags:53251} rows:{lengths:2 values:\"10\"}}}}",
 	"type:COMMIT",
 	"type:BEGIN",
 	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t1\"} completed:true}",
@@ -506,7 +512,7 @@ var expectedEvents = []string{
 	"type:ROW row_event:{table_name:\"t2\" row_changes:{after:{lengths:1 lengths:3 values:\"9180\"}}}",
 	"type:ROW row_event:{table_name:\"t2\" row_changes:{after:{lengths:2 lengths:3 values:\"10200\"}}}",
 	"type:ROW row_event:{table_name:\"t2\" row_changes:{after:{lengths:2 lengths:3 values:\"11220\"}}}",
-	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t2\" lastpk:{rows:{lengths:2 values:\"11\"}}}}",
+	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t2\" lastpk:{fields:{name:\"id21\" type:INT32 charset:63 flags:53251} rows:{lengths:2 values:\"11\"}}}}",
 	"type:COMMIT",
 	"type:BEGIN",
 	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t2\"} completed:true}",
@@ -534,7 +540,7 @@ var expectedEvents = []string{
 	"type:ROW row_event:{table_name:\"t3\" row_changes:{after:{lengths:1 lengths:3 values:\"8240\"}}}",
 	"type:ROW row_event:{table_name:\"t3\" row_changes:{after:{lengths:1 lengths:3 values:\"9270\"}}}",
 	"type:ROW row_event:{table_name:\"t3\" row_changes:{after:{lengths:2 lengths:3 values:\"10300\"}}}",
-	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t3\" lastpk:{rows:{lengths:2 values:\"10\"}}}}",
+	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t3\" lastpk:{fields:{name:\"id31\" type:INT32 charset:63 flags:53251} rows:{lengths:2 values:\"10\"}}}}",
 	"type:COMMIT",
 	"type:BEGIN",
 	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t3\"} completed:true}",

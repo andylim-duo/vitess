@@ -24,6 +24,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,21 +32,28 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
+	"vitess.io/vitess/go/vt/sqlparser"
+
 	_flag "vitess.io/vitess/go/internal/flag"
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/replication"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/test/utils"
 	"vitess.io/vitess/go/vt/binlog/binlogplayer"
 	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/dbconnpool"
 	"vitess.io/vitess/go/vt/grpcclient"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/sidecardb"
 	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vttablet"
 	"vitess.io/vitess/go/vt/vttablet/queryservice"
 	"vitess.io/vitess/go/vt/vttablet/queryservice/fakes"
 	"vitess.io/vitess/go/vt/vttablet/tabletconn"
 	"vitess.io/vitess/go/vt/vttablet/tabletconntest"
 	qh "vitess.io/vitess/go/vt/vttablet/tabletmanager/vreplication/queryhistory"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/vstreamer"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/vstreamer/testenv"
 
@@ -55,14 +63,17 @@ import (
 )
 
 var (
-	playerEngine          *Engine
-	streamerEngine        *vstreamer.Engine
-	env                   *testenv.Env
-	globalFBC             = &fakeBinlogClient{}
-	vrepldb               = "vrepl"
-	globalDBQueries       = make(chan string, 1000)
-	testForeignKeyQueries = false
-	doNotLogDBQueries     = false
+	playerEngine             *Engine
+	streamerEngine           *vstreamer.Engine
+	env                      *testenv.Env
+	envMu                    sync.Mutex
+	globalFBC                = &fakeBinlogClient{}
+	vrepldb                  = "vrepl"
+	globalDBQueries          = make(chan string, 1000)
+	lastMultiExecQuery       = ""
+	testForeignKeyQueries    = false
+	testSetForeignKeyQueries = false
+	doNotLogDBQueries        = false
 )
 
 type LogExpectation struct {
@@ -110,45 +121,86 @@ func init() {
 	heartbeatRe = regexp.MustCompile(`update _vt.vreplication set time_updated=\d+ where id=\d+`)
 }
 
+func cleanup() {
+	playerEngine.Close()
+	streamerEngine.Close()
+	env.Close()
+	envMu.Unlock()
+}
+
+func setup(ctx context.Context) (func(), int) {
+	var err error
+	env, err = testenv.Init(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v", err)
+		return nil, 1
+	}
+	envMu.Lock()
+	globalDBQueries = make(chan string, 1000)
+	resetBinlogClient()
+
+	vttablet.VReplicationExperimentalFlags = 0
+
+	// Engines cannot be initialized in testenv because it introduces circular dependencies.
+	streamerEngine = vstreamer.NewEngine(env.TabletEnv, env.SrvTopo, env.SchemaEngine, nil, env.Cells[0])
+	streamerEngine.InitDBConfig(env.KeyspaceName, env.ShardName)
+	streamerEngine.Open()
+
+	if err := env.Mysqld.ExecuteSuperQuery(ctx, fmt.Sprintf("create database %s", vrepldb)); err != nil {
+		fmt.Fprintf(os.Stderr, "%v", err)
+		return nil, 1
+	}
+
+	if err := env.Mysqld.ExecuteSuperQuery(ctx, "set @@global.innodb_lock_wait_timeout=1"); err != nil {
+		fmt.Fprintf(os.Stderr, "%v", err)
+		return nil, 1
+	}
+	externalConfig := map[string]*dbconfigs.DBConfigs{
+		"exta": env.Dbcfgs,
+		"extb": env.Dbcfgs,
+	}
+	playerEngine = NewTestEngine(env.TopoServ, env.Cells[0], env.Mysqld, realDBClientFactory, realDBClientFactory, vrepldb, externalConfig)
+	playerEngine.Open(ctx)
+
+	return cleanup, 0
+}
+
+// We run Tests twice, first with full binlog_row_image, then with noblob.
+var runNoBlobTest = false
+
+// We use this tempDir for creating the external cnfs, since we create the test cluster afterwards.
+const tempDir = "/tmp"
+
 func TestMain(m *testing.M) {
 	binlogplayer.SetProtocol("vreplication_test_framework", "test")
 	_flag.ParseFlagsForTest()
 	exitCode := func() int {
-		var err error
-		env, err = testenv.Init()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%v", err)
-			return 1
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if err := utils.SetBinlogRowImageMode("full", tempDir); err != nil {
+			panic(err)
 		}
-		defer env.Close()
-
-		vreplicationExperimentalFlags = 0
-
-		// engines cannot be initialized in testenv because it introduces
-		// circular dependencies.
-		streamerEngine = vstreamer.NewEngine(env.TabletEnv, env.SrvTopo, env.SchemaEngine, nil, env.Cells[0])
-		streamerEngine.InitDBConfig(env.KeyspaceName, env.ShardName)
-		streamerEngine.Open()
-		defer streamerEngine.Close()
-
-		if err := env.Mysqld.ExecuteSuperQuery(context.Background(), fmt.Sprintf("create database %s", vrepldb)); err != nil {
-			fmt.Fprintf(os.Stderr, "%v", err)
-			return 1
+		defer utils.SetBinlogRowImageMode("", tempDir)
+		cancel, ret := setup(ctx)
+		if ret > 0 {
+			return ret
 		}
-
-		if err := env.Mysqld.ExecuteSuperQuery(context.Background(), "set @@global.innodb_lock_wait_timeout=1"); err != nil {
-			fmt.Fprintf(os.Stderr, "%v", err)
-			return 1
+		ret = m.Run()
+		if ret > 0 {
+			return ret
 		}
+		cancel()
 
-		externalConfig := map[string]*dbconfigs.DBConfigs{
-			"exta": env.Dbcfgs,
-			"extb": env.Dbcfgs,
+		runNoBlobTest = true
+		if err := utils.SetBinlogRowImageMode("noblob", tempDir); err != nil {
+			panic(err)
 		}
-		playerEngine = NewTestEngine(env.TopoServ, env.Cells[0], env.Mysqld, realDBClientFactory, realDBClientFactory, vrepldb, externalConfig)
-		playerEngine.Open(context.Background())
-		defer playerEngine.Close()
-
+		defer utils.SetBinlogRowImageMode("", tempDir)
+		cancel, ret = setup(ctx)
+		if ret > 0 {
+			return ret
+		}
+		defer cancel()
 		return m.Run()
 	}()
 	os.Exit(exitCode)
@@ -164,7 +216,7 @@ func primaryPosition(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return mysql.EncodePosition(pos)
+	return replication.EncodePosition(pos)
 }
 
 func execStatements(t *testing.T, queries []string) {
@@ -172,6 +224,15 @@ func execStatements(t *testing.T, queries []string) {
 	if err := env.Mysqld.ExecuteSuperQueryList(context.Background(), queries); err != nil {
 		log.Errorf("Error executing query: %s", err.Error())
 		t.Error(err)
+	}
+}
+
+func execConnStatements(t *testing.T, conn *dbconnpool.DBConnection, queries []string) {
+	t.Helper()
+	for _, query := range queries {
+		if _, err := conn.ExecuteFetch(query, 10000, false); err != nil {
+			t.Fatalf("ExecuteFetch(%v) failed: %v", query, err)
+		}
 	}
 }
 
@@ -260,7 +321,7 @@ func (ftc *fakeTabletConn) VStream(ctx context.Context, request *binlogdatapb.VS
 	if vstreamHook != nil {
 		vstreamHook(ctx)
 	}
-	return streamerEngine.Stream(ctx, request.Position, request.TableLastPKs, request.Filter, send)
+	return streamerEngine.Stream(ctx, request.Position, request.TableLastPKs, request.Filter, throttlerapp.VStreamerName, send)
 }
 
 // vstreamRowsHook allows you to do work just before calling VStreamRows.
@@ -426,19 +487,54 @@ func (dbc *realDBClient) ExecuteFetch(query string, maxrows int) (*sqltypes.Resu
 	}
 	if !strings.HasPrefix(query, "select") && !strings.HasPrefix(query, "set") && !dbc.nolog {
 		globalDBQueries <- query
+	} else if testSetForeignKeyQueries && strings.Contains(query, "set foreign_key_checks") {
+		globalDBQueries <- query
 	} else if testForeignKeyQueries && strings.Contains(query, "foreign_key_checks") { //allow select/set for foreign_key_checks
 		globalDBQueries <- query
 	}
 	return qr, err
 }
 
+func (dc *realDBClient) ExecuteFetchMulti(query string, maxrows int) ([]*sqltypes.Result, error) {
+	queries, err := sqlparser.NewTestParser().SplitStatementToPieces(query)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]*sqltypes.Result, 0, len(queries))
+	for _, query := range queries {
+		qr, err := dc.ExecuteFetch(query, maxrows)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, qr)
+	}
+	lastMultiExecQuery = query
+	return results, nil
+}
+
 func expectDeleteQueries(t *testing.T) {
 	t.Helper()
+	if doNotLogDBQueries {
+		return
+	}
 	expectNontxQueries(t, qh.Expect(
 		"/delete from _vt.vreplication",
 		"/delete from _vt.copy_state",
 		"/delete from _vt.post_copy_action",
 	))
+}
+
+func deleteAllVReplicationStreams(t *testing.T) {
+	t.Helper()
+	res, err := playerEngine.Exec("select id from _vt.vreplication")
+	require.NoError(t, err, "could not select ids from _vt.vreplication: %v", err)
+	ids := make([]string, len(res.Rows))
+	for i, row := range res.Rows {
+		id := row[0].ToString()
+		ids[i] = id
+	}
+	_, err = playerEngine.Exec(fmt.Sprintf("delete from _vt.vreplication where id in (%s)", strings.Join(ids, ",")))
+	require.NoError(t, err, "failed to delete vreplication rows: %v", err)
 }
 
 func expectLogsAndUnsubscribe(t *testing.T, logs []LogExpectation, logCh chan *VrLogStats) {
@@ -484,6 +580,10 @@ func shouldIgnoreQuery(query string) bool {
 		", time_throttled=",      // update of last throttle time, can happen out-of-band, so can't test for it
 		", component_throttled=", // update of last throttle time, can happen out-of-band, so can't test for it
 		"context cancel",
+		"SELECT rows_copied FROM _vt.vreplication WHERE id=",
+		// This is only executed if the table has no defined Primary Key, which we don't know in the lower level
+		// code.
+		"SELECT index_cols.COLUMN_NAME AS column_name, index_cols.INDEX_NAME as index_name FROM information_schema.STATISTICS",
 	}
 	if sidecardb.MatchesInitQuery(query) {
 		return true
@@ -498,6 +598,9 @@ func shouldIgnoreQuery(query string) bool {
 
 func expectDBClientQueries(t *testing.T, expectations qh.ExpectationSequence, skippableOnce ...string) {
 	t.Helper()
+	if doNotLogDBQueries {
+		return
+	}
 	failed := false
 	skippedOnce := false
 	validator := qh.NewVerifier(expectations)
@@ -558,7 +661,9 @@ func expectDBClientQueries(t *testing.T, expectations qh.ExpectationSequence, sk
 // It also disregards updates to _vt.vreplication.
 func expectNontxQueries(t *testing.T, expectations qh.ExpectationSequence) {
 	t.Helper()
-
+	if doNotLogDBQueries {
+		return
+	}
 	failed := false
 
 	validator := qh.NewVerifier(expectations)
@@ -621,15 +726,36 @@ func expectQueryResult(t *testing.T, query string, values [][]string) {
 func customExpectData(t *testing.T, table string, values [][]string, exec func(ctx context.Context, query string) (*sqltypes.Result, error)) {
 	t.Helper()
 
+	const timeout = 30 * time.Second
+	const tick = 100 * time.Millisecond
+
 	var query string
 	if len(strings.Split(table, ".")) == 1 {
 		query = fmt.Sprintf("select * from %s.%s", vrepldb, table)
 	} else {
 		query = fmt.Sprintf("select * from %s", table)
 	}
-	err := compareQueryResults(t, query, values, exec)
-	if err != nil {
-		require.FailNow(t, "data mismatch", err)
+
+	// without the sleep and retry there is a flakiness where rows inserted by vreplication are not immediately visible
+	// on the target for tests where we do not expect queries but just directly check the vreplicated data after inserting
+	// into the source.
+	tmr := time.NewTimer(timeout)
+	defer tmr.Stop()
+	var err error
+	for {
+		select {
+		case <-tmr.C:
+			if err != nil {
+				require.FailNow(t, "target has incorrect data", err)
+			}
+		default:
+			err = compareQueryResults(t, query, values, exec)
+			if err == nil {
+				return
+			}
+			log.Errorf("data mismatch: %v, retrying", err)
+			time.Sleep(tick)
+		}
 	}
 }
 
@@ -650,7 +776,7 @@ func compareQueryResults(t *testing.T, query string, values [][]string,
 		}
 		for j, val := range row {
 			if got := qr.Rows[i][j].ToString(); got != val {
-				return fmt.Errorf("Mismatch at (%d, %d): %v, want %s", i, j, qr.Rows[i][j], val)
+				return fmt.Errorf("mismatch at (%d, %d): got '%s', want '%s'", i, j, qr.Rows[i][j].ToString(), val)
 			}
 		}
 	}

@@ -8,7 +8,7 @@ import (
 	context "context"
 	reflect "reflect"
 
-	gomock "github.com/golang/mock/gomock"
+	gomock "go.uber.org/mock/gomock"
 
 	discovery "vitess.io/vitess/go/vt/discovery"
 	query "vitess.io/vitess/go/vt/proto/query"
@@ -59,6 +59,14 @@ func (m *MockHealthCheck) CacheStatus() discovery.TabletsCacheStatusList {
 	return ret0
 }
 
+// HealthyStatus mocks base method.
+func (m *MockHealthCheck) HealthyStatus() discovery.TabletsCacheStatusList {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "HealthyStatus")
+	ret0, _ := ret[0].(discovery.TabletsCacheStatusList)
+	return ret0
+}
+
 // CacheStatus indicates an expected call of CacheStatus.
 func (mr *MockHealthCheckMockRecorder) CacheStatus() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
@@ -105,6 +113,20 @@ func (m *MockHealthCheck) GetHealthyTabletStats(arg0 *query.Target) []*discovery
 func (mr *MockHealthCheckMockRecorder) GetHealthyTabletStats(arg0 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetHealthyTabletStats", reflect.TypeOf((*MockHealthCheck)(nil).GetHealthyTabletStats), arg0)
+}
+
+// GetLoadTabletsTrigger mocks base method.
+func (m *MockHealthCheck) GetLoadTabletsTrigger() chan struct{} {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetLoadTabletsTrigger")
+	ret0, _ := ret[0].(chan struct{})
+	return ret0
+}
+
+// GetLoadTabletsTrigger indicates an expected call of GetLoadTabletsTrigger.
+func (mr *MockHealthCheckMockRecorder) GetLoadTabletsTrigger() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetLoadTabletsTrigger", reflect.TypeOf((*MockHealthCheck)(nil).GetLoadTabletsTrigger))
 }
 
 // GetTabletHealth mocks base method.

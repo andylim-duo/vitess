@@ -21,13 +21,38 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
+
+func lookupHashCreateVindexTestCase(
+	testName string,
+	vindexParams map[string]string,
+	expectErr error,
+	expectUnknownParams []string,
+) createVindexTestCase {
+	return createVindexTestCase{
+		testName: testName,
+
+		vindexType:   "lookup_hash",
+		vindexName:   "lookup_hash",
+		vindexParams: vindexParams,
+
+		expectCost:          20,
+		expectErr:           expectErr,
+		expectIsUnique:      false,
+		expectNeedsVCursor:  true,
+		expectString:        "lookup_hash",
+		expectUnknownParams: expectUnknownParams,
+	}
+}
+
+func TestLookupHashCreateVindex(t *testing.T) {
+	testLookupCreateVindexCommonCases(t, lookupHashCreateVindexTestCase)
+}
 
 func TestLookupHashNew(t *testing.T) {
 	l := createLookup(t, "lookup_hash", false /* writeOnly */)
@@ -40,7 +65,7 @@ func TestLookupHashNew(t *testing.T) {
 		t.Errorf("Create(lookup, false): %v, want %v", got, want)
 	}
 
-	_, err := CreateVindex("lookup_hash", "lookup_hash", map[string]string{
+	vdx, err := CreateVindex("lookup_hash", "lookup_hash", map[string]string{
 		"table":      "t",
 		"from":       "fromc",
 		"to":         "toc",
@@ -50,20 +75,10 @@ func TestLookupHashNew(t *testing.T) {
 	if err == nil || err.Error() != want {
 		t.Errorf("Create(bad_scatter): %v, want %s", err, want)
 	}
-}
-
-func TestLookupHashInfo(t *testing.T) {
-	lookuphash := createLookup(t, "lookup_hash", false /* writeOnly */)
-	assert.Equal(t, 20, lookuphash.Cost())
-	assert.Equal(t, "lookup_hash", lookuphash.String())
-	assert.False(t, lookuphash.IsUnique())
-	assert.True(t, lookuphash.NeedsVCursor())
-
-	lookuphashunique := createLookup(t, "lookup_hash_unique", false /* writeOnly */)
-	assert.Equal(t, 10, lookuphashunique.Cost())
-	assert.Equal(t, "lookup_hash_unique", lookuphashunique.String())
-	assert.True(t, lookuphashunique.IsUnique())
-	assert.True(t, lookuphashunique.NeedsVCursor())
+	if err == nil {
+		unknownParams := vdx.(ParamValidating).UnknownParams()
+		require.Empty(t, unknownParams)
+	}
 }
 
 func TestLookupHashMap(t *testing.T) {
@@ -221,10 +236,7 @@ func TestLookupHashCreate(t *testing.T) {
 	}
 
 	err = lookuphash.(Lookup).Create(context.Background(), vc, [][]sqltypes.Value{{sqltypes.NULL}}, [][]byte{[]byte("\x16k@\xb4J\xbaK\xd6")}, false /* ignoreMode */)
-	want := "lookup.Create: input has null values: row: 0, col: 0"
-	if err == nil || err.Error() != want {
-		t.Errorf("lookuphash.Create(NULL) err: %v, want %s", err, want)
-	}
+	require.ErrorContains(t, err, "VT03028: Column 'fromc' cannot be null on row 0, col 0")
 
 	vc.queries = nil
 	lookuphash.(*LookupHash).lkp.IgnoreNulls = true
@@ -235,10 +247,7 @@ func TestLookupHashCreate(t *testing.T) {
 	}
 
 	err = lookuphash.(Lookup).Create(context.Background(), vc, [][]sqltypes.Value{{sqltypes.NewInt64(1)}}, [][]byte{[]byte("bogus")}, false /* ignoreMode */)
-	want = "lookup.Create.vunhash: invalid keyspace id: 626f677573"
-	if err == nil || err.Error() != want {
-		t.Errorf("lookuphash.Create(bogus) err: %v, want %s", err, want)
-	}
+	require.ErrorContains(t, err, "lookup.Create.vunhash: invalid keyspace id: 626f677573")
 }
 
 func TestLookupHashDelete(t *testing.T) {

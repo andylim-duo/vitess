@@ -22,13 +22,12 @@ import (
 	"sync"
 	"time"
 
-	"vitess.io/vitess/go/pools"
+	"vitess.io/vitess/go/pools/smartconnpool"
 	"vitess.io/vitess/go/timer"
 	"vitess.io/vitess/go/trace"
 	"vitess.io/vitess/go/vt/concurrency"
 	"vitess.io/vitess/go/vt/dtids"
 	"vitess.io/vitess/go/vt/log"
-	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/vtgateconn"
@@ -98,7 +97,7 @@ func NewTxEngine(env tabletenv.Env) *TxEngine {
 	config := env.Config()
 	te := &TxEngine{
 		env:                 env,
-		shutdownGracePeriod: config.GracePeriods.ShutdownSeconds.Get(),
+		shutdownGracePeriod: config.GracePeriods.Shutdown,
 		reservedConnStats:   env.Exporter().NewTimings("ReservedConnections", "Reserved connections stats", "operation"),
 	}
 	limiter := txlimiter.New(env)
@@ -125,8 +124,8 @@ func NewTxEngine(env tabletenv.Env) *TxEngine {
 	// the TxPreparedPool.
 	te.preparedPool = NewTxPreparedPool(config.TxPool.Size - 2)
 	readPool := connpool.NewPool(env, "TxReadPool", tabletenv.ConnPoolConfig{
-		Size:               3,
-		IdleTimeoutSeconds: env.Config().TxPool.IdleTimeoutSeconds,
+		Size:        3,
+		IdleTimeout: env.Config().TxPool.IdleTimeout,
 	})
 	te.twoPC = NewTwoPC(readPool)
 	te.state = NotServing
@@ -213,7 +212,7 @@ func (te *TxEngine) isTxPoolAvailable(addToWaitGroup func(int)) error {
 
 	canOpenTransactions := te.state == AcceptingReadOnly || te.state == AcceptingReadAndWrite
 	if !canOpenTransactions {
-		return vterrors.Errorf(vtrpc.Code_UNAVAILABLE, vterrors.TxEngineClosed, te.state)
+		return vterrors.Errorf(vtrpcpb.Code_UNAVAILABLE, vterrors.TxEngineClosed, te.state)
 	}
 	addToWaitGroup(1)
 	return nil
@@ -223,7 +222,7 @@ func (te *TxEngine) isTxPoolAvailable(addToWaitGroup func(int)) error {
 // statement(s) used to execute the begin (if any).
 //
 // Subsequent statements can access the connection through the transaction id.
-func (te *TxEngine) Begin(ctx context.Context, savepointQueries []string, reservedID int64, setting *pools.Setting, options *querypb.ExecuteOptions) (int64, string, string, error) {
+func (te *TxEngine) Begin(ctx context.Context, savepointQueries []string, reservedID int64, setting *smartconnpool.Setting, options *querypb.ExecuteOptions) (int64, string, string, error) {
 	span, ctx := trace.NewSpan(ctx, "TxEngine.Begin")
 	defer span.Finish()
 

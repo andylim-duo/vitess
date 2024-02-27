@@ -17,26 +17,32 @@ limitations under the License.
 package schemadiff
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtenv"
 )
 
 func TestDiffTables(t *testing.T) {
+	env57, err := vtenv.New(vtenv.Options{MySQLServerVersion: "5.7.9"})
+	require.NoError(t, err)
 	tt := []struct {
-		name     string
-		from     string
-		to       string
-		diff     string
-		cdiff    string
-		fromName string
-		toName   string
-		action   string
-		isError  bool
-		hints    *DiffHints
+		name        string
+		from        string
+		to          string
+		diff        string
+		cdiff       string
+		fromName    string
+		toName      string
+		action      string
+		expectError string
+		hints       *DiffHints
+		env         *Environment
 	}{
 		{
 			name: "identical",
@@ -188,7 +194,122 @@ func TestDiffTables(t *testing.T) {
 				TableQualifierHint: TableQualifierDeclared,
 			},
 		},
+		{
+			name: "changing table level defaults with column specific settings, ignore charset",
+			from: "create table t (a varchar(64) CHARACTER SET latin1 COLLATE latin1_bin) default charset=latin1",
+			to:   "create table t (a varchar(64) CHARACTER SET latin1 COLLATE latin1_bin)",
+			hints: &DiffHints{
+				AlterTableAlgorithmStrategy: AlterTableAlgorithmStrategyCopy,
+				TableCharsetCollateStrategy: TableCharsetCollateIgnoreAlways,
+			},
+		},
+		{
+			name: "changing table level defaults with column specific settings based on collation, ignore charset",
+			from: "create table t (a varchar(64) COLLATE latin1_bin) default charset=utf8mb4",
+			to:   "create table t (a varchar(64) CHARACTER SET latin1 COLLATE latin1_bin)",
+			hints: &DiffHints{
+				AlterTableAlgorithmStrategy: AlterTableAlgorithmStrategyCopy,
+				TableCharsetCollateStrategy: TableCharsetCollateIgnoreAlways,
+			},
+		},
+		{
+			name: "error on unknown collation",
+			from: "create table t (a varchar(64) COLLATE latin1_nonexisting) default charset=utf8mb4",
+			to:   "create table t (a varchar(64) CHARACTER SET latin1 COLLATE latin1_bin)",
+			hints: &DiffHints{
+				AlterTableAlgorithmStrategy: AlterTableAlgorithmStrategyCopy,
+				TableCharsetCollateStrategy: TableCharsetCollateIgnoreAlways,
+			},
+			expectError: (&UnknownColumnCollationCharsetError{Column: "a", Collation: "latin1_nonexisting"}).Error(),
+		},
+		{
+			name: "error on unknown charset",
+			from: "create table t (a varchar(64)) default charset=latin_nonexisting collate=''",
+			to:   "create table t (a varchar(64) CHARACTER SET latin1 COLLATE latin1_bin)",
+			hints: &DiffHints{
+				AlterTableAlgorithmStrategy: AlterTableAlgorithmStrategyCopy,
+			},
+			expectError: (&UnknownColumnCharsetCollationError{Column: "a", Charset: "latin_nonexisting"}).Error(),
+		},
+		{
+			name:     "changing table level defaults with column specific settings",
+			from:     "create table t (a varchar(64) CHARACTER SET latin1 COLLATE latin1_bin) default charset=latin1",
+			to:       "create table t (a varchar(64) CHARACTER SET latin1 COLLATE latin1_bin)",
+			diff:     "alter table t charset utf8mb4, algorithm = COPY",
+			cdiff:    "ALTER TABLE `t` CHARSET utf8mb4, ALGORITHM = COPY",
+			action:   "alter",
+			fromName: "t",
+			hints: &DiffHints{
+				AlterTableAlgorithmStrategy: AlterTableAlgorithmStrategyCopy,
+				TableCharsetCollateStrategy: TableCharsetCollateStrict,
+			},
+		},
+		{
+			name:     "changing table level defaults with column specific settings, table already normalized",
+			from:     "create table t (a varchar(64)) default charset=latin1",
+			to:       "create table t (a varchar(64) CHARACTER SET latin1 COLLATE latin1_bin)",
+			diff:     "alter table t modify column a varchar(64) character set latin1 collate latin1_bin, charset utf8mb4, algorithm = COPY",
+			cdiff:    "ALTER TABLE `t` MODIFY COLUMN `a` varchar(64) CHARACTER SET latin1 COLLATE latin1_bin, CHARSET utf8mb4, ALGORITHM = COPY",
+			action:   "alter",
+			fromName: "t",
+			hints: &DiffHints{
+				AlterTableAlgorithmStrategy: AlterTableAlgorithmStrategyCopy,
+				TableCharsetCollateStrategy: TableCharsetCollateStrict,
+			},
+		},
+		{
+			name:   "changing table level charset to default",
+			from:   `create table t (i int) default charset=latin1`,
+			to:     `create table t (i int)`,
+			action: "alter",
+			diff:   "alter table t charset utf8mb4",
+			cdiff:  "ALTER TABLE `t` CHARSET utf8mb4",
+		},
+		{
+			name: "no changes with normalization and utf8mb4",
+			from: `CREATE TABLE IF NOT EXISTS tables
+			(
+				TABLE_SCHEMA varchar(64) NOT NULL,
+				TABLE_NAME varchar(64) NOT NULL,
+				CREATE_STATEMENT longtext,
+				CREATE_TIME BIGINT,
+				PRIMARY KEY (TABLE_SCHEMA, TABLE_NAME)
+			) engine = InnoDB`,
+			to: "CREATE TABLE `tables` (" +
+				"`TABLE_SCHEMA` varchar(64) NOT NULL," +
+				"`TABLE_NAME` varchar(64) NOT NULL," +
+				"`CREATE_STATEMENT` longtext," +
+				"`CREATE_TIME` bigint DEFAULT NULL," +
+				"PRIMARY KEY (`TABLE_SCHEMA`,`TABLE_NAME`)" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			hints: &DiffHints{
+				TableCharsetCollateStrategy: TableCharsetCollateIgnoreAlways,
+			},
+		},
+		{
+			name: "no changes with normalization and utf8mb3",
+			from: `CREATE TABLE IF NOT EXISTS tables
+			(
+				TABLE_SCHEMA varchar(64) NOT NULL,
+				TABLE_NAME varchar(64) NOT NULL,
+				CREATE_STATEMENT longtext,
+				CREATE_TIME BIGINT,
+				PRIMARY KEY (TABLE_SCHEMA, TABLE_NAME)
+			) engine = InnoDB`,
+			to: "CREATE TABLE `tables` (" +
+				"`TABLE_SCHEMA` varchar(64) NOT NULL," +
+				"`TABLE_NAME` varchar(64) NOT NULL," +
+				"`CREATE_STATEMENT` longtext," +
+				"`CREATE_TIME` bigint DEFAULT NULL," +
+				"PRIMARY KEY (`TABLE_SCHEMA`,`TABLE_NAME`)" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_general_ci",
+			hints: &DiffHints{
+				TableCharsetCollateStrategy: TableCharsetCollateIgnoreAlways,
+			},
+			env: NewEnv(env57, collations.CollationUtf8mb3ID),
+		},
 	}
+	env := NewTestEnv()
 	for _, ts := range tt {
 		t.Run(ts.name, func(t *testing.T) {
 			var fromCreateTable *sqlparser.CreateTable
@@ -196,8 +317,11 @@ func TestDiffTables(t *testing.T) {
 			if ts.hints != nil {
 				hints = ts.hints
 			}
+			if ts.env != nil {
+				env = ts.env
+			}
 			if ts.from != "" {
-				fromStmt, err := sqlparser.ParseStrictDDL(ts.from)
+				fromStmt, err := env.Parser().ParseStrictDDL(ts.from)
 				assert.NoError(t, err)
 				var ok bool
 				fromCreateTable, ok = fromStmt.(*sqlparser.CreateTable)
@@ -205,7 +329,7 @@ func TestDiffTables(t *testing.T) {
 			}
 			var toCreateTable *sqlparser.CreateTable
 			if ts.to != "" {
-				toStmt, err := sqlparser.ParseStrictDDL(ts.to)
+				toStmt, err := env.Parser().ParseStrictDDL(ts.to)
 				assert.NoError(t, err)
 				var ok bool
 				toCreateTable, ok = toStmt.(*sqlparser.CreateTable)
@@ -217,17 +341,21 @@ func TestDiffTables(t *testing.T) {
 			// Technically, DiffCreateTablesQueries calls DiffTables,
 			// but we expose both to users of this library. so we want to make sure
 			// both work as expected irrespective of any relationship between them.
-			dq, dqerr := DiffCreateTablesQueries(ts.from, ts.to, hints)
-			d, err := DiffTables(fromCreateTable, toCreateTable, hints)
+			dq, dqerr := DiffCreateTablesQueries(env, ts.from, ts.to, hints)
+			d, err := DiffTables(env, fromCreateTable, toCreateTable, hints)
 			switch {
-			case ts.isError:
-				assert.Error(t, err)
-				assert.Error(t, dqerr)
+			case ts.expectError != "":
+				assert.ErrorContains(t, err, ts.expectError)
+				assert.ErrorContains(t, dqerr, ts.expectError)
 			case ts.diff == "":
 				assert.NoError(t, err)
 				assert.NoError(t, dqerr)
-				assert.Nil(t, d)
-				assert.Nil(t, dq)
+				if !assert.Nil(t, d) {
+					assert.Failf(t, "found unexpected diff", "%v", d.CanonicalStatementString())
+				}
+				if !assert.Nil(t, dq) {
+					assert.Failf(t, "found unexpected diff", "%v", dq.CanonicalStatementString())
+				}
 			default:
 				assert.NoError(t, err)
 				require.NotNil(t, d)
@@ -240,7 +368,7 @@ func TestDiffTables(t *testing.T) {
 					assert.Equal(t, ts.action, action)
 
 					// validate we can parse back the statement
-					_, err = sqlparser.ParseStrictDDL(diff)
+					_, err = env.Parser().ParseStrictDDL(diff)
 					assert.NoError(t, err)
 
 					eFrom, eTo := d.Entities()
@@ -259,7 +387,7 @@ func TestDiffTables(t *testing.T) {
 					assert.Equal(t, ts.action, action)
 
 					// validate we can parse back the statement
-					_, err = sqlparser.ParseStrictDDL(canonicalDiff)
+					_, err = env.Parser().ParseStrictDDL(canonicalDiff)
 					assert.NoError(t, err)
 				}
 				// let's also check dq, and also validate that dq's statement is identical to d's
@@ -321,11 +449,12 @@ func TestDiffViews(t *testing.T) {
 		},
 	}
 	hints := &DiffHints{}
+	env := NewTestEnv()
 	for _, ts := range tt {
 		t.Run(ts.name, func(t *testing.T) {
 			var fromCreateView *sqlparser.CreateView
 			if ts.from != "" {
-				fromStmt, err := sqlparser.ParseStrictDDL(ts.from)
+				fromStmt, err := env.Parser().ParseStrictDDL(ts.from)
 				assert.NoError(t, err)
 				var ok bool
 				fromCreateView, ok = fromStmt.(*sqlparser.CreateView)
@@ -333,7 +462,7 @@ func TestDiffViews(t *testing.T) {
 			}
 			var toCreateView *sqlparser.CreateView
 			if ts.to != "" {
-				toStmt, err := sqlparser.ParseStrictDDL(ts.to)
+				toStmt, err := env.Parser().ParseStrictDDL(ts.to)
 				assert.NoError(t, err)
 				var ok bool
 				toCreateView, ok = toStmt.(*sqlparser.CreateView)
@@ -345,8 +474,8 @@ func TestDiffViews(t *testing.T) {
 			// Technically, DiffCreateTablesQueries calls DiffTables,
 			// but we expose both to users of this library. so we want to make sure
 			// both work as expected irrespective of any relationship between them.
-			dq, dqerr := DiffCreateViewsQueries(ts.from, ts.to, hints)
-			d, err := DiffViews(fromCreateView, toCreateView, hints)
+			dq, dqerr := DiffCreateViewsQueries(env, ts.from, ts.to, hints)
+			d, err := DiffViews(env, fromCreateView, toCreateView, hints)
 			switch {
 			case ts.isError:
 				assert.Error(t, err)
@@ -354,8 +483,12 @@ func TestDiffViews(t *testing.T) {
 			case ts.diff == "":
 				assert.NoError(t, err)
 				assert.NoError(t, dqerr)
-				assert.Nil(t, d)
-				assert.Nil(t, dq)
+				if !assert.Nil(t, d) {
+					assert.Failf(t, "found unexpected diff", "%v", d.CanonicalStatementString())
+				}
+				if !assert.Nil(t, dq) {
+					assert.Failf(t, "found unexpected diff", "%v", dq.CanonicalStatementString())
+				}
 			default:
 				assert.NoError(t, err)
 				require.NotNil(t, d)
@@ -368,7 +501,7 @@ func TestDiffViews(t *testing.T) {
 					assert.Equal(t, ts.action, action)
 
 					// validate we can parse back the statement
-					_, err = sqlparser.ParseStrictDDL(diff)
+					_, err = env.Parser().ParseStrictDDL(diff)
 					assert.NoError(t, err)
 
 					eFrom, eTo := d.Entities()
@@ -387,7 +520,7 @@ func TestDiffViews(t *testing.T) {
 					assert.Equal(t, ts.action, action)
 
 					// validate we can parse back the statement
-					_, err = sqlparser.ParseStrictDDL(canonicalDiff)
+					_, err = env.Parser().ParseStrictDDL(canonicalDiff)
 					assert.NoError(t, err)
 				}
 
@@ -403,6 +536,7 @@ func TestDiffViews(t *testing.T) {
 }
 
 func TestDiffSchemas(t *testing.T) {
+	ctx := context.Background()
 	tt := []struct {
 		name        string
 		from        string
@@ -599,21 +733,21 @@ func TestDiffSchemas(t *testing.T) {
 			tableRename: TableRenameHeuristicStatement,
 		},
 		{
-			name: "identical tables: drop and create",
+			name: "drop and create all",
 			from: "create table t1a(id int primary key); create table t2a(id int unsigned primary key); create table t3a(id smallint primary key); ",
 			to:   "create table t1b(id bigint primary key); create table t2b(id int unsigned primary key); create table t3b(id int primary key); ",
 			diffs: []string{
-				"drop table t1a",
-				"drop table t2a",
 				"drop table t3a",
+				"drop table t2a",
+				"drop table t1a",
 				"create table t1b (\n\tid bigint,\n\tprimary key (id)\n)",
 				"create table t2b (\n\tid int unsigned,\n\tprimary key (id)\n)",
 				"create table t3b (\n\tid int,\n\tprimary key (id)\n)",
 			},
 			cdiffs: []string{
-				"DROP TABLE `t1a`",
-				"DROP TABLE `t2a`",
 				"DROP TABLE `t3a`",
+				"DROP TABLE `t2a`",
+				"DROP TABLE `t1a`",
 				"CREATE TABLE `t1b` (\n\t`id` bigint,\n\tPRIMARY KEY (`id`)\n)",
 				"CREATE TABLE `t2b` (\n\t`id` int unsigned,\n\tPRIMARY KEY (`id`)\n)",
 				"CREATE TABLE `t3b` (\n\t`id` int,\n\tPRIMARY KEY (`id`)\n)",
@@ -626,16 +760,58 @@ func TestDiffSchemas(t *testing.T) {
 			diffs: []string{
 				"drop table t3a",
 				"create table t1b (\n\tid bigint,\n\tprimary key (id)\n)",
-				"rename table t1a to t3b",
 				"rename table t2a to t2b",
+				"rename table t1a to t3b",
 			},
 			cdiffs: []string{
 				"DROP TABLE `t3a`",
 				"CREATE TABLE `t1b` (\n\t`id` bigint,\n\tPRIMARY KEY (`id`)\n)",
-				"RENAME TABLE `t1a` TO `t3b`",
 				"RENAME TABLE `t2a` TO `t2b`",
+				"RENAME TABLE `t1a` TO `t3b`",
 			},
 			tableRename: TableRenameHeuristicStatement,
+		},
+		{
+			name: "tables with irregular names",
+			from: "create table `t.2`(id int primary key); create table t3(`i.d` int primary key)",
+			to:   "create table `t.2` (id bigint primary key); create table t3(`i.d` int unsigned primary key)",
+			diffs: []string{
+				"alter table `t.2` modify column id bigint",
+				"alter table t3 modify column `i.d` int unsigned",
+			},
+			cdiffs: []string{
+				"ALTER TABLE `t.2` MODIFY COLUMN `id` bigint",
+				"ALTER TABLE `t3` MODIFY COLUMN `i.d` int unsigned",
+			},
+		},
+		// Foreign keys
+		{
+			name: "create tables with foreign keys, expect specific order",
+			to:   "create table t7(id int primary key); create table t5 (id int primary key, i int, constraint f5 foreign key (i) references t7(id)); create table t4 (id int primary key, i int, constraint f4 foreign key (i) references t7(id));",
+			diffs: []string{
+				"create table t7 (\n\tid int,\n\tprimary key (id)\n)",
+				"create table t4 (\n\tid int,\n\ti int,\n\tprimary key (id),\n\tkey f4 (i),\n\tconstraint f4 foreign key (i) references t7 (id)\n)",
+				"create table t5 (\n\tid int,\n\ti int,\n\tprimary key (id),\n\tkey f5 (i),\n\tconstraint f5 foreign key (i) references t7 (id)\n)",
+			},
+			cdiffs: []string{
+				"CREATE TABLE `t7` (\n\t`id` int,\n\tPRIMARY KEY (`id`)\n)",
+				"CREATE TABLE `t4` (\n\t`id` int,\n\t`i` int,\n\tPRIMARY KEY (`id`),\n\tKEY `f4` (`i`),\n\tCONSTRAINT `f4` FOREIGN KEY (`i`) REFERENCES `t7` (`id`)\n)",
+				"CREATE TABLE `t5` (\n\t`id` int,\n\t`i` int,\n\tPRIMARY KEY (`id`),\n\tKEY `f5` (`i`),\n\tCONSTRAINT `f5` FOREIGN KEY (`i`) REFERENCES `t7` (`id`)\n)",
+			},
+		},
+		{
+			name: "drop tables with foreign keys, expect specific order",
+			from: "create table t7(id int primary key); create table t5 (id int primary key, i int, constraint f5 foreign key (i) references t7(id)); create table t4 (id int primary key, i int, constraint f4 foreign key (i) references t7(id));",
+			diffs: []string{
+				"drop table t5",
+				"drop table t4",
+				"drop table t7",
+			},
+			cdiffs: []string{
+				"DROP TABLE `t5`",
+				"DROP TABLE `t4`",
+				"DROP TABLE `t7`",
+			},
 		},
 		// Views
 		{
@@ -719,35 +895,54 @@ func TestDiffSchemas(t *testing.T) {
 			from: "create view v1 as select * from t1; create table t1(id int primary key); create table t2(id int primary key); create view v2 as select * from t2; create table t3(id int primary key);",
 			to:   "create view v0 as select * from v2, t2; create table t4(id int primary key); create view v2 as select id from t2; create table t2(id bigint primary key); create table t3(id int primary key)",
 			diffs: []string{
-				"drop table t1",
 				"drop view v1",
+				"drop table t1",
 				"alter table t2 modify column id bigint",
 				"alter view v2 as select id from t2",
-				"create table t4 (\n\tid int,\n\tprimary key (id)\n)",
 				"create view v0 as select * from v2, t2",
+				"create table t4 (\n\tid int,\n\tprimary key (id)\n)",
 			},
 			cdiffs: []string{
-				"DROP TABLE `t1`",
 				"DROP VIEW `v1`",
+				"DROP TABLE `t1`",
 				"ALTER TABLE `t2` MODIFY COLUMN `id` bigint",
 				"ALTER VIEW `v2` AS SELECT `id` FROM `t2`",
-				"CREATE TABLE `t4` (\n\t`id` int,\n\tPRIMARY KEY (`id`)\n)",
 				"CREATE VIEW `v0` AS SELECT * FROM `v2`, `t2`",
+				"CREATE TABLE `t4` (\n\t`id` int,\n\tPRIMARY KEY (`id`)\n)",
+			},
+		},
+		{
+			// Making sure schemadiff distinguishes between VIEWs with different casing
+			name: "case insensitive views",
+			from: "create view v1 as select * from t; create table t(id int primary key); create view V1 as select * from t",
+			to:   "",
+			diffs: []string{
+				"drop view v1",
+				"drop view V1",
+				"drop table t",
+			},
+			cdiffs: []string{
+				"DROP VIEW `v1`",
+				"DROP VIEW `V1`",
+				"DROP TABLE `t`",
 			},
 		},
 	}
+	env := NewTestEnv()
 	for _, ts := range tt {
 		t.Run(ts.name, func(t *testing.T) {
 			hints := &DiffHints{
 				TableRenameStrategy: ts.tableRename,
 			}
-			diffs, err := DiffSchemasSQL(ts.from, ts.to, hints)
+			diff, err := DiffSchemasSQL(env, ts.from, ts.to, hints)
 			if ts.expectError != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), ts.expectError)
 			} else {
 				assert.NoError(t, err)
 
+				diffs, err := diff.OrderedDiffs(ctx)
+				assert.NoError(t, err)
 				statements := []string{}
 				cstatements := []string{}
 				for _, d := range diffs {
@@ -765,31 +960,31 @@ func TestDiffSchemas(t *testing.T) {
 
 				// validate we can parse back the diff statements
 				for _, s := range statements {
-					_, err := sqlparser.ParseStrictDDL(s)
+					_, err := env.Parser().ParseStrictDDL(s)
 					assert.NoError(t, err)
 				}
 				for _, s := range cstatements {
-					_, err := sqlparser.ParseStrictDDL(s)
+					_, err := env.Parser().ParseStrictDDL(s)
 					assert.NoError(t, err)
 				}
 
 				{
 					// Validate "apply()" on "from" converges with "to"
-					schema1, err := NewSchemaFromSQL(ts.from)
-					assert.NoError(t, err)
+					schema1, err := NewSchemaFromSQL(env, ts.from)
+					require.NoError(t, err)
 					schema1SQL := schema1.ToSQL()
 
-					schema2, err := NewSchemaFromSQL(ts.to)
-					assert.NoError(t, err)
+					schema2, err := NewSchemaFromSQL(env, ts.to)
+					require.NoError(t, err)
 					applied, err := schema1.Apply(diffs)
 					require.NoError(t, err)
 
 					// validate schema1 unaffected by Apply
 					assert.Equal(t, schema1SQL, schema1.ToSQL())
 
-					appliedDiff, err := schema2.Diff(applied, hints)
+					appliedDiff, err := schema2.SchemaDiff(applied, hints)
 					require.NoError(t, err)
-					assert.Empty(t, appliedDiff)
+					assert.True(t, appliedDiff.Empty())
 					assert.Equal(t, schema2.ToQueries(), applied.ToQueries())
 				}
 			}
@@ -798,6 +993,7 @@ func TestDiffSchemas(t *testing.T) {
 }
 
 func TestSchemaApplyError(t *testing.T) {
+	ctx := context.Background()
 	tt := []struct {
 		name string
 		from string
@@ -829,16 +1025,19 @@ func TestSchemaApplyError(t *testing.T) {
 		},
 	}
 	hints := &DiffHints{}
+	env := NewTestEnv()
 	for _, ts := range tt {
 		t.Run(ts.name, func(t *testing.T) {
 			// Validate "apply()" on "from" converges with "to"
-			schema1, err := NewSchemaFromSQL(ts.from)
+			schema1, err := NewSchemaFromSQL(env, ts.from)
 			assert.NoError(t, err)
-			schema2, err := NewSchemaFromSQL(ts.to)
+			schema2, err := NewSchemaFromSQL(env, ts.to)
 			assert.NoError(t, err)
 
 			{
-				diffs, err := schema1.Diff(schema2, hints)
+				diff, err := schema1.SchemaDiff(schema2, hints)
+				require.NoError(t, err)
+				diffs, err := diff.OrderedDiffs(ctx)
 				assert.NoError(t, err)
 				assert.NotEmpty(t, diffs)
 				_, err = schema1.Apply(diffs)
@@ -847,7 +1046,9 @@ func TestSchemaApplyError(t *testing.T) {
 				require.Error(t, err, "expected error applying to schema2. diffs: %v", diffs)
 			}
 			{
-				diffs, err := schema2.Diff(schema1, hints)
+				diff, err := schema2.SchemaDiff(schema1, hints)
+				require.NoError(t, err)
+				diffs, err := diff.OrderedDiffs(ctx)
 				assert.NoError(t, err)
 				assert.NotEmpty(t, diffs, "schema1: %v, schema2: %v", schema1.ToSQL(), schema2.ToSQL())
 				_, err = schema2.Apply(diffs)

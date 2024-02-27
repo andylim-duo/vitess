@@ -21,12 +21,13 @@ side of the remote execution of mysqlctl commands.
 package grpcmysqlctlserver
 
 import (
+	"context"
+	"time"
+
 	"google.golang.org/grpc"
 
-	"context"
-
+	"vitess.io/vitess/go/protoutil"
 	"vitess.io/vitess/go/vt/mysqlctl"
-
 	mysqlctlpb "vitess.io/vitess/go/vt/proto/mysqlctl"
 )
 
@@ -42,14 +43,33 @@ func (s *server) Start(ctx context.Context, request *mysqlctlpb.StartRequest) (*
 	return &mysqlctlpb.StartResponse{}, s.mysqld.Start(ctx, s.cnf, request.MysqldArgs...)
 }
 
+const mysqlShutdownTimeout = 5 * time.Minute
+
 // Shutdown implements the server side of the MysqlctlClient interface.
 func (s *server) Shutdown(ctx context.Context, request *mysqlctlpb.ShutdownRequest) (*mysqlctlpb.ShutdownResponse, error) {
-	return &mysqlctlpb.ShutdownResponse{}, s.mysqld.Shutdown(ctx, s.cnf, request.WaitForMysqld)
+	timeout, ok, err := protoutil.DurationFromProto(request.MysqlShutdownTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		timeout = mysqlShutdownTimeout
+	}
+	return &mysqlctlpb.ShutdownResponse{}, s.mysqld.Shutdown(ctx, s.cnf, request.WaitForMysqld, timeout)
 }
 
 // RunMysqlUpgrade implements the server side of the MysqlctlClient interface.
-func (s *server) RunMysqlUpgrade(ctx context.Context, request *mysqlctlpb.RunMysqlUpgradeRequest) (*mysqlctlpb.RunMysqlUpgradeResponse, error) {
-	return &mysqlctlpb.RunMysqlUpgradeResponse{}, s.mysqld.RunMysqlUpgrade()
+func (s *server) RunMysqlUpgrade(ctx context.Context, _ *mysqlctlpb.RunMysqlUpgradeRequest) (*mysqlctlpb.RunMysqlUpgradeResponse, error) {
+	return &mysqlctlpb.RunMysqlUpgradeResponse{}, s.mysqld.RunMysqlUpgrade(ctx)
+}
+
+// RunMysqlUpgrade implements the server side of the MysqlctlClient interface.
+func (s *server) ApplyBinlogFile(ctx context.Context, request *mysqlctlpb.ApplyBinlogFileRequest) (*mysqlctlpb.ApplyBinlogFileResponse, error) {
+	return &mysqlctlpb.ApplyBinlogFileResponse{}, s.mysqld.ApplyBinlogFile(ctx, request)
+}
+
+// ReadBinlogFilesTimestamps implements the server side of the MysqlctlClient interface.
+func (s *server) ReadBinlogFilesTimestamps(ctx context.Context, request *mysqlctlpb.ReadBinlogFilesTimestampsRequest) (*mysqlctlpb.ReadBinlogFilesTimestampsResponse, error) {
+	return s.mysqld.ReadBinlogFilesTimestamps(ctx, request)
 }
 
 // ReinitConfig implements the server side of the MysqlctlClient interface.
@@ -60,6 +80,15 @@ func (s *server) ReinitConfig(ctx context.Context, request *mysqlctlpb.ReinitCon
 // RefreshConfig implements the server side of the MysqlctlClient interface.
 func (s *server) RefreshConfig(ctx context.Context, request *mysqlctlpb.RefreshConfigRequest) (*mysqlctlpb.RefreshConfigResponse, error) {
 	return &mysqlctlpb.RefreshConfigResponse{}, s.mysqld.RefreshConfig(ctx, s.cnf)
+}
+
+// VersionString registers the Server for RPCs.
+func (s *server) VersionString(ctx context.Context, request *mysqlctlpb.VersionStringRequest) (*mysqlctlpb.VersionStringResponse, error) {
+	version, err := s.mysqld.GetVersionString(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &mysqlctlpb.VersionStringResponse{Version: version}, nil
 }
 
 // StartServer registers the Server for RPCs.

@@ -25,7 +25,9 @@ import (
 
 // Watch is part of the topo.Conn interface.
 func (c *Conn) Watch(ctx context.Context, filePath string) (*topo.WatchData, <-chan *topo.WatchData, error) {
-	if c.closed {
+	c.factory.callstats.Add([]string{"Watch"}, 1)
+
+	if c.closed.Load() {
 		return nil, nil, ErrConnectionClosed
 	}
 
@@ -50,9 +52,7 @@ func (c *Conn) Watch(ctx context.Context, filePath string) (*topo.WatchData, <-c
 	}
 
 	notifications := make(chan *topo.WatchData, 100)
-	watchIndex := nextWatchIndex
-	nextWatchIndex++
-	n.watches[watchIndex] = watch{contents: notifications}
+	watchIndex := n.addWatch(watch{contents: notifications})
 
 	go func() {
 		<-ctx.Done()
@@ -77,7 +77,9 @@ func (c *Conn) Watch(ctx context.Context, filePath string) (*topo.WatchData, <-c
 
 // WatchRecursive is part of the topo.Conn interface.
 func (c *Conn) WatchRecursive(ctx context.Context, dirpath string) ([]*topo.WatchDataRecursive, <-chan *topo.WatchDataRecursive, error) {
-	if c.closed {
+	c.factory.callstats.Add([]string{"WatchRecursive"}, 1)
+
+	if c.closed.Load() {
 		return nil, nil, ErrConnectionClosed
 	}
 
@@ -105,9 +107,7 @@ func (c *Conn) WatchRecursive(ctx context.Context, dirpath string) ([]*topo.Watc
 	})
 
 	notifications := make(chan *topo.WatchDataRecursive, 100)
-	watchIndex := nextWatchIndex
-	nextWatchIndex++
-	n.watches[watchIndex] = watch{recursive: notifications}
+	watchIndex := n.addWatch(watch{recursive: notifications})
 
 	go func() {
 		defer close(notifications)

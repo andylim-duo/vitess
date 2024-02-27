@@ -55,7 +55,7 @@ var (
 )
 
 func registerFlags(fs *pflag.FlagSet) {
-	fs.IntVar(&concurrency, "tablet_manager_grpc_concurrency", concurrency, "concurrency to use to talk to a vttablet server for performance-sensitive RPCs (like ExecuteFetchAs{Dba,AllPrivs,App})")
+	fs.IntVar(&concurrency, "tablet_manager_grpc_concurrency", concurrency, "concurrency to use to talk to a vttablet server for performance-sensitive RPCs (like ExecuteFetchAs{Dba,App}, CheckThrottler and FullStatus)")
 	fs.StringVar(&cert, "tablet_manager_grpc_cert", cert, "the cert to use to connect")
 	fs.StringVar(&key, "tablet_manager_grpc_key", key, "the key to use to connect")
 	fs.StringVar(&ca, "tablet_manager_grpc_ca", ca, "the server ca to use to validate servers when connecting")
@@ -69,7 +69,6 @@ var _binaries = []string{ // binaries that require the flags in this package
 	"vtctl",
 	"vtctld",
 	"vtctldclient",
-	"vtgr",
 	"vtorc",
 	"vttablet",
 	"vttestserver",
@@ -95,10 +94,9 @@ type tmc struct {
 
 // grpcClient implements both dialer and poolDialer.
 type grpcClient struct {
-	// This cache of connections is to maximize QPS for ExecuteFetch.
-	// Note we'll keep the clients open and close them upon Close() only.
-	// But that's OK because usually the tasks that use them are
-	// one-purpose only.
+	// This cache of connections is to maximize QPS for ExecuteFetchAs{Dba,App},
+	// CheckThrottler and FullStatus. Note we'll keep the clients open and close them upon Close() only.
+	// But that's OK because usually the tasks that use them are one-purpose only.
 	// The map is protected by the mutex.
 	mu           sync.Mutex
 	rpcClientMap map[string]chan *tmc
@@ -116,16 +114,17 @@ type poolDialer interface {
 // Client implements tmclient.TabletManagerClient.
 //
 // Connections are produced by the dialer implementation, which is either the
-// grpcClient implementation, which reuses connections only for ExecuteFetch and
-// otherwise makes single-purpose connections that are closed after use.
+// grpcClient implementation, which reuses connections only for ExecuteFetchAs{Dba,App}
+// CheckThrottler, and FullStatus, otherwise making single-purpose connections that are closed
+// after use.
 //
 // In order to more efficiently use the underlying tcp connections, you can
 // instead use the cachedConnDialer implementation by specifying
 //
-//	-tablet_manager_protocol "grpc-cached"
+//	--tablet_manager_protocol "grpc-cached"
 //
-// The cachedConnDialer keeps connections to up to -tablet_manager_grpc_connpool_size distinct
-// tablets open at any given time, for faster per-RPC call time, and less
+// The cachedConnDialer keeps connections to up to --tablet_manager_grpc_connpool_size
+// distinct tablets open at any given time, for faster per-RPC call time, and less
 // connection churn.
 type Client struct {
 	dialer dialer
@@ -363,6 +362,18 @@ func (client *Client) ReloadSchema(ctx context.Context, tablet *topodatapb.Table
 	return err
 }
 
+func (client *Client) ResetSequences(ctx context.Context, tablet *topodatapb.Tablet, tables []string) error {
+	c, closer, err := client.dialer.dial(ctx, tablet)
+	if err != nil {
+		return err
+	}
+	defer closer.Close()
+	_, err = c.ResetSequences(ctx, &tabletmanagerdatapb.ResetSequencesRequest{
+		Tables: tables,
+	})
+	return err
+}
+
 // PreflightSchema is part of the tmclient.TabletManagerClient interface.
 func (client *Client) PreflightSchema(ctx context.Context, tablet *topodatapb.Tablet, changes []string) ([]*tabletmanagerdatapb.SchemaChangeResult, error) {
 	c, closer, err := client.dialer.dial(ctx, tablet)
@@ -477,11 +488,12 @@ func (client *Client) ExecuteFetchAsDba(ctx context.Context, tablet *topodatapb.
 	}
 
 	response, err := c.ExecuteFetchAsDba(ctx, &tabletmanagerdatapb.ExecuteFetchAsDbaRequest{
-		Query:          req.Query,
-		DbName:         topoproto.TabletDbName(tablet),
-		MaxRows:        req.MaxRows,
-		DisableBinlogs: req.DisableBinlogs,
-		ReloadSchema:   req.DisableBinlogs,
+		Query:                   req.Query,
+		DbName:                  topoproto.TabletDbName(tablet),
+		MaxRows:                 req.MaxRows,
+		DisableBinlogs:          req.DisableBinlogs,
+		ReloadSchema:            req.DisableBinlogs,
+		DisableForeignKeyChecks: req.DisableForeignKeyChecks,
 	})
 	if err != nil {
 		return nil, err
@@ -557,12 +569,28 @@ func (client *Client) ReplicationStatus(ctx context.Context, tablet *topodatapb.
 }
 
 // FullStatus is part of the tmclient.TabletManagerClient interface.
+// It always tries to use a cached client via the dialer pool as this is
+// called very frequently from VTOrc, and the overhead of creating a new gRPC connection/channel
+// and dialing the other tablet every time is not practical.
 func (client *Client) FullStatus(ctx context.Context, tablet *topodatapb.Tablet) (*replicationdatapb.FullStatus, error) {
-	c, closer, err := client.dialer.dial(ctx, tablet)
-	if err != nil {
-		return nil, err
+	var c tabletmanagerservicepb.TabletManagerClient
+	var err error
+	if poolDialer, ok := client.dialer.(poolDialer); ok {
+		c, err = poolDialer.dialPool(ctx, tablet)
+		if err != nil {
+			return nil, err
+		}
 	}
-	defer closer.Close()
+
+	if c == nil {
+		var closer io.Closer
+		c, closer, err = client.dialer.dial(ctx, tablet)
+		if err != nil {
+			return nil, err
+		}
+		defer closer.Close()
+	}
+
 	response, err := c.FullStatus(ctx, &tabletmanagerdatapb.FullStatusRequest{})
 	if err != nil {
 		return nil, err
@@ -679,18 +707,47 @@ func (client *Client) GetReplicas(ctx context.Context, tablet *topodatapb.Tablet
 	return response.Addrs, nil
 }
 
-// VExec is part of the tmclient.TabletManagerClient interface.
-func (client *Client) VExec(ctx context.Context, tablet *topodatapb.Tablet, query, workflow, keyspace string) (*querypb.QueryResult, error) {
+//
+// VReplication related methods
+//
+
+func (client *Client) CreateVReplicationWorkflow(ctx context.Context, tablet *topodatapb.Tablet, request *tabletmanagerdatapb.CreateVReplicationWorkflowRequest) (*tabletmanagerdatapb.CreateVReplicationWorkflowResponse, error) {
 	c, closer, err := client.dialer.dial(ctx, tablet)
 	if err != nil {
 		return nil, err
 	}
 	defer closer.Close()
-	response, err := c.VExec(ctx, &tabletmanagerdatapb.VExecRequest{Query: query, Workflow: workflow, Keyspace: keyspace})
+	response, err := c.CreateVReplicationWorkflow(ctx, request)
 	if err != nil {
 		return nil, err
 	}
-	return response.Result, nil
+	return response, nil
+}
+
+func (client *Client) DeleteVReplicationWorkflow(ctx context.Context, tablet *topodatapb.Tablet, request *tabletmanagerdatapb.DeleteVReplicationWorkflowRequest) (*tabletmanagerdatapb.DeleteVReplicationWorkflowResponse, error) {
+	c, closer, err := client.dialer.dial(ctx, tablet)
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+	response, err := c.DeleteVReplicationWorkflow(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func (client *Client) ReadVReplicationWorkflow(ctx context.Context, tablet *topodatapb.Tablet, request *tabletmanagerdatapb.ReadVReplicationWorkflowRequest) (*tabletmanagerdatapb.ReadVReplicationWorkflowResponse, error) {
+	c, closer, err := client.dialer.dial(ctx, tablet)
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+	response, err := c.ReadVReplicationWorkflow(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
 // VReplicationExec is part of the tmclient.TabletManagerClient interface.
@@ -718,6 +775,19 @@ func (client *Client) VReplicationWaitForPos(ctx context.Context, tablet *topoda
 		return err
 	}
 	return nil
+}
+
+func (client *Client) UpdateVReplicationWorkflow(ctx context.Context, tablet *topodatapb.Tablet, request *tabletmanagerdatapb.UpdateVReplicationWorkflowRequest) (*tabletmanagerdatapb.UpdateVReplicationWorkflowResponse, error) {
+	c, closer, err := client.dialer.dial(ctx, tablet)
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+	response, err := c.UpdateVReplicationWorkflow(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
 // VDiff is part of the tmclient.TabletManagerClient interface.
@@ -946,6 +1016,37 @@ func (client *Client) Backup(ctx context.Context, tablet *topodatapb.Tablet, req
 		stream: stream,
 		closer: closer,
 	}, nil
+}
+
+// CheckThrottler is part of the tmclient.TabletManagerClient interface.
+// It always tries to use a cached client via the dialer pool as this is
+// called very frequently between tablets when the throttler is enabled in
+// a keyspace and the overhead of creating a new gRPC connection/channel
+// and dialing the other tablet every time is not practical.
+func (client *Client) CheckThrottler(ctx context.Context, tablet *topodatapb.Tablet, req *tabletmanagerdatapb.CheckThrottlerRequest) (*tabletmanagerdatapb.CheckThrottlerResponse, error) {
+	var c tabletmanagerservicepb.TabletManagerClient
+	var err error
+	if poolDialer, ok := client.dialer.(poolDialer); ok {
+		c, err = poolDialer.dialPool(ctx, tablet)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if c == nil {
+		var closer io.Closer
+		c, closer, err = client.dialer.dial(ctx, tablet)
+		if err != nil {
+			return nil, err
+		}
+		defer closer.Close()
+	}
+
+	response, err := c.CheckThrottler(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
 type restoreFromBackupStreamAdapter struct {

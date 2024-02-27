@@ -29,6 +29,7 @@ package stats
 
 import (
 	"bytes"
+	"context"
 	"expvar"
 	"fmt"
 	"strconv"
@@ -45,6 +46,7 @@ var (
 	emitStats         bool
 	statsEmitPeriod   = 60 * time.Second
 	statsBackend      string
+	statsBackendInit  = make(chan struct{})
 	combineDimensions string
 	dropVariables     string
 )
@@ -121,6 +123,76 @@ func Publish(name string, v expvar.Var) {
 	publish(name, v)
 }
 
+func pushAll() error {
+	backend, ok := pushBackends[statsBackend]
+	if !ok {
+		return fmt.Errorf("no PushBackend registered with name %s", statsBackend)
+	}
+	return backend.PushAll()
+}
+
+func pushOne(name string, v Variable) error {
+	backend, ok := pushBackends[statsBackend]
+	if !ok {
+		return fmt.Errorf("no PushBackend registered with name %s", statsBackend)
+	}
+	return backend.PushOne(name, v)
+}
+
+// StringMapFuncWithMultiLabels is a multidimensional string map publisher.
+//
+// Map keys are compound names made with joining multiple strings with '.',
+// and are named by corresponding key labels.
+//
+// Map values are any string, and are named by the value label.
+//
+// Since the map is returned by the function, we assume it's in the right
+// format (meaning each key is of the form 'aaa.bbb.ccc' with as many elements
+// as there are in Labels).
+//
+// Backends which need to provide a numeric value can set a constant value of 1
+// (or whatever is appropriate for the backend) for each key-value pair present
+// in the map.
+type StringMapFuncWithMultiLabels struct {
+	StringMapFunc
+	help       string
+	keyLabels  []string
+	valueLabel string
+}
+
+// Help returns the descriptive help message.
+func (s StringMapFuncWithMultiLabels) Help() string {
+	return s.help
+}
+
+// KeyLabels returns the list of key labels.
+func (s StringMapFuncWithMultiLabels) KeyLabels() []string {
+	return s.keyLabels
+}
+
+// ValueLabel returns the value label.
+func (s StringMapFuncWithMultiLabels) ValueLabel() string {
+	return s.valueLabel
+}
+
+// NewStringMapFuncWithMultiLabels creates a new StringMapFuncWithMultiLabels,
+// mapping to the provided function. The key labels correspond with components
+// of map keys. The value label names the map values.
+func NewStringMapFuncWithMultiLabels(name, help string, keyLabels []string, valueLabel string, f func() map[string]string) *StringMapFuncWithMultiLabels {
+	t := &StringMapFuncWithMultiLabels{
+		StringMapFunc: StringMapFunc(f),
+		help:          help,
+		keyLabels:     keyLabels,
+		valueLabel:    valueLabel,
+	}
+
+	if name != "" {
+		publish(name, t)
+	}
+
+	return t
+}
+
 func publish(name string, v expvar.Var) {
 	defaultVarGroup.publish(name, v)
 }
@@ -129,13 +201,27 @@ func publish(name string, v expvar.Var) {
 // to be pushed to it. It's used to support push-based metrics backends, as expvar
 // by default only supports pull-based ones.
 type PushBackend interface {
-	// PushAll pushes all stats from expvar to the backend
+	// PushAll pushes all stats from expvar to the backend.
 	PushAll() error
+	// PushOne pushes a single stat from expvar to the backend.
+	PushOne(name string, v Variable) error
 }
 
 var pushBackends = make(map[string]PushBackend)
 var pushBackendsLock sync.Mutex
 var once sync.Once
+
+func AwaitBackend(ctx context.Context) error {
+	if statsBackend == "" {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-statsBackendInit:
+		return nil
+	}
+}
 
 // RegisterPushBackend allows modules to register PushBackend implementations.
 // Should be called on init().
@@ -146,6 +232,9 @@ func RegisterPushBackend(name string, backend PushBackend) {
 		log.Fatalf("PushBackend %s already exists; can't register the same name multiple times", name)
 	}
 	pushBackends[name] = backend
+	if name == statsBackend {
+		close(statsBackendInit)
+	}
 	if emitStats {
 		// Start a single goroutine to emit stats periodically
 		once.Do(func() {
@@ -160,13 +249,7 @@ func emitToBackend(emitPeriod *time.Duration) {
 	ticker := time.NewTicker(*emitPeriod)
 	defer ticker.Stop()
 	for range ticker.C {
-		backend, ok := pushBackends[statsBackend]
-		if !ok {
-			log.Errorf("No PushBackend registered with name %s", statsBackend)
-			return
-		}
-		err := backend.PushAll()
-		if err != nil {
+		if err := pushAll(); err != nil {
 			// TODO(aaijazi): This might cause log spam...
 			log.Warningf("Pushing stats to backend %v failed: %v", statsBackend, err)
 		}

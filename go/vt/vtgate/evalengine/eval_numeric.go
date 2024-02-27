@@ -17,12 +17,15 @@ limitations under the License.
 package evalengine
 
 import (
+	"fmt"
 	"math"
 	"strconv"
 
+	"vitess.io/vitess/go/mysql/decimal"
+	"vitess.io/vitess/go/mysql/fastparse"
+	"vitess.io/vitess/go/mysql/format"
+	"vitess.io/vitess/go/mysql/json"
 	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/vt/vtgate/evalengine/internal/decimal"
-	"vitess.io/vitess/go/vt/vtgate/evalengine/internal/json"
 	"vitess.io/vitess/go/vt/vthash"
 )
 
@@ -38,7 +41,8 @@ type (
 	}
 
 	evalInt64 struct {
-		i int64
+		i          int64
+		bitLiteral bool
 	}
 
 	evalUint64 struct {
@@ -61,8 +65,8 @@ var _ evalNumeric = (*evalUint64)(nil)
 var _ evalNumeric = (*evalFloat)(nil)
 var _ evalNumeric = (*evalDecimal)(nil)
 
-var evalBoolTrue = &evalInt64{1}
-var evalBoolFalse = &evalInt64{0}
+var evalBoolTrue = &evalInt64{i: 1}
+var evalBoolFalse = &evalInt64{i: 0}
 
 func newEvalUint64(u uint64) *evalUint64 {
 	return &evalUint64{u: u}
@@ -94,12 +98,12 @@ func newEvalBool(b bool) *evalInt64 {
 	return evalBoolFalse
 }
 
-func evalToNumeric(e eval) evalNumeric {
+func evalToNumeric(e eval, preciseDatetime bool) evalNumeric {
 	switch e := e.(type) {
 	case evalNumeric:
 		return e
 	case *evalBytes:
-		if e.isHexLiteral {
+		if e.isHexLiteral() {
 			hex, ok := e.toNumericHex()
 			if !ok {
 				// overflow
@@ -107,20 +111,225 @@ func evalToNumeric(e eval) evalNumeric {
 			}
 			return hex
 		}
-		return &evalFloat{f: parseStringToFloat(e.string())}
+		if e.isBitLiteral() {
+			bit, ok := e.toNumericBit()
+			if !ok {
+				// overflow
+				return newEvalFloat(0)
+			}
+			return bit
+		}
+		f, _ := fastparse.ParseFloat64(e.string())
+		return &evalFloat{f: f}
 	case *evalJSON:
 		switch e.Type() {
-		case json.TypeTrue:
-			return newEvalBool(true)
-		case json.TypeFalse:
-			return newEvalBool(false)
-		case json.TypeNumber, json.TypeString:
-			return &evalFloat{f: parseStringToFloat(e.Raw())}
+		case json.TypeBoolean:
+			if e == json.ValueTrue {
+				return &evalFloat{f: 1.0}
+			}
+			return &evalFloat{f: 0.0}
+		case json.TypeNumber:
+			f, _ := e.Float64()
+			return &evalFloat{f: f}
+		case json.TypeString:
+			f, _ := fastparse.ParseFloat64(e.Raw())
+			return &evalFloat{f: f}
 		default:
 			return &evalFloat{f: 0}
 		}
+	case *evalTemporal:
+		if preciseDatetime {
+			if e.prec == 0 {
+				return newEvalInt64(e.toInt64())
+			}
+			return newEvalDecimalWithPrec(e.toDecimal(), int32(e.prec))
+		}
+		return &evalFloat{f: e.toFloat()}
 	default:
 		panic("unsupported")
+	}
+}
+
+func evalToFloat(e eval) (*evalFloat, bool) {
+	switch e := e.(type) {
+	case *evalFloat:
+		return e, true
+	case evalNumeric:
+		return e.toFloat()
+	case *evalBytes:
+		if e.isHexLiteral() {
+			hex, ok := e.toNumericHex()
+			if !ok {
+				// overflow
+				return newEvalFloat(0), false
+			}
+			f, ok := hex.toFloat()
+			if !ok {
+				return newEvalFloat(0), false
+			}
+			return f, true
+		}
+		if e.isBitLiteral() {
+			bit, ok := e.toNumericBit()
+			if !ok {
+				// overflow
+				return newEvalFloat(0), false
+			}
+			f, ok := bit.toFloat()
+			if !ok {
+				return newEvalFloat(0), false
+			}
+			return f, true
+		}
+		val, err := fastparse.ParseFloat64(e.string())
+		return &evalFloat{f: val}, err == nil
+	case *evalJSON:
+		switch e.Type() {
+		case json.TypeBoolean:
+			if e == json.ValueTrue {
+				return &evalFloat{f: 1.0}, true
+			}
+			return &evalFloat{f: 0.0}, true
+		case json.TypeNumber:
+			f, ok := e.Float64()
+			return &evalFloat{f: f}, ok
+		case json.TypeString:
+			val, err := fastparse.ParseFloat64(e.Raw())
+			return &evalFloat{f: val}, err == nil
+		default:
+			return &evalFloat{f: 0}, true
+		}
+	case *evalTemporal:
+		return &evalFloat{f: e.toFloat()}, true
+	default:
+		panic(fmt.Sprintf("unsupported type %T", e))
+	}
+}
+
+func evalToDecimal(e eval, m, d int32) *evalDecimal {
+	switch e := e.(type) {
+	case evalNumeric:
+		return e.toDecimal(m, d)
+	case *evalBytes:
+		if e.isHexLiteral() {
+			hex, ok := e.toNumericHex()
+			if !ok {
+				// overflow
+				return newEvalDecimal(decimal.Zero, m, d)
+			}
+			return hex.toDecimal(m, d)
+		}
+		if e.isBitLiteral() {
+			bit, ok := e.toNumericBit()
+			if !ok {
+				// overflow
+				return newEvalDecimal(decimal.Zero, m, d)
+			}
+			return bit.toDecimal(m, d)
+		}
+		dec, _ := decimal.NewFromString(e.string())
+		return newEvalDecimal(dec, m, d)
+	case *evalJSON:
+		switch e.Type() {
+		case json.TypeBoolean:
+			if e == json.ValueTrue {
+				return newEvalDecimal(decimal.NewFromInt(1), m, d)
+			}
+			return newEvalDecimal(decimal.Zero, m, d)
+		case json.TypeNumber:
+			switch e.NumberType() {
+			case json.NumberTypeSigned:
+				i, _ := e.Int64()
+				return newEvalDecimal(decimal.NewFromInt(i), m, d)
+			case json.NumberTypeUnsigned:
+				// If the value fits in an unsigned integer, convert to that
+				// and then cast it to a signed integer and then turn it into a decimal.
+				// SELECT CAST(CAST(18446744073709551615 AS JSON) AS DECIMAL) -> -1
+				u, _ := e.Uint64()
+				return newEvalDecimal(decimal.NewFromInt(int64(u)), m, d)
+			case json.NumberTypeDecimal:
+				dec, _ := e.Decimal()
+				return newEvalDecimal(dec, m, d)
+			case json.NumberTypeFloat:
+				f, _ := e.Float64()
+				dec := decimal.NewFromFloat(f)
+				return newEvalDecimal(dec, m, d)
+			default:
+				panic("unreachable")
+			}
+		case json.TypeString:
+			dec, _ := decimal.NewFromString(e.Raw())
+			return newEvalDecimal(dec, m, d)
+		default:
+			return newEvalDecimal(decimal.Zero, m, d)
+		}
+	case *evalTemporal:
+		return newEvalDecimal(e.toDecimal(), m, d)
+	default:
+		panic("unsupported")
+	}
+}
+
+func evalToInt64(e eval) *evalInt64 {
+	switch e := e.(type) {
+	case *evalInt64:
+		return e
+	case evalNumeric:
+		return e.toInt64()
+	case *evalBytes:
+		if e.isHexLiteral() {
+			hex, ok := e.toNumericHex()
+			if !ok {
+				// overflow
+				return newEvalInt64(0)
+			}
+			return hex.toInt64()
+		}
+		if e.isBitLiteral() {
+			bit, ok := e.toNumericBit()
+			if !ok {
+				// overflow
+				return newEvalInt64(0)
+			}
+			return bit
+		}
+		i, _ := fastparse.ParseInt64(e.string(), 10)
+		return newEvalInt64(i)
+	case *evalJSON:
+		switch e.Type() {
+		case json.TypeBoolean:
+			if e == json.ValueTrue {
+				return newEvalInt64(1)
+			}
+			return newEvalInt64(0)
+		case json.TypeNumber:
+			switch e.NumberType() {
+			case json.NumberTypeSigned:
+				i, _ := e.Int64()
+				return newEvalInt64(i)
+			case json.NumberTypeUnsigned:
+				u, _ := e.Uint64()
+				// OMG, MySQL is really terrible at this.
+				return newEvalInt64(int64(u))
+			case json.NumberTypeDecimal:
+				d, _ := e.Decimal()
+				return newEvalInt64(decimalToInt64(d))
+			case json.NumberTypeFloat:
+				f, _ := e.Float64()
+				return newEvalInt64(floatToInt64(f))
+			default:
+				panic("unsupported")
+			}
+		case json.TypeString:
+			i, _ := fastparse.ParseInt64(e.Raw(), 10)
+			return newEvalInt64(i)
+		default:
+			return newEvalInt64(0)
+		}
+	case *evalTemporal:
+		return newEvalInt64(e.toInt64())
+	default:
+		panic(fmt.Sprintf("unsupported type: %T", e))
 	}
 }
 
@@ -142,6 +351,9 @@ func (e *evalInt64) ToRawBytes() []byte {
 }
 
 func (e *evalInt64) negate() evalNumeric {
+	if e.bitLiteral {
+		return newEvalFloat(-float64(e.i))
+	}
 	if e.i == math.MinInt64 {
 		return newEvalDecimalWithPrec(decimal.NewFromInt(e.i).NegInPlace(), 0)
 	}
@@ -221,23 +433,26 @@ func (e *evalFloat) SQLType() sqltypes.Type {
 }
 
 func (e *evalFloat) ToRawBytes() []byte {
-	return FormatFloat(sqltypes.Float64, e.f)
+	return format.FormatFloat(e.f)
 }
 
 func (e *evalFloat) negate() evalNumeric {
 	return newEvalFloat(-e.f)
 }
 
-func (e *evalFloat) toInt64() *evalInt64 {
+func floatToInt64(f float64) int64 {
 	// the int64(f) conversion is always well-defined, but for float values larger than
 	// MaxInt64, it returns a negative value. Check for underflow: if the sign of
 	// our integral is negative but our float is not, clamp to MaxInt64 like MySQL does.
-	f := math.Round(e.f)
-	i := int64(f)
+	i := int64(math.Round(f))
 	if i < 0 && !math.Signbit(f) {
 		i = math.MaxInt64
 	}
-	return newEvalInt64(i)
+	return i
+}
+
+func (e *evalFloat) toInt64() *evalInt64 {
+	return newEvalInt64(floatToInt64(e.f))
 }
 
 func (e *evalFloat) toFloat() (*evalFloat, bool) {
@@ -304,10 +519,20 @@ func (e *evalDecimal) negate() evalNumeric {
 	return newEvalDecimalWithPrec(e.dec.Neg(), e.length)
 }
 
+func decimalToInt64(dec decimal.Decimal) int64 {
+	dec = dec.Round(0)
+	i, valid := dec.Int64()
+	if !valid {
+		if dec.Sign() < 0 {
+			return math.MinInt64
+		}
+		return math.MaxInt64
+	}
+	return i
+}
+
 func (e *evalDecimal) toInt64() *evalInt64 {
-	dec := e.dec.Round(0)
-	i, _ := dec.Int64()
-	return newEvalInt64(i)
+	return newEvalInt64(decimalToInt64(e.dec))
 }
 
 func (e *evalDecimal) toFloat0() (float64, bool) {
@@ -333,6 +558,9 @@ func (e *evalDecimal) toUint64() *evalUint64 {
 		return newEvalUint64(uint64(i))
 	}
 
-	u, _ := dec.Uint64()
+	u, valid := dec.Uint64()
+	if !valid {
+		return newEvalUint64(math.MaxUint64)
+	}
 	return newEvalUint64(u)
 }

@@ -18,21 +18,15 @@ package inst
 
 import (
 	"fmt"
-	"log/syslog"
 	"os"
 	"time"
 
-	"vitess.io/vitess/go/vt/external/golib/sqlutils"
-	"vitess.io/vitess/go/vt/log"
-
 	"github.com/rcrowley/go-metrics"
 
+	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/vtorc/config"
 	"vitess.io/vitess/go/vt/vtorc/db"
 )
-
-// syslogWriter is optional, and defaults to nil (disabled)
-var syslogWriter *syslog.Writer
 
 var auditOperationCounter = metrics.NewCounter()
 
@@ -40,24 +34,12 @@ func init() {
 	_ = metrics.Register("audit.write", auditOperationCounter)
 }
 
-// EnableSyslogWriter enables, if possible, writes to syslog. These will execute _in addition_ to normal logging
-func EnableAuditSyslog() (err error) {
-	syslogWriter, err = syslog.New(syslog.LOG_ERR, "vtorc")
-	if err != nil {
-		syslogWriter = nil
-	}
-	return err
-}
-
 // AuditOperation creates and writes a new audit entry by given params
-func AuditOperation(auditType string, instanceKey *InstanceKey, message string) error {
-	if instanceKey == nil {
-		instanceKey = &InstanceKey{}
-	}
+func AuditOperation(auditType string, tabletAlias string, message string) error {
 	keyspace := ""
 	shard := ""
-	if instanceKey.Hostname != "" {
-		keyspace, shard, _ = GetKeyspaceShardName(instanceKey)
+	if tabletAlias != "" {
+		keyspace, shard, _ = GetKeyspaceShardName(tabletAlias)
 	}
 
 	auditWrittenToFile := false
@@ -71,7 +53,7 @@ func AuditOperation(auditType string, instanceKey *InstanceKey, message string) 
 			}
 
 			defer f.Close()
-			text := fmt.Sprintf("%s\t%s\t%s\t%d\t[%s:%s]\t%s\t\n", time.Now().Format("2006-01-02 15:04:05"), auditType, instanceKey.Hostname, instanceKey.Port, keyspace, shard, message)
+			text := fmt.Sprintf("%s\t%s\t%s\t[%s:%s]\t%s\t\n", time.Now().Format("2006-01-02 15:04:05"), auditType, tabletAlias, keyspace, shard, message)
 			if _, err = f.WriteString(text); err != nil {
 				log.Error(err)
 			}
@@ -81,14 +63,13 @@ func AuditOperation(auditType string, instanceKey *InstanceKey, message string) 
 		_, err := db.ExecVTOrc(`
 			insert
 				into audit (
-					audit_timestamp, audit_type, hostname, port, keyspace, shard, message
+					audit_timestamp, audit_type, alias, keyspace, shard, message
 				) VALUES (
-					NOW(), ?, ?, ?, ?, ?, ?
+					NOW(), ?, ?, ?, ?, ?
 				)
 			`,
 			auditType,
-			instanceKey.Hostname,
-			instanceKey.Port,
+			tabletAlias,
 			keyspace,
 			shard,
 			message,
@@ -98,12 +79,9 @@ func AuditOperation(auditType string, instanceKey *InstanceKey, message string) 
 			return err
 		}
 	}
-	logMessage := fmt.Sprintf("auditType:%s instance:%s keyspace:%s shard:%s message:%s", auditType, instanceKey.DisplayString(), keyspace, shard, message)
-	if syslogWriter != nil {
+	logMessage := fmt.Sprintf("auditType:%s alias:%s keyspace:%s shard:%s message:%s", auditType, tabletAlias, keyspace, shard, message)
+	if syslogMessage(logMessage) {
 		auditWrittenToFile = true
-		go func() {
-			_ = syslogWriter.Info(logMessage)
-		}()
 	}
 	if !auditWrittenToFile {
 		log.Infof(logMessage)
@@ -111,52 +89,6 @@ func AuditOperation(auditType string, instanceKey *InstanceKey, message string) 
 	auditOperationCounter.Inc(1)
 
 	return nil
-}
-
-// ReadRecentAudit returns a list of audit entries order chronologically descending, using page number.
-func ReadRecentAudit(instanceKey *InstanceKey, page int) ([]Audit, error) {
-	res := []Audit{}
-	args := sqlutils.Args()
-	whereCondition := ``
-	if instanceKey != nil {
-		whereCondition = `where hostname=? and port=?`
-		args = append(args, instanceKey.Hostname, instanceKey.Port)
-	}
-	query := fmt.Sprintf(`
-		select
-			audit_id,
-			audit_timestamp,
-			audit_type,
-			hostname,
-			port,
-			message
-		from
-			audit
-		%s
-		order by
-			audit_timestamp desc
-		limit ?
-		offset ?
-		`, whereCondition)
-	args = append(args, config.AuditPageSize, page*config.AuditPageSize)
-	err := db.QueryVTOrc(query, args, func(m sqlutils.RowMap) error {
-		audit := Audit{}
-		audit.AuditID = m.GetInt64("audit_id")
-		audit.AuditTimestamp = m.GetString("audit_timestamp")
-		audit.AuditType = m.GetString("audit_type")
-		audit.AuditInstanceKey.Hostname = m.GetString("hostname")
-		audit.AuditInstanceKey.Port = m.GetInt("port")
-		audit.Message = m.GetString("message")
-
-		res = append(res, audit)
-		return nil
-	})
-
-	if err != nil {
-		log.Error(err)
-	}
-	return res, err
-
 }
 
 // ExpireAudit removes old rows from the audit table

@@ -23,13 +23,12 @@ import (
 
 	"github.com/spf13/pflag"
 
+	"vitess.io/vitess/go/vt/vtenv"
+
 	"vitess.io/vitess/go/vt/servenv"
 
 	"vitess.io/vitess/go/acl"
-	"vitess.io/vitess/go/vt/discovery"
-	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/topo"
-	"vitess.io/vitess/go/vt/vtctl"
 	"vitess.io/vitess/go/vt/wrangler"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -37,8 +36,6 @@ import (
 )
 
 var (
-	enableRealtimeStats = false
-	durabilityPolicy    = "none"
 	sanitizeLogMessages = false
 )
 
@@ -49,13 +46,12 @@ func init() {
 }
 
 func registerVtctldFlags(fs *pflag.FlagSet) {
-	fs.StringVar(&durabilityPolicy, "durability_policy", durabilityPolicy, "type of durability to enforce. Default is none. Other values are dictated by registered plugins")
 	fs.BoolVar(&sanitizeLogMessages, "vtctld_sanitize_log_messages", sanitizeLogMessages, "When true, vtctld sanitizes logging.")
 }
 
 // InitVtctld initializes all the vtctld functionality.
-func InitVtctld(ts *topo.Server) error {
-	actionRepo := NewActionRepository(ts)
+func InitVtctld(env *vtenv.Environment, ts *topo.Server) error {
+	actionRepo := NewActionRepository(env, ts)
 
 	// keyspace actions
 	actionRepo.RegisterKeyspaceAction("ValidateKeyspace",
@@ -131,19 +127,8 @@ func InitVtctld(ts *topo.Server) error {
 			return "", err
 		})
 
-	var healthCheck discovery.HealthCheck
-	if enableRealtimeStats {
-		ctx := context.Background()
-		cells, err := ts.GetKnownCells(ctx)
-		if err != nil {
-			log.Errorf("Failed to get the list of known cells, failed to instantiate the healthcheck at startup: %v", err)
-		} else {
-			healthCheck = vtctl.NewHealthCheck(ctx, ts, localCell, cells)
-		}
-	}
-
 	// Serve the REST API
-	initAPI(context.Background(), ts, actionRepo, healthCheck)
+	initAPI(context.Background(), ts, actionRepo)
 
 	// Serve the topology endpoint in the REST API at /topodata
 	initExplorer(ts)

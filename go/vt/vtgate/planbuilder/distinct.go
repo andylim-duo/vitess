@@ -17,7 +17,6 @@ limitations under the License.
 package planbuilder
 
 import (
-	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
 )
 
@@ -27,33 +26,32 @@ var _ logicalPlan = (*distinct)(nil)
 type distinct struct {
 	logicalPlanCommon
 	checkCols      []engine.CheckCol
+	truncateColumn int
+
+	// needToTruncate is the old way to check weight_string column and set truncation.
 	needToTruncate bool
 }
 
-func newDistinct(source logicalPlan, checkCols []engine.CheckCol, needToTruncate bool) logicalPlan {
+func newDistinct(source logicalPlan, checkCols []engine.CheckCol, truncateColumn int) logicalPlan {
 	return &distinct{
 		logicalPlanCommon: newBuilderCommon(source),
 		checkCols:         checkCols,
-		needToTruncate:    needToTruncate,
+		truncateColumn:    truncateColumn,
 	}
-}
-
-func newDistinctV3(source logicalPlan) logicalPlan {
-	return &distinct{logicalPlanCommon: newBuilderCommon(source)}
 }
 
 func (d *distinct) Primitive() engine.Primitive {
-	if d.checkCols == nil {
-		// If we are missing the checkCols information, we are on the V3 planner and should produce a V3 Distinct
-		return &engine.DistinctV3{Source: d.input.Primitive()}
-	}
-	truncate := false
+	truncate := d.truncateColumn
 	if d.needToTruncate {
+		wsColFound := false
 		for _, col := range d.checkCols {
 			if col.WsCol != nil {
-				truncate = true
+				wsColFound = true
 				break
 			}
+		}
+		if wsColFound {
+			truncate = len(d.checkCols)
 		}
 	}
 	return &engine.Distinct{
@@ -61,18 +59,4 @@ func (d *distinct) Primitive() engine.Primitive {
 		CheckCols: d.checkCols,
 		Truncate:  truncate,
 	}
-}
-
-// Rewrite implements the logicalPlan interface
-func (d *distinct) Rewrite(inputs ...logicalPlan) error {
-	if len(inputs) != 1 {
-		return vterrors.VT13001("distinct: wrong number of inputs")
-	}
-	d.input = inputs[0]
-	return nil
-}
-
-// Inputs implements the logicalPlan interface
-func (d *distinct) Inputs() []logicalPlan {
-	return []logicalPlan{d.input}
 }

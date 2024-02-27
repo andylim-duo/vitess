@@ -1,5 +1,5 @@
 /*
-Copyright 2020 The Vitess Authors.
+Copyright 2021 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,72 +17,25 @@ limitations under the License.
 package planbuilder
 
 import (
-	"vitess.io/vitess/go/vt/sqlparser"
-	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
 )
 
 type concatenate struct {
-	v3Plan
-	lhs, rhs logicalPlan
-	order    int
+	sources []logicalPlan
+
+	// These column offsets do not need to be typed checked - they usually contain weight_string()
+	// columns that are not going to be returned to the user
+	noNeedToTypeCheck []int
 }
 
 var _ logicalPlan = (*concatenate)(nil)
 
-func (c *concatenate) Order() int {
-	return c.order
-}
-
-func (c *concatenate) ResultColumns() []*resultColumn {
-	return c.lhs.ResultColumns()
-}
-
-func (c *concatenate) Reorder(order int) {
-	c.lhs.Reorder(order)
-	c.rhs.Reorder(c.lhs.Order())
-	c.order = c.rhs.Order() + 1
-}
-
-func (c *concatenate) Wireup(plan logicalPlan, jt *jointab) error {
-	// TODO systay should we do something different here?
-	err := c.lhs.Wireup(plan, jt)
-	if err != nil {
-		return err
-	}
-	return c.rhs.Wireup(plan, jt)
-}
-
-func (c *concatenate) SupplyVar(from, to int, col *sqlparser.ColName, varname string) {
-	panic("implement me")
-}
-
-func (c *concatenate) SupplyCol(col *sqlparser.ColName) (rc *resultColumn, colNumber int) {
-	panic("implement me")
-}
-
-func (c *concatenate) SupplyWeightString(colNumber int, alsoAddToGroupBy bool) (weightcolNumber int, err error) {
-	panic("implement me")
-}
-
+// Primitive implements the logicalPlan interface
 func (c *concatenate) Primitive() engine.Primitive {
-	lhs := c.lhs.Primitive()
-	rhs := c.rhs.Primitive()
-
-	return engine.NewConcatenate([]engine.Primitive{lhs, rhs}, nil)
-}
-
-// Rewrite implements the logicalPlan interface
-func (c *concatenate) Rewrite(inputs ...logicalPlan) error {
-	if len(inputs) != 2 {
-		return vterrors.VT13001("concatenate: wrong number of inputs")
+	var sources []engine.Primitive
+	for _, source := range c.sources {
+		sources = append(sources, source.Primitive())
 	}
-	c.lhs = inputs[0]
-	c.rhs = inputs[1]
-	return nil
-}
 
-// Inputs implements the logicalPlan interface
-func (c *concatenate) Inputs() []logicalPlan {
-	return []logicalPlan{c.lhs, c.rhs}
+	return engine.NewConcatenate(sources, c.noNeedToTypeCheck)
 }

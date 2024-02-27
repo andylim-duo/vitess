@@ -17,10 +17,10 @@ limitations under the License.
 package operators
 
 import (
+	"vitess.io/vitess/go/slice"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
-	"vitess.io/vitess/go/vt/vtgate/planbuilder/operators/ops"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 	"vitess.io/vitess/go/vt/vtgate/semantics"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
@@ -48,89 +48,122 @@ type (
 	}
 )
 
-const VindexUnsupported = "WHERE clause for vindex function must be of the form id = <val> or id in(<val>,...)"
+const wrongWhereCond = "WHERE clause for vindex function must be of the form id = <val> or id in(<val>,...)"
 
 // Introduces implements the Operator interface
-func (v *Vindex) Introduces() semantics.TableSet {
+func (v *Vindex) introducesTableID() semantics.TableSet {
 	return v.Solved
 }
 
-// IPhysical implements the PhysicalOperator interface
-func (v *Vindex) IPhysical() {}
-
 // Clone implements the Operator interface
-func (v *Vindex) Clone([]ops.Operator) ops.Operator {
+func (v *Vindex) Clone([]Operator) Operator {
 	clone := *v
 	return &clone
 }
 
-var _ ops.PhysicalOperator = (*Vindex)(nil)
+func (v *Vindex) AddColumn(ctx *plancontext.PlanningContext, reuse bool, gb bool, ae *sqlparser.AliasedExpr) int {
+	if gb {
+		panic(vterrors.VT13001("tried to add group by to a table"))
+	}
+	if reuse {
+		offset := v.FindCol(ctx, ae.Expr, true)
+		if offset > -1 {
+			return offset
+		}
+	}
 
-func (v *Vindex) AddColumn(_ *plancontext.PlanningContext, expr sqlparser.Expr) (int, error) {
-	return addColumn(v, expr)
+	return addColumn(ctx, v, ae.Expr)
 }
 
-func (v *Vindex) GetColumns() []*sqlparser.ColName {
+func colNameToExpr(c *sqlparser.ColName) *sqlparser.AliasedExpr {
+	return &sqlparser.AliasedExpr{
+		Expr: c,
+		As:   sqlparser.IdentifierCI{},
+	}
+}
+
+func (v *Vindex) FindCol(ctx *plancontext.PlanningContext, expr sqlparser.Expr, underRoute bool) int {
+	for idx, col := range v.Columns {
+		if ctx.SemTable.EqualsExprWithDeps(expr, col) {
+			return idx
+		}
+	}
+
+	return -1
+}
+
+func (v *Vindex) GetColumns(*plancontext.PlanningContext) []*sqlparser.AliasedExpr {
+	return slice.Map(v.Columns, colNameToExpr)
+}
+
+func (v *Vindex) GetSelectExprs(ctx *plancontext.PlanningContext) sqlparser.SelectExprs {
+	return transformColumnsToSelectExprs(ctx, v)
+}
+
+func (v *Vindex) GetOrdering(*plancontext.PlanningContext) []OrderBy {
+	return nil
+}
+
+func (v *Vindex) GetColNames() []*sqlparser.ColName {
 	return v.Columns
 }
+
 func (v *Vindex) AddCol(col *sqlparser.ColName) {
 	v.Columns = append(v.Columns, col)
 }
 
-// checkValid implements the Operator interface
-func (v *Vindex) CheckValid() error {
+func (v *Vindex) CheckValid() {
 	if len(v.Table.Predicates) == 0 {
-		return vterrors.VT12001(VindexUnsupported + " (where clause missing)")
+		panic(vterrors.VT09018(wrongWhereCond + " (where clause missing)"))
 	}
-
-	return nil
 }
 
-func (v *Vindex) AddPredicate(ctx *plancontext.PlanningContext, expr sqlparser.Expr) (ops.Operator, error) {
+func (v *Vindex) AddPredicate(ctx *plancontext.PlanningContext, expr sqlparser.Expr) Operator {
 	for _, e := range sqlparser.SplitAndExpression(nil, expr) {
 		deps := ctx.SemTable.RecursiveDeps(e)
 		if deps.NumberOfTables() > 1 {
-			return nil, vterrors.VT12001(VindexUnsupported + " (multiple tables involved)")
+			panic(vterrors.VT09018(wrongWhereCond + " (multiple tables involved)"))
 		}
 		// check if we already have a predicate
 		if v.OpCode != engine.VindexNone {
-			return nil, vterrors.VT12001(VindexUnsupported + " (multiple filters)")
+			panic(vterrors.VT09018(wrongWhereCond + " (multiple filters)"))
 		}
 
 		// check LHS
 		comparison, ok := e.(*sqlparser.ComparisonExpr)
 		if !ok {
-			return nil, vterrors.VT12001(VindexUnsupported + " (not a comparison)")
+			panic(vterrors.VT09018(wrongWhereCond + " (not a comparison)"))
 		}
 		if comparison.Operator != sqlparser.EqualOp && comparison.Operator != sqlparser.InOp {
-			return nil, vterrors.VT12001(VindexUnsupported + " (not equality)")
+			panic(vterrors.VT09018(wrongWhereCond + " (not equality)"))
 		}
 		colname, ok := comparison.Left.(*sqlparser.ColName)
 		if !ok {
-			return nil, vterrors.VT12001(VindexUnsupported + " (lhs is not a column)")
+			panic(vterrors.VT09018(wrongWhereCond + " (lhs is not a column)"))
 		}
 		if !colname.Name.EqualString("id") {
-			return nil, vterrors.VT12001(VindexUnsupported + " (lhs is not id)")
+			panic(vterrors.VT09018(wrongWhereCond + " (lhs is not id)"))
 		}
 
 		// check RHS
-		var err error
 		if sqlparser.IsValue(comparison.Right) || sqlparser.IsSimpleTuple(comparison.Right) {
 			v.Value = comparison.Right
 		} else {
-			return nil, vterrors.VT12001(VindexUnsupported + " (rhs is not a value)")
+			panic(vterrors.VT09018(wrongWhereCond + " (rhs is not a value)"))
 		}
-		if err != nil {
-			return nil, vterrors.VT12001(VindexUnsupported+": %v", err)
-		}
+
 		v.OpCode = engine.VindexMap
 		v.Table.Predicates = append(v.Table.Predicates, e)
 	}
-	return v, nil
+	return v
 }
 
 // TablesUsed implements the Operator interface.
 // It is not keyspace-qualified.
 func (v *Vindex) TablesUsed() []string {
 	return []string{v.Table.Table.Name.String()}
+}
+
+func (v *Vindex) ShortDescription() string {
+	return v.Vindex.String()
 }

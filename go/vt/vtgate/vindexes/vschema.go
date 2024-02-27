@@ -23,18 +23,19 @@ import (
 	"os"
 	"sort"
 	"strings"
-
-	"vitess.io/vitess/go/sqlescape"
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
-	"vitess.io/vitess/go/vt/vterrors"
+	"time"
 
 	"vitess.io/vitess/go/json2"
+	"vitess.io/vitess/go/mysql/collations"
+	"vitess.io/vitess/go/sqlescape"
 	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/vt/sqlparser"
-
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
 )
 
 // TabletTypeSuffix maps the tablet type to its suffix string.
@@ -52,6 +53,7 @@ var TabletTypeSuffix = map[topodatapb.TabletType]string{
 
 // The following constants represent table types.
 const (
+	TypeTable     = ""
 	TypeSequence  = "sequence"
 	TypeReference = "reference"
 )
@@ -61,13 +63,17 @@ const (
 type VSchema struct {
 	RoutingRules map[string]*RoutingRule `json:"routing_rules"`
 
-	// uniqueTables contains the name of all tables in all keyspaces. if the table is uniquely named, the value will
-	// be the name of the keyspace where this table exists. if multiple keyspaces have a table with the same name, the
-	// value will be a `nil` value
+	// globalTables contains the name of all tables in all keyspaces. If the
+	// table is uniquely named, the value will be the qualified Table object
+	// with the keyspace where this table exists. If multiple keyspaces have a
+	// table with the same name, the value will be a `nil`.
 	globalTables      map[string]*Table
 	uniqueVindexes    map[string]Vindex
 	Keyspaces         map[string]*KeyspaceSchema `json:"keyspaces"`
 	ShardRoutingRules map[string]string          `json:"shard_routing_rules"`
+	// created is the time when the VSchema object was created. Used to detect if a cached
+	// copy of the vschema is stale.
+	created time.Time
 }
 
 // RoutingRule represents one routing rule.
@@ -110,6 +116,20 @@ type Table struct {
 	// Source is a keyspace-qualified table name that points to the source of a
 	// reference table. Only applicable for tables with Type set to "reference".
 	Source *Source `json:"source,omitempty"`
+
+	ChildForeignKeys  []ChildFKInfo  `json:"child_foreign_keys,omitempty"`
+	ParentForeignKeys []ParentFKInfo `json:"parent_foreign_keys,omitempty"`
+
+	// index can be columns or expression.
+	// For Primary key, functional indexes are not allowed, therefore it will only be columns.
+	// MySQL error message: ERROR 3756 (HY000): The primary key cannot be a functional index
+	PrimaryKey sqlparser.Columns `json:"primary_key,omitempty"`
+	UniqueKeys []sqlparser.Exprs `json:"unique_keys,omitempty"`
+}
+
+// GetTableName gets the sqlparser.TableName for the vindex Table.
+func (t *Table) GetTableName() sqlparser.TableName {
+	return sqlparser.NewTableNameWithQualifier(t.Name.String(), t.Keyspace.Name)
 }
 
 // Keyspace contains the keyspcae info for each Table.
@@ -128,6 +148,14 @@ type ColumnVindex struct {
 	isUnique bool
 	cost     int
 	partial  bool
+	backfill bool
+}
+
+// TableInfo contains column and foreign key info for a table.
+type TableInfo struct {
+	Columns     []Column
+	ForeignKeys []*sqlparser.ForeignKeyDefinition
+	Indexes     []*sqlparser.IndexDefinition
 }
 
 // IsUnique is used to tell whether the ColumnVindex
@@ -148,47 +176,106 @@ func (c *ColumnVindex) IsPartialVindex() bool {
 	return c.partial
 }
 
+// IsBackfilling returns true if the vindex is in the process of backfilling the rows.
+func (c *ColumnVindex) IsBackfilling() bool {
+	return c.backfill
+}
+
 // Column describes a column.
 type Column struct {
 	Name          sqlparser.IdentifierCI `json:"name"`
 	Type          querypb.Type           `json:"type"`
 	CollationName string                 `json:"collation_name"`
+	Default       sqlparser.Expr         `json:"default,omitempty"`
+
+	// Invisible marks this as a column that will not be automatically included in `*` projections
+	Invisible bool  `json:"invisible,omitempty"`
+	Size      int32 `json:"size,omitempty"`
+	Scale     int32 `json:"scale,omitempty"`
+	Nullable  bool  `json:"nullable,omitempty"`
+	// Values contains the list of values for enum and set types.
+	Values []string `json:"values,omitempty"`
 }
 
 // MarshalJSON returns a JSON representation of Column.
 func (col *Column) MarshalJSON() ([]byte, error) {
-	return json.Marshal(struct {
-		Name string `json:"name"`
-		Type string `json:"type,omitempty"`
+	cj := struct {
+		Name      string `json:"name"`
+		Type      string `json:"type,omitempty"`
+		Invisible bool   `json:"invisible,omitempty"`
+		Default   string `json:"default,omitempty"`
 	}{
 		Name: col.Name.String(),
 		Type: querypb.Type_name[int32(col.Type)],
-	})
+	}
+	if col.Invisible {
+		cj.Invisible = true
+	}
+	if col.Default != nil {
+		cj.Default = sqlparser.String(col.Default)
+	}
+	return json.Marshal(cj)
+}
+
+func (col *Column) ToEvalengineType(collationEnv *collations.Environment) evalengine.Type {
+	var collation collations.ID
+	if sqltypes.IsText(col.Type) {
+		collation, _ = collationEnv.LookupID(col.CollationName)
+	} else {
+		collation = collations.CollationForType(col.Type, collationEnv.DefaultConnectionCharset())
+	}
+	return evalengine.NewTypeEx(col.Type, collation, col.Nullable, col.Size, col.Scale)
 }
 
 // KeyspaceSchema contains the schema(table) for a keyspace.
 type KeyspaceSchema struct {
-	Keyspace *Keyspace
-	Tables   map[string]*Table
-	Vindexes map[string]Vindex
-	Views    map[string]sqlparser.SelectStatement
-	Error    error
+	Keyspace       *Keyspace
+	ForeignKeyMode vschemapb.Keyspace_ForeignKeyMode
+	Tables         map[string]*Table
+	Vindexes       map[string]Vindex
+	Views          map[string]sqlparser.SelectStatement
+	Error          error
 }
 
 type ksJSON struct {
-	Sharded  bool              `json:"sharded,omitempty"`
-	Tables   map[string]*Table `json:"tables,omitempty"`
-	Vindexes map[string]Vindex `json:"vindexes,omitempty"`
-	Views    map[string]string `json:"views,omitempty"`
-	Error    string            `json:"error,omitempty"`
+	Sharded        bool              `json:"sharded,omitempty"`
+	ForeignKeyMode string            `json:"foreignKeyMode,omitempty"`
+	Tables         map[string]*Table `json:"tables,omitempty"`
+	Vindexes       map[string]Vindex `json:"vindexes,omitempty"`
+	Views          map[string]string `json:"views,omitempty"`
+	Error          string            `json:"error,omitempty"`
+}
+
+// findTable looks for the table with the requested tablename in the keyspace.
+//
+// If no table matching the requested tablename is found, and:
+//
+//   - constructUnshardedIfNotFound is not requested, than no table is returned.
+//   - constructUnshardedIfNotFound is requested, and the keyspace is
+//     unsharded, then a *Table representing that table is returned.
+func (ks *KeyspaceSchema) findTable(
+	tablename string,
+	constructUnshardedIfNotFound bool,
+) *Table {
+	table := ks.Tables[tablename]
+	if table != nil {
+		return table
+	}
+
+	if constructUnshardedIfNotFound && !ks.Keyspace.Sharded {
+		return &Table{Name: sqlparser.NewIdentifierCS(tablename), Keyspace: ks.Keyspace}
+	}
+
+	return nil
 }
 
 // MarshalJSON returns a JSON representation of KeyspaceSchema.
 func (ks *KeyspaceSchema) MarshalJSON() ([]byte, error) {
 	ksJ := ksJSON{
-		Sharded:  ks.Keyspace.Sharded,
-		Tables:   ks.Tables,
-		Vindexes: ks.Vindexes,
+		Sharded:        ks.Keyspace.Sharded,
+		Tables:         ks.Tables,
+		ForeignKeyMode: ks.ForeignKeyMode.String(),
+		Vindexes:       ks.Vindexes,
 	}
 	if ks.Error != nil {
 		ksJ.Error = ks.Error.Error()
@@ -220,26 +307,30 @@ func (source *Source) String() string {
 }
 
 // BuildVSchema builds a VSchema from a SrvVSchema.
-func BuildVSchema(source *vschemapb.SrvVSchema) (vschema *VSchema) {
+func BuildVSchema(source *vschemapb.SrvVSchema, parser *sqlparser.Parser) (vschema *VSchema) {
 	vschema = &VSchema{
 		RoutingRules:   make(map[string]*RoutingRule),
 		globalTables:   make(map[string]*Table),
 		uniqueVindexes: make(map[string]Vindex),
 		Keyspaces:      make(map[string]*KeyspaceSchema),
+		created:        time.Now(),
 	}
-	buildKeyspaces(source, vschema)
-	buildReferences(source, vschema)
+	buildKeyspaces(source, vschema, parser)
+	// buildGlobalTables before buildReferences so that buildReferences can
+	// resolve sources which reference global tables.
 	buildGlobalTables(source, vschema)
-	resolveAutoIncrement(source, vschema)
-	buildRoutingRule(source, vschema)
+	buildReferences(source, vschema)
+	buildRoutingRule(source, vschema, parser)
 	buildShardRoutingRule(source, vschema)
+	// Resolve auto-increments after routing rules are built since sequence tables also obey routing rules.
+	resolveAutoIncrement(source, vschema, parser)
 	return vschema
 }
 
 // BuildKeyspaceSchema builds the vschema portion for one keyspace.
 // The build ignores sequence references because those dependencies can
 // go cross-keyspace.
-func BuildKeyspaceSchema(input *vschemapb.Keyspace, keyspace string) (*KeyspaceSchema, error) {
+func BuildKeyspaceSchema(input *vschemapb.Keyspace, keyspace string, parser *sqlparser.Parser) (*KeyspaceSchema, error) {
 	if input == nil {
 		input = &vschemapb.Keyspace{}
 	}
@@ -253,39 +344,47 @@ func BuildKeyspaceSchema(input *vschemapb.Keyspace, keyspace string) (*KeyspaceS
 		uniqueVindexes: make(map[string]Vindex),
 		Keyspaces:      make(map[string]*KeyspaceSchema),
 	}
-	buildKeyspaces(formal, vschema)
+	buildKeyspaces(formal, vschema, parser)
 	err := vschema.Keyspaces[keyspace].Error
 	return vschema.Keyspaces[keyspace], err
 }
 
-// ValidateKeyspace ensures that the keyspace vschema is valid.
+// BuildKeyspace ensures that the keyspace vschema is valid.
 // External references (like sequence) are not validated.
-func ValidateKeyspace(input *vschemapb.Keyspace) error {
-	_, err := BuildKeyspaceSchema(input, "")
-	return err
+func BuildKeyspace(input *vschemapb.Keyspace, parser *sqlparser.Parser) (*KeyspaceSchema, error) {
+	return BuildKeyspaceSchema(input, "", parser)
 }
 
-func buildKeyspaces(source *vschemapb.SrvVSchema, vschema *VSchema) {
+func buildKeyspaces(source *vschemapb.SrvVSchema, vschema *VSchema, parser *sqlparser.Parser) {
 	for ksname, ks := range source.Keyspaces {
 		ksvschema := &KeyspaceSchema{
 			Keyspace: &Keyspace{
 				Name:    ksname,
 				Sharded: ks.Sharded,
 			},
-			Tables:   make(map[string]*Table),
-			Vindexes: make(map[string]Vindex),
+			ForeignKeyMode: replaceUnspecifiedForeignKeyMode(ks.ForeignKeyMode),
+			Tables:         make(map[string]*Table),
+			Vindexes:       make(map[string]Vindex),
 		}
 		vschema.Keyspaces[ksname] = ksvschema
-		ksvschema.Error = buildTables(ks, vschema, ksvschema)
+		ksvschema.Error = buildTables(ks, vschema, ksvschema, parser)
 	}
 }
 
-func (vschema *VSchema) AddView(ksname string, viewName, query string) error {
+// replaceUnspecifiedForeignKeyMode replaces the default value of the foreign key mode enum with the default we want to keep.
+func replaceUnspecifiedForeignKeyMode(fkMode vschemapb.Keyspace_ForeignKeyMode) vschemapb.Keyspace_ForeignKeyMode {
+	if fkMode == vschemapb.Keyspace_unspecified {
+		return vschemapb.Keyspace_unmanaged
+	}
+	return fkMode
+}
+
+func (vschema *VSchema) AddView(ksname, viewName, query string, parser *sqlparser.Parser) error {
 	ks, ok := vschema.Keyspaces[ksname]
 	if !ok {
 		return fmt.Errorf("keyspace %s not found in vschema", ksname)
 	}
-	ast, err := sqlparser.Parse(query)
+	ast, err := parser.Parse(query)
 	if err != nil {
 		return err
 	}
@@ -327,18 +426,26 @@ func buildKeyspaceGlobalTables(vschema *VSchema, ksvschema *KeyspaceSchema) {
 			if gt == nil {
 				// Table name is already marked ambiguous, nothing to do.
 				continue
-			} else if t.isReferencedInKeyspace(gt.Keyspace.Name) {
-				// If the stored table refers to this table, store this
-				// table instead.
-				vschema.globalTables[tname] = t
-			} else if gt.isReferencedInKeyspace(t.Keyspace.Name) {
-				// The source of this table is already stored. Do nothing.
-				continue
 			} else {
+				// Special handling for reference tables which specify their source.
+				if t.Type == TypeReference && t.Source != nil {
+					// If the reference table points to the already stored
+					// global table, there is no ambiguity.
+					if t.Source.Qualifier.IsEmpty() || t.Source.Qualifier.String() == gt.Keyspace.Name {
+						continue
+					}
+				}
 				// Otherwise, mark this table name ambiguous.
 				vschema.globalTables[tname] = nil
 			}
 		} else {
+			// Reference tables which define a source with the same name may be
+			// globally routable through their source, as long as the source
+			// doesn't require explicit routing.
+			if t.Type == TypeReference && t.Source != nil && t.Source.Name.String() == t.Name.String() {
+				continue
+			}
+
 			vschema.globalTables[tname] = t
 		}
 	}
@@ -363,6 +470,7 @@ func buildKeyspaceReferences(vschema *VSchema, ksvschema *KeyspaceSchema) error 
 		}
 
 		sourceKsname := source.Qualifier.String()
+		sourceTname := source.Name.String()
 
 		// Prohibit self-references.
 		if sourceKsname == keyspace.Name {
@@ -374,10 +482,32 @@ func buildKeyspaceReferences(vschema *VSchema, ksvschema *KeyspaceSchema) error 
 			)
 		}
 
-		// Validate that reference can be resolved.
-		_, sourceT, err := vschema.findKeyspaceAndTableBySource(source)
+		// Verify the reference source can be resolved.
+		sourceT, err := vschema.findTable(
+			sourceKsname,
+			sourceTname,
+			false, /* constructTableIfNotFound */
+		)
+		// Rephrase errors to be more helpful in the context of VSchema linting.
+		if err != nil {
+			if vterrors.Code(err) != vtrpcpb.Code_NOT_FOUND || vterrors.ErrState(err) != vterrors.BadDb {
+				return err
+			}
+			return vterrors.Errorf(
+				vtrpcpb.Code_NOT_FOUND,
+				"source %q references a non-existent keyspace %q",
+				source,
+				sourceKsname,
+			)
+		}
 		if sourceT == nil {
-			return err
+			return vterrors.Errorf(
+				vtrpcpb.Code_NOT_FOUND,
+				"source %q references a table %q that is not present in the VSchema of keyspace %q",
+				source,
+				sourceTname,
+				sourceKsname,
+			)
 		}
 
 		// Validate source table types.
@@ -405,8 +535,10 @@ func buildKeyspaceReferences(vschema *VSchema, ksvschema *KeyspaceSchema) error 
 		}
 		sourceT.addReferenceInKeyspace(keyspace.Name, t)
 
-		// Forbid reference chains.
-		for sourceT.Source != nil {
+		// Forbid reference chains. This is not necessarily a technical
+		// limitation. If people want this, in theory it should be possible as
+		// long as reference chains are not circular.
+		if sourceT.Source != nil {
 			chain := fmt.Sprintf("%s => %s => %s", tname, sourceT, sourceT.Source)
 
 			return vterrors.Errorf(
@@ -421,7 +553,7 @@ func buildKeyspaceReferences(vschema *VSchema, ksvschema *KeyspaceSchema) error 
 	return nil
 }
 
-func buildTables(ks *vschemapb.Keyspace, vschema *VSchema, ksvschema *KeyspaceSchema) error {
+func buildTables(ks *vschemapb.Keyspace, vschema *VSchema, ksvschema *KeyspaceSchema, parser *sqlparser.Parser) error {
 	keyspace := ksvschema.Keyspace
 	for vname, vindexInfo := range ks.Vindexes {
 		vindex, err := CreateVindex(vindexInfo.Type, vname, vindexInfo.Params)
@@ -451,7 +583,7 @@ func buildTables(ks *vschemapb.Keyspace, vschema *VSchema, ksvschema *KeyspaceSc
 			t.Type = table.Type
 		case TypeReference:
 			if table.Source != "" {
-				tableName, err := parseQualifiedTable(table.Source)
+				tableName, err := parseTable(table.Source)
 				if err != nil {
 					return vterrors.Errorf(
 						vtrpcpb.Code_INVALID_ARGUMENT,
@@ -513,8 +645,31 @@ func buildTables(ks *vschemapb.Keyspace, vschema *VSchema, ksvschema *KeyspaceSc
 					tname,
 				)
 			}
+			var colDefault sqlparser.Expr
+			if col.Default != "" {
+				var err error
+				colDefault, err = parser.ParseExpr(col.Default)
+				if err != nil {
+					return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT,
+						"could not parse the '%s' column's default expression '%s' for table '%s'", col.Name, col.Default, tname)
+				}
+			}
+			nullable := true
+			if col.Nullable != nil {
+				nullable = *col.Nullable
+			}
 			colNames[name.Lowered()] = true
-			t.Columns = append(t.Columns, Column{Name: name, Type: col.Type})
+			t.Columns = append(t.Columns, Column{
+				Name:          name,
+				Type:          col.Type,
+				CollationName: col.CollationName,
+				Default:       colDefault,
+				Invisible:     col.Invisible,
+				Size:          col.Size,
+				Scale:         col.Scale,
+				Nullable:      nullable,
+				Values:        col.Values,
+			})
 		}
 
 		// Initialize ColumnVindexes.
@@ -557,6 +712,10 @@ func buildTables(ks *vschemapb.Keyspace, vschema *VSchema, ksvschema *KeyspaceSc
 					columns = append(columns, sqlparser.NewIdentifierCI(indCol))
 				}
 			}
+			backfill := false
+			if lkpBackfill, ok := vindex.(LookupBackfill); ok {
+				backfill = lkpBackfill.IsBackfilling()
+			}
 			columnVindex := &ColumnVindex{
 				Columns:  columns,
 				Type:     vindexInfo.Type,
@@ -565,6 +724,7 @@ func buildTables(ks *vschemapb.Keyspace, vschema *VSchema, ksvschema *KeyspaceSc
 				Vindex:   vindex,
 				isUnique: vindex.IsUnique(),
 				cost:     vindex.Cost(),
+				backfill: backfill,
 			}
 			if i == 0 {
 				// Perform Primary vindex check.
@@ -617,13 +777,14 @@ func buildTables(ks *vschemapb.Keyspace, vschema *VSchema, ksvschema *KeyspaceSc
 				columnSubset := columns[:i]
 				cost++
 				columnVindex = &ColumnVindex{
-					Columns: columnSubset,
-					Type:    vindexInfo.Type,
-					Name:    ind.Name,
-					Owned:   owned,
-					Vindex:  vindex,
-					cost:    cost,
-					partial: true,
+					Columns:  columnSubset,
+					Type:     vindexInfo.Type,
+					Name:     ind.Name,
+					Owned:    owned,
+					Vindex:   vindex,
+					cost:     cost,
+					partial:  true,
+					backfill: backfill,
 				}
 				t.ColumnVindexes = append(t.ColumnVindexes, columnVindex)
 			}
@@ -646,7 +807,7 @@ func (vschema *VSchema) addTableName(t *Table) {
 	}
 }
 
-func resolveAutoIncrement(source *vschemapb.SrvVSchema, vschema *VSchema) {
+func resolveAutoIncrement(source *vschemapb.SrvVSchema, vschema *VSchema, parser *sqlparser.Parser) {
 	for ksname, ks := range source.Keyspaces {
 		ksvschema := vschema.Keyspaces[ksname]
 		for tname, table := range ks.Tables {
@@ -654,10 +815,14 @@ func resolveAutoIncrement(source *vschemapb.SrvVSchema, vschema *VSchema) {
 			if t == nil || table.AutoIncrement == nil {
 				continue
 			}
-			seqks, seqtab, err := sqlparser.ParseTable(table.AutoIncrement.Sequence)
+			seqks, seqtab, err := parser.ParseTable(table.AutoIncrement.Sequence)
 			var seq *Table
 			if err == nil {
-				seq, err = vschema.FindTable(seqks, seqtab)
+				// Ensure that sequence tables also obey routing rules.
+				seq, err = vschema.FindRoutedTable(seqks, seqtab, topodatapb.TabletType_PRIMARY)
+				if seq == nil && err == nil {
+					err = vterrors.Errorf(vtrpcpb.Code_NOT_FOUND, "table %s not found", seqtab)
+				}
 			}
 			if err != nil {
 				// Better to remove the table than to leave it partially initialized.
@@ -682,32 +847,47 @@ func resolveAutoIncrement(source *vschemapb.SrvVSchema, vschema *VSchema) {
 
 // expects table name of the form <keyspace>.<tablename>
 func escapeQualifiedTable(qualifiedTableName string) (string, error) {
-	keyspace, tableName, err := extractQualifiedTableParts(qualifiedTableName)
+	keyspace, tableName, err := extractTableParts(qualifiedTableName, false /* allowUnqualified */)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%s.%s",
-		// unescape() first in case an already escaped string was passed
-		sqlescape.EscapeID(sqlescape.UnescapeID(keyspace)),
-		sqlescape.EscapeID(sqlescape.UnescapeID(tableName))), nil
+	// unescape() first in case an already escaped string was passed
+	keyspace, err = sqlescape.EnsureEscaped(keyspace)
+	if err != nil {
+		return "", err
+	}
+	tableName, err = sqlescape.EnsureEscaped(tableName)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s.%s", keyspace, tableName), nil
 }
 
-func extractQualifiedTableParts(qualifiedTableName string) (string, string, error) {
-	// It's possible to have a database or table name with a dot in it, but that's not otherwise supported within vitess today
-	arr := strings.Split(qualifiedTableName, ".")
+func extractTableParts(tableName string, allowUnqualified bool) (string, string, error) {
+	errMsgFormat := "invalid table name: %s, it must be of the "
+	if allowUnqualified {
+		errMsgFormat = errMsgFormat + "unqualified form <table_name> or the "
+	}
+	errMsgFormat = errMsgFormat + "qualified form <keyspace_name>.<table_name> (dots are not allowed in either name)"
+
+	// It's possible to have a database or table name with a dot in it, but
+	// that's not otherwise supported within vitess today
+	arr := strings.Split(tableName, ".")
 	switch len(arr) {
+	case 1:
+		if allowUnqualified {
+			return "", arr[0], nil
+		}
 	case 2:
 		return arr[0], arr[1], nil
 	}
 	// Using fmt.Errorf instead of vterrors here because this error is always wrapped in vterrors.
-	return "", "", fmt.Errorf(
-		"invalid table name: %s, it must be of the qualified form <keyspace_name>.<table_name> (dots are not allowed in either name)",
-		qualifiedTableName,
-	)
+	return "", "", fmt.Errorf(errMsgFormat, tableName)
+
 }
 
-func parseQualifiedTable(qualifiedTableName string) (sqlparser.TableName, error) {
-	keyspace, tableName, err := extractQualifiedTableParts(qualifiedTableName)
+func parseTable(tableName string) (sqlparser.TableName, error) {
+	keyspace, tableName, err := extractTableParts(tableName, true /* allowUnqualified */)
 	if err != nil {
 		return sqlparser.TableName{}, err
 	}
@@ -717,7 +897,7 @@ func parseQualifiedTable(qualifiedTableName string) (sqlparser.TableName, error)
 	}, nil
 }
 
-func buildRoutingRule(source *vschemapb.SrvVSchema, vschema *VSchema) {
+func buildRoutingRule(source *vschemapb.SrvVSchema, vschema *VSchema, parser *sqlparser.Parser) {
 	var err error
 	if source.RoutingRules == nil {
 		return
@@ -760,7 +940,7 @@ outer:
 				continue outer
 			}
 
-			toKeyspace, toTableName, err := sqlparser.ParseTable(toTable)
+			toKeyspace, toTableName, err := parser.ParseTable(toTable)
 
 			if err != nil {
 				vschema.RoutingRules[rule.FromTable] = &RoutingRule{
@@ -810,57 +990,92 @@ func buildShardRoutingRule(source *vschemapb.SrvVSchema, vschema *VSchema) {
 // valid and belonging to that keyspace.
 // FindTable bypasses routing rules and returns at most one table.
 func (vschema *VSchema) FindTable(keyspace, tablename string) (*Table, error) {
-	t, err := vschema.findTable(keyspace, tablename)
-	if err != nil {
-		return nil, err
+	table, err := vschema.findTable(
+		keyspace,
+		tablename,
+		true, /* constructUnshardedIfNotFound */
+	)
+
+	if table != nil || err != nil {
+		return table, err
 	}
-	if t == nil {
-		return nil, vterrors.NewErrorf(
-			vtrpcpb.Code_NOT_FOUND,
-			vterrors.UnknownTable,
-			"table %s not found",
+
+	return nil, vterrors.NewErrorf(
+		vtrpcpb.Code_NOT_FOUND,
+		vterrors.UnknownTable,
+		"table %s not found",
+		tablename,
+	)
+}
+
+// findGlobalTable looks for a table that is uniquely named across all
+// keyspaces.
+//
+// If multiple tables with the requested tablename are found, an error
+// indicating this ambiguity is returned.
+//
+// If no table matching requested table name is found, and:
+//
+//   - constructUnshardedIfNotFound is not requested, than no table is returned.
+//   - constructUnshardedIfNotFound is requested, and there is only one keyspace,
+//     and that keyspace is unsharded, then a *Table representing that table is
+//     returned.
+func (vschema *VSchema) findGlobalTable(
+	tablename string,
+	constructUnshardedIfNotFound bool,
+) (*Table, error) {
+	if len(vschema.Keyspaces) == 1 {
+		for _, ks := range vschema.Keyspaces {
+			table := ks.findTable(tablename, constructUnshardedIfNotFound)
+			return table, nil
+		}
+	}
+
+	table, ok := vschema.globalTables[tablename]
+
+	if table != nil {
+		return table, nil
+	}
+
+	if ok {
+		return nil, vterrors.Errorf(
+			vtrpcpb.Code_FAILED_PRECONDITION,
+			"ambiguous table reference: %s",
 			tablename,
 		)
 	}
-	return t, nil
+
+	return nil, nil
 }
 
-// findTable is like FindTable, but does not return an error if a table is not found.
-func (vschema *VSchema) findTable(keyspace, tablename string) (*Table, error) {
+// findTable looks for a keyspace matching the provided keyspace, and then
+// looks for a table in that keyspace using the provided tablename.
+//
+// If the requested keyspace is "", then (*VSchema).findGlobalTable is used to
+// find a global table.
+//
+// Otherwise:
+//
+//   - If no matching keyspace is found, an error is returned.
+//   - If a matching keyspace is found, (*Keyspace).findTable is used to find a
+//     matching table.
+//
+// constructUnshardedIfNotFound is passed to (*VSchema).findGlobalTable or
+// (*Keyspace).findTable, and is used to construct a *Table representing a
+// table present in an unsharded keyspace but not defined in the vschema.
+func (vschema *VSchema) findTable(
+	keyspace,
+	tablename string,
+	constructUnshardedIfNotFound bool,
+) (*Table, error) {
 	if keyspace == "" {
-		t, ok := vschema.globalTables[tablename]
-		if t == nil {
-			if ok {
-				return nil, vterrors.Errorf(
-					vtrpcpb.Code_FAILED_PRECONDITION,
-					"ambiguous table reference: %s",
-					tablename,
-				)
-			}
-			if len(vschema.Keyspaces) != 1 {
-				return nil, nil
-			}
-			// Loop happens only once.
-			for _, ks := range vschema.Keyspaces {
-				if ks.Keyspace.Sharded {
-					return nil, nil
-				}
-				return &Table{Name: sqlparser.NewIdentifierCS(tablename), Keyspace: ks.Keyspace}, nil
-			}
-		}
-		keyspace = t.Keyspace.Name
+		return vschema.findGlobalTable(tablename, constructUnshardedIfNotFound)
 	}
 	ks, ok := vschema.Keyspaces[keyspace]
 	if !ok {
 		return nil, vterrors.VT05003(keyspace)
 	}
-	table := ks.Tables[tablename]
-	if table == nil {
-		if ks.Keyspace.Sharded {
-			return nil, nil
-		}
-		return &Table{Name: sqlparser.NewIdentifierCS(tablename), Keyspace: ks.Keyspace}, nil
-	}
+	table := ks.findTable(tablename, constructUnshardedIfNotFound)
 	return table, nil
 }
 
@@ -901,7 +1116,11 @@ func (vschema *VSchema) FindRoutedTable(keyspace, tablename string, tabletType t
 			return rr.Tables[0], nil
 		}
 	}
-	return vschema.findTable(keyspace, tablename)
+	return vschema.findTable(
+		keyspace,
+		tablename,
+		true, /* constructUnshardedTableIfNotFound */
+	)
 }
 
 // FindTableOrVindex finds a table or a Vindex by name using Find and FindVindex.
@@ -965,33 +1184,6 @@ func (vschema *VSchema) FindView(keyspace, name string) sqlparser.SelectStatemen
 	return statement
 }
 
-func (vschema *VSchema) findKeyspaceAndTableBySource(source *Source) (*Keyspace, *Table, error) {
-	sourceKsname := source.Qualifier.String()
-	sourceTname := source.Name.String()
-
-	sourceKs, ok := vschema.Keyspaces[sourceKsname]
-	if !ok {
-		return nil, nil, vterrors.NewErrorf(
-			vtrpcpb.Code_NOT_FOUND,
-			vterrors.BadDb,
-			"source %q references a non-existent keyspace %q",
-			source,
-			sourceKsname,
-		)
-	}
-
-	sourceT, ok := sourceKs.Tables[sourceTname]
-	if !ok {
-		return sourceKs.Keyspace, nil, vterrors.NewErrorf(
-			vtrpcpb.Code_NOT_FOUND,
-			vterrors.UnknownTable,
-			"source %q references a table %q that is not present in the VSchema of keyspace %q", source, sourceTname, sourceKsname,
-		)
-	}
-
-	return sourceKs.Keyspace, sourceT, nil
-}
-
 // NotFoundError represents the error where the table name was not found
 type NotFoundError struct {
 	TableName string
@@ -1037,6 +1229,17 @@ func (vschema *VSchema) FindRoutedShard(keyspace, shard string) (string, error) 
 		return ks, nil
 	}
 	return keyspace, nil
+}
+
+// GetCreated returns the time when the VSchema was created.
+func (vschema *VSchema) GetCreated() time.Time {
+	return vschema.created
+}
+
+// ResetCreated resets the created time to zero value.
+// Used only in tests where vschema protos are compared.
+func (vschema *VSchema) ResetCreated() {
+	vschema.created = time.Time{}
 }
 
 // ByCost provides the interface needed for ColumnVindexes to
@@ -1088,11 +1291,12 @@ func LoadFormalKeyspace(filename string) (*vschemapb.Keyspace, error) {
 	return formal, nil
 }
 
-// ChooseVindexForType chooses the most appropriate vindex for the give type.
+// ChooseVindexForType chooses the most appropriate vindex type for
+// the given SQL data type.
 func ChooseVindexForType(typ querypb.Type) (string, error) {
 	switch {
 	case sqltypes.IsIntegral(typ):
-		return "hash", nil
+		return "xxhash", nil
 	case sqltypes.IsText(typ):
 		return "unicode_loose_md5", nil
 	case sqltypes.IsBinary(typ):
@@ -1197,8 +1401,4 @@ func (t *Table) getReferenceInKeyspace(keyspace string) *Table {
 		return nil
 	}
 	return t
-}
-
-func (t *Table) isReferencedInKeyspace(keyspace string) bool {
-	return t.getReferenceInKeyspace(keyspace) != nil
 }

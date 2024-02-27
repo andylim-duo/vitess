@@ -25,22 +25,27 @@ import (
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/vtenv"
 )
 
 // TestInitTabletShardConversion makes sure InitTablet converts the
 // shard name to lower case when it's a keyrange, and populates
 // KeyRange properly.
 func TestInitTabletShardConversion(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	cell := "cell1"
-	ts := memorytopo.NewServer(cell)
-	wr := New(logutil.NewConsoleLogger(), ts, nil)
+	ts := memorytopo.NewServer(ctx, cell)
+	wr := New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, nil)
 
 	tablet := &topodatapb.Tablet{
 		Alias: &topodatapb.TabletAlias{
 			Cell: cell,
 			Uid:  1,
 		},
-		Shard: "80-C0",
+		Keyspace: "test",
+		Shard:    "80-C0",
 	}
 
 	if err := wr.TopoServer().InitTablet(context.Background(), tablet, false /*allowPrimaryOverride*/, true /*createShardAndKeyspace*/, false /*allowUpdate*/); err != nil {
@@ -61,16 +66,20 @@ func TestInitTabletShardConversion(t *testing.T) {
 
 // TestDeleteTabletBasic tests delete of non-primary tablet
 func TestDeleteTabletBasic(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	cell := "cell1"
-	ts := memorytopo.NewServer(cell)
-	wr := New(logutil.NewConsoleLogger(), ts, nil)
+	ts := memorytopo.NewServer(ctx, cell)
+	wr := New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, nil)
 
 	tablet := &topodatapb.Tablet{
 		Alias: &topodatapb.TabletAlias{
 			Cell: cell,
 			Uid:  1,
 		},
-		Shard: "0",
+		Shard:    "0",
+		Keyspace: "test",
 	}
 
 	if err := wr.TopoServer().InitTablet(context.Background(), tablet, false /*allowPrimaryOverride*/, true /*createShardAndKeyspace*/, false /*allowUpdate*/); err != nil {
@@ -89,9 +98,12 @@ func TestDeleteTabletBasic(t *testing.T) {
 // TestDeleteTabletTruePrimary tests that you can delete a true primary tablet
 // only if allowPrimary is set to true
 func TestDeleteTabletTruePrimary(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	cell := "cell1"
-	ts := memorytopo.NewServer(cell)
-	wr := New(logutil.NewConsoleLogger(), ts, nil)
+	ts := memorytopo.NewServer(ctx, cell)
+	wr := New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, nil)
 
 	tablet := &topodatapb.Tablet{
 		Alias: &topodatapb.TabletAlias{
@@ -133,9 +145,12 @@ func TestDeleteTabletTruePrimary(t *testing.T) {
 // TestDeleteTabletFalsePrimary tests that you can delete a false primary tablet
 // with allowPrimary set to false
 func TestDeleteTabletFalsePrimary(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	cell := "cell1"
-	ts := memorytopo.NewServer(cell)
-	wr := New(logutil.NewConsoleLogger(), ts, nil)
+	ts := memorytopo.NewServer(ctx, cell)
+	wr := New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, nil)
 
 	tablet1 := &topodatapb.Tablet{
 		Alias: &topodatapb.TabletAlias{
@@ -182,9 +197,12 @@ func TestDeleteTabletFalsePrimary(t *testing.T) {
 // TestDeleteTabletShardNonExisting tests that you can delete a true primary
 // tablet if a shard does not exists anymore.
 func TestDeleteTabletShardNonExisting(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	cell := "cell1"
-	ts := memorytopo.NewServer(cell)
-	wr := New(logutil.NewConsoleLogger(), ts, nil)
+	ts := memorytopo.NewServer(ctx, cell)
+	wr := New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, nil)
 
 	tablet := &topodatapb.Tablet{
 		Alias: &topodatapb.TabletAlias{

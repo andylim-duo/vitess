@@ -27,32 +27,32 @@ import (
 	"sync/atomic"
 	"time"
 
-	"google.golang.org/protobuf/proto"
-
-	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/constants/sidecar"
+	"vitess.io/vitess/go/mysql/sqlerror"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/binlog/binlogplayer"
 	"vitess.io/vitess/go/vt/dbconfigs"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/mysqlctl"
-	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
-	querypb "vitess.io/vitess/go/vt/proto/query"
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
+
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
 const (
-	reshardingJournalTableName = "_vt.resharding_journal"
-	vreplicationTableName      = "_vt.vreplication"
-	copyStateTableName         = "_vt.copy_state"
-	postCopyActionTableName    = "_vt.post_copy_action"
+	reshardingJournalTableName = "resharding_journal"
+	vreplicationTableName      = "vreplication"
+	copyStateTableName         = "copy_state"
+	postCopyActionTableName    = "post_copy_action"
 
-	maxRows                      = 10000
-	throttlerVReplicationAppName = "vreplication"
-	throttlerOnlineDDLAppName    = "online-ddl"
+	maxRows = 10000
 )
 
 const (
@@ -72,7 +72,7 @@ var waitRetryTime = 1 * time.Second
 // How frequently vcopier will update _vt.vreplication rows_copied
 var rowsCopiedUpdateInterval = 30 * time.Second
 
-// How frequntly vcopier will garbage collect old copy_state rows.
+// How frequently vcopier will garbage collect old copy_state rows.
 // By default, do it in between every 2nd and 3rd rows copied update.
 var copyStateGCInterval = (rowsCopiedUpdateInterval * 3) - (rowsCopiedUpdateInterval / 2)
 
@@ -107,10 +107,12 @@ type Engine struct {
 	throttlerClient *throttle.Client
 
 	// This should only be set in Test Engines in order to short
-	// curcuit functions as needed in unit tests. It's automatically
+	// circuit functions as needed in unit tests. It's automatically
 	// enabled in NewSimpleTestEngine. This should NOT be used in
 	// production.
 	shortcircuit bool
+
+	env *vtenv.Environment
 }
 
 type journalEvent struct {
@@ -127,15 +129,16 @@ type PostCopyAction struct {
 
 // NewEngine creates a new Engine.
 // A nil ts means that the Engine is disabled.
-func NewEngine(config *tabletenv.TabletConfig, ts *topo.Server, cell string, mysqld mysqlctl.MysqlDaemon, lagThrottler *throttle.Throttler) *Engine {
+func NewEngine(env *vtenv.Environment, config *tabletenv.TabletConfig, ts *topo.Server, cell string, mysqld mysqlctl.MysqlDaemon, lagThrottler *throttle.Throttler) *Engine {
 	vre := &Engine{
+		env:             env,
 		controllers:     make(map[int32]*controller),
 		ts:              ts,
 		cell:            cell,
 		mysqld:          mysqld,
 		journaler:       make(map[string]*journalEvent),
-		ec:              newExternalConnector(config.ExternalConnections),
-		throttlerClient: throttle.NewBackgroundClient(lagThrottler, throttlerVReplicationAppName, throttle.ThrottleCheckPrimaryWrite),
+		ec:              newExternalConnector(env, config.ExternalConnections),
+		throttlerClient: throttle.NewBackgroundClient(lagThrottler, throttlerapp.VReplicationName, throttle.ThrottleCheckPrimaryWrite),
 	}
 
 	return vre
@@ -143,22 +146,24 @@ func NewEngine(config *tabletenv.TabletConfig, ts *topo.Server, cell string, mys
 
 // InitDBConfig should be invoked after the db name is computed.
 func (vre *Engine) InitDBConfig(dbcfgs *dbconfigs.DBConfigs) {
-	// If we're already initilized, it's a test engine. Ignore the call.
+	// If we're already initialized, it's a test engine. Ignore the call.
 	if vre.dbClientFactoryFiltered != nil && vre.dbClientFactoryDba != nil {
 		return
 	}
 	vre.dbClientFactoryFiltered = func() binlogplayer.DBClient {
-		return binlogplayer.NewDBClient(dbcfgs.FilteredWithDB())
+		return binlogplayer.NewDBClient(dbcfgs.FilteredWithDB(), vre.env.Parser())
 	}
 	vre.dbClientFactoryDba = func() binlogplayer.DBClient {
-		return binlogplayer.NewDBClient(dbcfgs.DbaWithDB())
+		return binlogplayer.NewDBClient(dbcfgs.DbaWithDB(), vre.env.Parser())
 	}
 	vre.dbName = dbcfgs.DBName
 }
 
 // NewTestEngine creates a new Engine for testing.
 func NewTestEngine(ts *topo.Server, cell string, mysqld mysqlctl.MysqlDaemon, dbClientFactoryFiltered func() binlogplayer.DBClient, dbClientFactoryDba func() binlogplayer.DBClient, dbname string, externalConfig map[string]*dbconfigs.DBConfigs) *Engine {
+	env := vtenv.NewTestEnv()
 	vre := &Engine{
+		env:                     env,
 		controllers:             make(map[int32]*controller),
 		ts:                      ts,
 		cell:                    cell,
@@ -167,15 +172,17 @@ func NewTestEngine(ts *topo.Server, cell string, mysqld mysqlctl.MysqlDaemon, db
 		dbClientFactoryDba:      dbClientFactoryDba,
 		dbName:                  dbname,
 		journaler:               make(map[string]*journalEvent),
-		ec:                      newExternalConnector(externalConfig),
+		ec:                      newExternalConnector(env, externalConfig),
 	}
 	return vre
 }
 
 // NewSimpleTestEngine creates a new Engine for testing that can
-// also short curcuit functions as needed.
+// also short circuit functions as needed.
 func NewSimpleTestEngine(ts *topo.Server, cell string, mysqld mysqlctl.MysqlDaemon, dbClientFactoryFiltered func() binlogplayer.DBClient, dbClientFactoryDba func() binlogplayer.DBClient, dbname string, externalConfig map[string]*dbconfigs.DBConfigs) *Engine {
+	env := vtenv.NewTestEnv()
 	vre := &Engine{
+		env:                     env,
 		controllers:             make(map[int32]*controller),
 		ts:                      ts,
 		cell:                    cell,
@@ -184,7 +191,7 @@ func NewSimpleTestEngine(ts *topo.Server, cell string, mysqld mysqlctl.MysqlDaem
 		dbClientFactoryDba:      dbClientFactoryDba,
 		dbName:                  dbname,
 		journaler:               make(map[string]*journalEvent),
-		ec:                      newExternalConnector(externalConfig),
+		ec:                      newExternalConnector(env, externalConfig),
 		shortcircuit:            true,
 	}
 	return vre
@@ -221,7 +228,6 @@ func (vre *Engine) Open(ctx context.Context) {
 }
 
 func (vre *Engine) openLocked(ctx context.Context) error {
-
 	rows, err := vre.readAllRows(ctx)
 	if err != nil {
 		return err
@@ -263,7 +269,7 @@ func (vre *Engine) retry(ctx context.Context, err error) {
 		}
 		if err := vre.openLocked(ctx); err == nil {
 			// Don't invoke cancelRetry because openLocked
-			// will hold on to this context for later cancelation.
+			// will hold on to this context for later cancellation.
 			vre.cancelRetry = nil
 			vre.mu.Unlock()
 			return
@@ -318,7 +324,6 @@ func (vre *Engine) Close() {
 	// Wait for long-running functions to exit.
 	vre.wg.Wait()
 
-	vre.mysqld.DisableBinlogPlayback()
 	vre.isOpen = false
 
 	vre.updateStats()
@@ -364,7 +369,7 @@ func (vre *Engine) exec(query string, runAsAdmin bool) (*sqltypes.Result, error)
 	}
 	defer vre.updateStats()
 
-	plan, err := buildControllerPlan(query)
+	plan, err := buildControllerPlan(query, vre.env.Parser())
 	if err != nil {
 		return nil, err
 	}
@@ -378,10 +383,12 @@ func (vre *Engine) exec(query string, runAsAdmin bool) (*sqltypes.Result, error)
 	// Change the database to ensure that these events don't get
 	// replicated by another vreplication. This can happen when
 	// we reverse replication.
-	if _, err := dbClient.ExecuteFetch("use _vt", 1); err != nil {
+	if _, err := dbClient.ExecuteFetch(fmt.Sprintf("use %s", sidecar.GetIdentifier()), 1); err != nil {
 		return nil, err
 	}
 
+	stats := binlogplayer.NewStats()
+	defer stats.Stop()
 	switch plan.opcode {
 	case insertQuery:
 		qr, err := dbClient.ExecuteFetch(plan.query, 1)
@@ -396,7 +403,7 @@ func (vre *Engine) exec(query string, runAsAdmin bool) (*sqltypes.Result, error)
 			return nil, fmt.Errorf("insert id %v out of range", qr.InsertID)
 		}
 
-		vdbc := newVDBClient(dbClient, binlogplayer.NewStats())
+		vdbc := newVDBClient(dbClient, stats)
 
 		// If we are creating multiple streams, for example in a
 		// merge workflow going from 2 shards to 1 shard, we
@@ -455,7 +462,7 @@ func (vre *Engine) exec(query string, runAsAdmin bool) (*sqltypes.Result, error)
 		if err != nil {
 			return nil, err
 		}
-		vdbc := newVDBClient(dbClient, binlogplayer.NewStats())
+		vdbc := newVDBClient(dbClient, stats)
 		for _, id := range ids {
 			params, err := readRow(dbClient, id)
 			if err != nil {
@@ -482,7 +489,7 @@ func (vre *Engine) exec(query string, runAsAdmin bool) (*sqltypes.Result, error)
 			return &sqltypes.Result{}, nil
 		}
 		// Stop and delete the current controllers.
-		vdbc := newVDBClient(dbClient, binlogplayer.NewStats())
+		vdbc := newVDBClient(dbClient, stats)
 		for _, id := range ids {
 			if ct := vre.controllers[id]; ct != nil {
 				ct.Stop()
@@ -524,7 +531,7 @@ func (vre *Engine) exec(query string, runAsAdmin bool) (*sqltypes.Result, error)
 		}
 		return qr, nil
 	case selectQuery, reshardingJournalQuery:
-		// select and resharding journal queries are passed through.
+		// Selects and resharding journal queries are passed through.
 		return dbClient.ExecuteFetch(plan.query, maxRows)
 	}
 	panic("unreachable")
@@ -680,13 +687,13 @@ func (vre *Engine) transitionJournal(je *journalEvent) {
 	var newids []int32
 	for _, shard := range shardGTIDs {
 		sgtid := je.shardGTIDs[shard]
-		bls := proto.Clone(vre.controllers[refid].source).(*binlogdatapb.BinlogSource)
+		bls := vre.controllers[refid].source.CloneVT()
 		bls.Keyspace, bls.Shard = sgtid.Keyspace, sgtid.Shard
 
 		workflowType, _ := strconv.ParseInt(params["workflow_type"], 10, 32)
 		workflowSubType, _ := strconv.ParseInt(params["workflow_sub_type"], 10, 32)
 		deferSecondaryKeys, _ := strconv.ParseBool(params["defer_secondary_keys"])
-		ig := NewInsertGenerator(binlogplayer.BlpRunning, vre.dbName)
+		ig := NewInsertGenerator(binlogdatapb.VReplicationWorkflowState_Running, vre.dbName)
 		ig.AddRow(params["workflow"], bls, sgtid.Gtid, params["cell"], params["tablet_types"],
 			binlogdatapb.VReplicationWorkflowType(workflowType), binlogdatapb.VReplicationWorkflowSubType(workflowSubType), deferSecondaryKeys)
 		qr, err := dbClient.ExecuteFetch(ig.String(), maxRows)
@@ -781,7 +788,7 @@ func (vre *Engine) WaitForPos(ctx context.Context, id int32, pos string) error {
 			// The full error we get back from MySQL in that case is:
 			// Deadlock found when trying to get lock; try restarting transaction (errno 1213) (sqlstate 40001)
 			// Docs: https://dev.mysql.com/doc/mysql-errors/en/server-error-reference.html#error_er_lock_deadlock
-			if sqlErr, ok := err.(*mysql.SQLError); ok && sqlErr.Number() == mysql.ERLockDeadlock {
+			if sqlErr, ok := err.(*sqlerror.SQLError); ok && sqlErr.Number() == sqlerror.ERLockDeadlock {
 				log.Infof("Deadlock detected waiting for pos %s: %v; will retry", pos, err)
 			} else {
 				return err
@@ -792,7 +799,7 @@ func (vre *Engine) WaitForPos(ctx context.Context, id int32, pos string) error {
 			return fmt.Errorf("unexpected result: %v", qr)
 		}
 
-		// When err is not nil then we got a retryable error and will loop again
+		// When err is not nil then we got a retryable error and will loop again.
 		if err == nil {
 			current, dcerr := binlogplayer.DecodePosition(qr.Rows[0][0].ToString())
 			if dcerr != nil {
@@ -804,7 +811,7 @@ func (vre *Engine) WaitForPos(ctx context.Context, id int32, pos string) error {
 				return nil
 			}
 
-			if qr.Rows[0][1].ToString() == binlogplayer.BlpStopped {
+			if qr.Rows[0][1].ToString() == binlogdatapb.VReplicationWorkflowState_Stopped.String() {
 				return fmt.Errorf("replication has stopped at %v before reaching position %v, message: %s", current, mPos, qr.Rows[0][2].ToString())
 			}
 		}
@@ -847,7 +854,7 @@ func (vre *Engine) readAllRows(ctx context.Context) ([]map[string]string, error)
 		return nil, err
 	}
 	defer dbClient.Close()
-	qr, err := dbClient.ExecuteFetch(fmt.Sprintf("select * from _vt.vreplication where db_name=%v", encodeString(vre.dbName)), maxRows)
+	qr, err := dbClient.ExecuteFetch(fmt.Sprintf("select * from _vt.vreplication where db_name=%s", encodeString(vre.dbName)), maxRows)
 	if err != nil {
 		return nil, err
 	}

@@ -17,177 +17,375 @@ limitations under the License.
 package operators
 
 import (
-	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
 
-	"vitess.io/vitess/go/vt/vtgate/planbuilder/operators/ops"
-
+	"vitess.io/vitess/go/slice"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 )
 
-// ApplyJoin is a nested loop join - for each row on the LHS,
-// we'll execute the plan on the RHS, feeding data from left to right
-type ApplyJoin struct {
-	LHS, RHS ops.Operator
+type (
+	// ApplyJoin is a nested loop join - for each row on the LHS,
+	// we'll execute the plan on the RHS, feeding data from left to right
+	ApplyJoin struct {
+		LHS, RHS Operator
 
-	// Columns stores the column indexes of the columns coming from the left and right side
-	// negative value comes from LHS and positive from RHS
-	Columns []int
+		// LeftJoin will be true in the case of an outer join
+		LeftJoin bool
 
-	// ColumnsAST keeps track of what AST expression is represented in the Columns array
-	ColumnsAST []sqlparser.Expr
+		// JoinColumns keeps track of what AST expression is represented in the Columns array
+		JoinColumns *applyJoinColumns
 
-	// Vars are the arguments that need to be copied from the LHS to the RHS
-	Vars map[string]int
+		// JoinPredicates are join predicates that have been broken up into left hand side and right hand side parts.
+		JoinPredicates *applyJoinColumns
 
-	// LeftJoin will be true in the case of an outer join
-	LeftJoin bool
+		// ExtraVars are columns we need to copy from left to right not needed by any predicates or projections,
+		// these are needed by other operators further down the right hand side of the join
+		ExtraLHSVars []BindVarExpr
 
-	// JoinCols are the columns from the LHS used for the join.
-	// These are the same columns pushed on the LHS that are now used in the Vars field
-	LHSColumns []*sqlparser.ColName
+		// After offset planning
 
-	Predicate sqlparser.Expr
-}
+		// Columns stores the column indexes of the columns coming from the left and right side
+		// negative value comes from LHS and positive from RHS
+		Columns []int
 
-var _ ops.PhysicalOperator = (*ApplyJoin)(nil)
-
-func NewApplyJoin(lhs, rhs ops.Operator, predicate sqlparser.Expr, leftOuterJoin bool) *ApplyJoin {
-	return &ApplyJoin{
-		LHS:       lhs,
-		RHS:       rhs,
-		Vars:      map[string]int{},
-		Predicate: predicate,
-		LeftJoin:  leftOuterJoin,
+		// Vars are the arguments that need to be copied from the LHS to the RHS
+		Vars map[string]int
 	}
-}
 
-// IPhysical implements the PhysicalOperator interface
-func (a *ApplyJoin) IPhysical() {}
+	// applyJoinColumn is where we store information about columns passing through the join operator
+	// It can be in one of three possible configurations:
+	//   - Pure left
+	//     We are projecting a column that comes from the left. The RHSExpr will be nil for these
+	//   - Pure right
+	//     We are projecting a column that comes from the right. The LHSExprs will be empty for these
+	//   - Mix of data from left and right
+	//     Here we need to transmit columns from the LHS to the RHS,
+	//     so they can be used for the result of this expression that is using data from both sides.
+	//     All fields will be used for these
+	applyJoinColumn struct {
+		Original sqlparser.Expr // this is the original expression being passed through
+		LHSExprs []BindVarExpr
+		RHSExpr  sqlparser.Expr
+		GroupBy  bool // if this is true, we need to push this down to our inputs with addToGroupBy set to true
+	}
+
+	// BindVarExpr is an expression needed from one side of a join/subquery, and the argument name for it.
+	// TODO: Do we really need to store the name here? it could be found in the semantic state instead
+	BindVarExpr struct {
+		Name string
+		Expr sqlparser.Expr
+	}
+)
+
+func NewApplyJoin(ctx *plancontext.PlanningContext, lhs, rhs Operator, predicate sqlparser.Expr, leftOuterJoin bool) *ApplyJoin {
+	aj := &ApplyJoin{
+		LHS:            lhs,
+		RHS:            rhs,
+		Vars:           map[string]int{},
+		LeftJoin:       leftOuterJoin,
+		JoinColumns:    &applyJoinColumns{},
+		JoinPredicates: &applyJoinColumns{},
+	}
+	aj.AddJoinPredicate(ctx, predicate)
+	return aj
+}
 
 // Clone implements the Operator interface
-func (a *ApplyJoin) Clone(inputs []ops.Operator) ops.Operator {
-	return &ApplyJoin{
-		LHS:        inputs[0],
-		RHS:        inputs[1],
-		Columns:    slices.Clone(a.Columns),
-		ColumnsAST: slices.Clone(a.ColumnsAST),
-		Vars:       maps.Clone(a.Vars),
-		LeftJoin:   a.LeftJoin,
-		Predicate:  sqlparser.CloneExpr(a.Predicate),
-		LHSColumns: slices.Clone(a.LHSColumns),
-	}
+func (aj *ApplyJoin) Clone(inputs []Operator) Operator {
+	kopy := *aj
+	kopy.LHS = inputs[0]
+	kopy.RHS = inputs[1]
+	kopy.Columns = slices.Clone(aj.Columns)
+	kopy.JoinColumns = aj.JoinColumns.clone()
+	kopy.JoinPredicates = aj.JoinPredicates.clone()
+	kopy.Vars = maps.Clone(aj.Vars)
+	kopy.ExtraLHSVars = slices.Clone(aj.ExtraLHSVars)
+	return &kopy
 }
 
-func (a *ApplyJoin) AddPredicate(ctx *plancontext.PlanningContext, expr sqlparser.Expr) (ops.Operator, error) {
-	return AddPredicate(a, ctx, expr, false, newFilter)
+func (aj *ApplyJoin) AddPredicate(ctx *plancontext.PlanningContext, expr sqlparser.Expr) Operator {
+	return AddPredicate(ctx, aj, expr, false, newFilterSinglePredicate)
 }
 
 // Inputs implements the Operator interface
-func (a *ApplyJoin) Inputs() []ops.Operator {
-	return []ops.Operator{a.LHS, a.RHS}
+func (aj *ApplyJoin) Inputs() []Operator {
+	return []Operator{aj.LHS, aj.RHS}
 }
 
-var _ JoinOp = (*ApplyJoin)(nil)
-
-func (a *ApplyJoin) GetLHS() ops.Operator {
-	return a.LHS
+// SetInputs implements the Operator interface
+func (aj *ApplyJoin) SetInputs(inputs []Operator) {
+	aj.LHS, aj.RHS = inputs[0], inputs[1]
 }
 
-func (a *ApplyJoin) GetRHS() ops.Operator {
-	return a.RHS
+func (aj *ApplyJoin) GetLHS() Operator {
+	return aj.LHS
 }
 
-func (a *ApplyJoin) SetLHS(operator ops.Operator) {
-	a.LHS = operator
+func (aj *ApplyJoin) GetRHS() Operator {
+	return aj.RHS
 }
 
-func (a *ApplyJoin) SetRHS(operator ops.Operator) {
-	a.RHS = operator
+func (aj *ApplyJoin) SetLHS(operator Operator) {
+	aj.LHS = operator
 }
 
-func (a *ApplyJoin) MakeInner() {
-	a.LeftJoin = false
+func (aj *ApplyJoin) SetRHS(operator Operator) {
+	aj.RHS = operator
 }
 
-func (a *ApplyJoin) IsInner() bool {
-	return !a.LeftJoin
+func (aj *ApplyJoin) MakeInner() {
+	aj.LeftJoin = false
 }
 
-func (a *ApplyJoin) AddJoinPredicate(ctx *plancontext.PlanningContext, expr sqlparser.Expr) error {
-	bvName, cols, predicate, err := BreakExpressionInLHSandRHS(ctx, expr, TableID(a.LHS))
-	if err != nil {
-		return err
+func (aj *ApplyJoin) IsInner() bool {
+	return !aj.LeftJoin
+}
+
+func (aj *ApplyJoin) AddJoinPredicate(ctx *plancontext.PlanningContext, expr sqlparser.Expr) {
+	if expr == nil {
+		return
 	}
-	for i, col := range cols {
-		offset, err := a.LHS.AddColumn(ctx, col)
-		if err != nil {
-			return err
+	col := breakExpressionInLHSandRHSForApplyJoin(ctx, expr, TableID(aj.LHS))
+	aj.JoinPredicates.add(col)
+	rhs := aj.RHS.AddPredicate(ctx, col.RHSExpr)
+	aj.RHS = rhs
+}
+
+func (aj *ApplyJoin) GetColumns(*plancontext.PlanningContext) []*sqlparser.AliasedExpr {
+	return slice.Map(aj.JoinColumns.columns, func(from applyJoinColumn) *sqlparser.AliasedExpr {
+		return aeWrap(from.Original)
+	})
+}
+
+func (aj *ApplyJoin) GetSelectExprs(ctx *plancontext.PlanningContext) sqlparser.SelectExprs {
+	return transformColumnsToSelectExprs(ctx, aj)
+}
+
+func (aj *ApplyJoin) GetOrdering(ctx *plancontext.PlanningContext) []OrderBy {
+	return aj.LHS.GetOrdering(ctx)
+}
+
+func joinColumnToExpr(column applyJoinColumn) sqlparser.Expr {
+	return column.Original
+}
+
+func (aj *ApplyJoin) getJoinColumnFor(ctx *plancontext.PlanningContext, orig *sqlparser.AliasedExpr, e sqlparser.Expr, addToGroupBy bool) (col applyJoinColumn) {
+	defer func() {
+		col.Original = orig.Expr
+	}()
+	lhs := TableID(aj.LHS)
+	rhs := TableID(aj.RHS)
+	both := lhs.Merge(rhs)
+	deps := ctx.SemTable.RecursiveDeps(e)
+	col.GroupBy = addToGroupBy
+
+	switch {
+	case deps.IsSolvedBy(lhs):
+		col.LHSExprs = []BindVarExpr{{Expr: e}}
+	case deps.IsSolvedBy(rhs):
+		col.RHSExpr = e
+	case deps.IsSolvedBy(both):
+		col = breakExpressionInLHSandRHSForApplyJoin(ctx, e, TableID(aj.LHS))
+	default:
+		panic(vterrors.VT13002(sqlparser.String(e)))
+	}
+
+	return
+}
+
+func applyJoinCompare(ctx *plancontext.PlanningContext, expr sqlparser.Expr) func(e applyJoinColumn) bool {
+	return func(e applyJoinColumn) bool {
+		return ctx.SemTable.EqualsExprWithDeps(e.Original, expr)
+	}
+}
+
+func (aj *ApplyJoin) FindCol(ctx *plancontext.PlanningContext, expr sqlparser.Expr, _ bool) int {
+	return slices.IndexFunc(aj.JoinColumns.columns, applyJoinCompare(ctx, expr))
+}
+
+func (aj *ApplyJoin) AddColumn(
+	ctx *plancontext.PlanningContext,
+	reuse bool,
+	groupBy bool,
+	expr *sqlparser.AliasedExpr,
+) int {
+	if reuse {
+		offset := aj.FindCol(ctx, expr.Expr, false)
+		if offset != -1 {
+			return offset
 		}
-		a.Vars[bvName[i]] = offset
 	}
-	a.LHSColumns = append(a.LHSColumns, cols...)
+	col := aj.getJoinColumnFor(ctx, expr, expr.Expr, groupBy)
+	offset := len(aj.JoinColumns.columns)
+	aj.JoinColumns.add(col)
+	return offset
+}
 
-	rhs, err := a.RHS.AddPredicate(ctx, predicate)
-	if err != nil {
-		return err
+func (aj *ApplyJoin) planOffsets(ctx *plancontext.PlanningContext) Operator {
+	for _, col := range aj.JoinColumns.columns {
+		// Read the type description for applyJoinColumn to understand the following code
+		for _, lhsExpr := range col.LHSExprs {
+			offset := aj.LHS.AddColumn(ctx, true, col.GroupBy, aeWrap(lhsExpr.Expr))
+			if col.RHSExpr == nil {
+				// if we don't have an RHS expr, it means that this is a pure LHS expression
+				aj.addOffset(-offset - 1)
+			} else {
+				aj.Vars[lhsExpr.Name] = offset
+			}
+		}
+		if col.RHSExpr != nil {
+			offset := aj.RHS.AddColumn(ctx, true, col.GroupBy, aeWrap(col.RHSExpr))
+			aj.addOffset(offset + 1)
+		}
 	}
-	a.RHS = rhs
 
-	a.Predicate = ctx.SemTable.AndExpressions(expr, a.Predicate)
+	for _, col := range aj.JoinPredicates.columns {
+		for _, lhsExpr := range col.LHSExprs {
+			offset := aj.LHS.AddColumn(ctx, true, false, aeWrap(lhsExpr.Expr))
+			aj.Vars[lhsExpr.Name] = offset
+		}
+	}
+
+	for _, lhsExpr := range aj.ExtraLHSVars {
+		offset := aj.LHS.AddColumn(ctx, true, false, aeWrap(lhsExpr.Expr))
+		aj.Vars[lhsExpr.Name] = offset
+	}
+
 	return nil
 }
 
-func (a *ApplyJoin) AddColumn(ctx *plancontext.PlanningContext, expr sqlparser.Expr) (int, error) {
-	// first check if we already are passing through this expression
-	for i, existing := range a.ColumnsAST {
-		if ctx.SemTable.EqualsExpr(existing, expr) {
-			return i, nil
-		}
+func (aj *ApplyJoin) addOffset(offset int) {
+	aj.Columns = append(aj.Columns, offset)
+}
+
+func (aj *ApplyJoin) ShortDescription() string {
+	fn := func(cols *applyJoinColumns) string {
+		out := slice.Map(cols.columns, func(jc applyJoinColumn) string {
+			return jc.String()
+		})
+		return strings.Join(out, ", ")
 	}
 
-	lhs := TableID(a.LHS)
-	rhs := TableID(a.RHS)
-	both := lhs.Merge(rhs)
-	deps := ctx.SemTable.RecursiveDeps(expr)
+	firstPart := fmt.Sprintf("on %s columns: %s", fn(aj.JoinPredicates), fn(aj.JoinColumns))
+	if len(aj.ExtraLHSVars) == 0 {
+		return firstPart
+	}
+	extraCols := slice.Map(aj.ExtraLHSVars, func(s BindVarExpr) string { return s.String() })
 
-	// if we get here, it's a new expression we are dealing with.
-	// We need to decide if we can push it all on either side,
-	// or if we have to break the expression into left and right parts
-	switch {
-	case deps.IsSolvedBy(lhs):
-		offset, err := a.LHS.AddColumn(ctx, expr)
-		if err != nil {
-			return 0, err
-		}
-		a.Columns = append(a.Columns, -offset-1)
-	case deps.IsSolvedBy(both):
-		bvNames, lhsExprs, rhsExpr, err := BreakExpressionInLHSandRHS(ctx, expr, lhs)
-		if err != nil {
-			return 0, err
-		}
-		for i, lhsExpr := range lhsExprs {
-			offset, err := a.LHS.AddColumn(ctx, lhsExpr)
-			if err != nil {
-				return 0, err
+	return firstPart + " extra: " + strings.Join(extraCols, ", ")
+}
+
+func (aj *ApplyJoin) isColNameMovedFromL2R(bindVarName string) bool {
+	for _, jc := range aj.JoinColumns.columns {
+		for _, bve := range jc.LHSExprs {
+			if bve.Name == bindVarName {
+				return true
 			}
-			a.Vars[bvNames[i]] = offset
 		}
-		expr = rhsExpr
-		fallthrough // now we just pass the rest to the RHS of the join
-	case deps.IsSolvedBy(rhs):
-		offset, err := a.RHS.AddColumn(ctx, expr)
-		if err != nil {
-			return 0, err
+	}
+	for _, jp := range aj.JoinPredicates.columns {
+		for _, bve := range jp.LHSExprs {
+			if bve.Name == bindVarName {
+				return true
+			}
 		}
-		a.Columns = append(a.Columns, offset+1)
-	default:
-		return 0, vterrors.VT13002(sqlparser.String(expr))
+	}
+	for _, bve := range aj.ExtraLHSVars {
+		if bve.Name == bindVarName {
+			return true
+		}
+	}
+	return false
+}
+
+// findOrAddColNameBindVarName goes through the JoinColumns and looks for the given colName coming from the LHS of the join
+// and returns the argument name if found. if it's not found, a new applyJoinColumn passing this through will be added
+func (aj *ApplyJoin) findOrAddColNameBindVarName(ctx *plancontext.PlanningContext, col *sqlparser.ColName) string {
+	for i, thisCol := range aj.JoinColumns.columns {
+		idx := slices.IndexFunc(thisCol.LHSExprs, func(e BindVarExpr) bool {
+			return ctx.SemTable.EqualsExpr(e.Expr, col)
+		})
+
+		if idx != -1 {
+			if len(thisCol.LHSExprs) == 1 && thisCol.RHSExpr == nil {
+				// this is a ColName that was not being sent to the RHS, so it has no bindvar name.
+				// let's add one.
+				expr := thisCol.LHSExprs[idx]
+				bvname := ctx.GetReservedArgumentFor(expr.Expr)
+				expr.Name = bvname
+				aj.JoinColumns.columns[i].LHSExprs[idx] = expr
+			}
+			return thisCol.LHSExprs[idx].Name
+		}
+	}
+	for _, thisCol := range aj.JoinPredicates.columns {
+		idx := slices.IndexFunc(thisCol.LHSExprs, func(e BindVarExpr) bool {
+			return ctx.SemTable.EqualsExpr(e.Expr, col)
+		})
+		if idx != -1 {
+			return thisCol.LHSExprs[idx].Name
+		}
 	}
 
-	// the expression wasn't already there - let's add it
-	a.ColumnsAST = append(a.ColumnsAST, expr)
-	return len(a.Columns) - 1, nil
+	idx := slices.IndexFunc(aj.ExtraLHSVars, func(e BindVarExpr) bool {
+		return ctx.SemTable.EqualsExpr(e.Expr, col)
+	})
+	if idx != -1 {
+		return aj.ExtraLHSVars[idx].Name
+	}
+
+	// we didn't find it, so we need to add it
+	bvName := ctx.GetReservedArgumentFor(col)
+	aj.ExtraLHSVars = append(aj.ExtraLHSVars, BindVarExpr{
+		Name: bvName,
+		Expr: col,
+	})
+	return bvName
+}
+
+func (a *ApplyJoin) LHSColumnsNeeded(ctx *plancontext.PlanningContext) (needed sqlparser.Exprs) {
+	f := func(from BindVarExpr) sqlparser.Expr {
+		return from.Expr
+	}
+	for _, jc := range a.JoinColumns.columns {
+		needed = append(needed, slice.Map(jc.LHSExprs, f)...)
+	}
+	for _, jc := range a.JoinPredicates.columns {
+		needed = append(needed, slice.Map(jc.LHSExprs, f)...)
+	}
+	needed = append(needed, slice.Map(a.ExtraLHSVars, f)...)
+	return ctx.SemTable.Uniquify(needed)
+}
+
+func (jc applyJoinColumn) String() string {
+	rhs := sqlparser.String(jc.RHSExpr)
+	lhs := slice.Map(jc.LHSExprs, func(e BindVarExpr) string {
+		return sqlparser.String(e.Expr)
+	})
+	return fmt.Sprintf("[%s | %s | %s]", strings.Join(lhs, ", "), rhs, sqlparser.String(jc.Original))
+}
+
+func (jc applyJoinColumn) IsPureLeft() bool {
+	return jc.RHSExpr == nil
+}
+
+func (jc applyJoinColumn) IsPureRight() bool {
+	return len(jc.LHSExprs) == 0
+}
+
+func (jc applyJoinColumn) IsMixedLeftAndRight() bool {
+	return len(jc.LHSExprs) > 0 && jc.RHSExpr != nil
+}
+
+func (bve BindVarExpr) String() string {
+	if bve.Name == "" {
+		return sqlparser.String(bve.Expr)
+	}
+
+	return fmt.Sprintf(":%s|`%s`", bve.Name, sqlparser.String(bve.Expr))
 }

@@ -18,27 +18,23 @@ package evalengine
 
 import (
 	"fmt"
+	"slices"
 	"strings"
+	"sync"
 
 	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/sqltypes"
+	querypb "vitess.io/vitess/go/vt/proto/query"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vterrors"
-)
-
-type (
-	TranslationLookup interface {
-		ColumnLookup(col *sqlparser.ColName) (int, error)
-		CollationForExpr(expr sqlparser.Expr) collations.ID
-		DefaultCollation() collations.ID
-	}
 )
 
 var ErrTranslateExprNotSupported = "expr cannot be translated, not supported"
 var ErrEvaluatedExprNotSupported = "expr cannot be evaluated, not supported"
 
-func (ast *astCompiler) translateComparisonExpr(op sqlparser.ComparisonExprOperator, left, right sqlparser.Expr) (Expr, error) {
+func (ast *astCompiler) translateComparisonExpr(op sqlparser.ComparisonExprOperator, left, right sqlparser.Expr) (IR, error) {
 	l, err := ast.translateExpr(left)
 	if err != nil {
 		return nil, err
@@ -50,7 +46,7 @@ func (ast *astCompiler) translateComparisonExpr(op sqlparser.ComparisonExprOpera
 	return ast.translateComparisonExpr2(op, l, r)
 }
 
-func (ast *astCompiler) translateComparisonExpr2(op sqlparser.ComparisonExprOperator, left, right Expr) (Expr, error) {
+func (ast *astCompiler) translateComparisonExpr2(op sqlparser.ComparisonExprOperator, left, right IR) (IR, error) {
 	binaryExpr := BinaryExpr{
 		Left:  left,
 		Right: right,
@@ -60,7 +56,6 @@ func (ast *astCompiler) translateComparisonExpr2(op sqlparser.ComparisonExprOper
 		return &InExpr{
 			BinaryExpr: binaryExpr,
 			Negate:     op == sqlparser.NotInOp,
-			Hashed:     nil,
 		}, nil
 	}
 
@@ -83,23 +78,51 @@ func (ast *astCompiler) translateComparisonExpr2(op sqlparser.ComparisonExprOper
 		return &LikeExpr{BinaryExpr: binaryExpr}, nil
 	case sqlparser.NotLikeOp:
 		return &LikeExpr{BinaryExpr: binaryExpr, Negate: true}, nil
+	case sqlparser.RegexpOp, sqlparser.NotRegexpOp:
+		return &builtinRegexpLike{
+			CallExpr: CallExpr{
+				Arguments: []IR{left, right},
+				Method:    "REGEXP_LIKE",
+			},
+			Negate: op == sqlparser.NotRegexpOp,
+		}, nil
 	default:
 		return nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, op.ToString())
 	}
 }
 
-func (ast *astCompiler) translateLogicalNot(inner Expr) Expr {
-	return &NotExpr{UnaryExpr{inner}}
-}
-
-func (ast *astCompiler) translateLogicalExpr(opname string, left, right sqlparser.Expr) (Expr, error) {
-	l, err := ast.translateExpr(left)
+func (ast *astCompiler) translateLogicalNot(node *sqlparser.NotExpr) (IR, error) {
+	inner, err := ast.translateExpr(node.Expr)
 	if err != nil {
 		return nil, err
 	}
+	return &NotExpr{UnaryExpr{inner}}, nil
+}
 
-	if opname == "NOT" {
-		return ast.translateLogicalNot(l), nil
+func (ast *astCompiler) translateLogicalExpr(node sqlparser.Expr) (IR, error) {
+	var left, right sqlparser.Expr
+
+	var logic opLogical
+	switch n := node.(type) {
+	case *sqlparser.AndExpr:
+		left = n.Left
+		right = n.Right
+		logic = opLogicalAnd{}
+	case *sqlparser.OrExpr:
+		left = n.Left
+		right = n.Right
+		logic = opLogicalOr{}
+	case *sqlparser.XorExpr:
+		left = n.Left
+		right = n.Right
+		logic = opLogicalXor{}
+	default:
+		panic("unexpected logical operator")
+	}
+
+	l, err := ast.translateExpr(left)
+	if err != nil {
+		return nil, err
 	}
 
 	r, err := ast.translateExpr(right)
@@ -107,29 +130,41 @@ func (ast *astCompiler) translateLogicalExpr(opname string, left, right sqlparse
 		return nil, err
 	}
 
-	var logic func(l, r boolean) boolean
-	switch opname {
-	case "AND":
-		logic = func(l, r boolean) boolean { return l.and(r) }
-	case "OR":
-		logic = func(l, r boolean) boolean { return l.or(r) }
-	case "XOR":
-		logic = func(l, r boolean) boolean { return l.xor(r) }
-	default:
-		panic("unexpected logical operator")
-	}
-
 	return &LogicalExpr{
 		BinaryExpr: BinaryExpr{
 			Left:  l,
 			Right: r,
 		},
-		op:     logic,
-		opname: opname,
+		op: logic,
 	}, nil
 }
 
-func (ast *astCompiler) translateIsExpr(left sqlparser.Expr, op sqlparser.IsExprOperator) (Expr, error) {
+func (ast *astCompiler) translateIntervalExpr(needle sqlparser.Expr, haystack []sqlparser.Expr) (IR, error) {
+	exprs := make([]IR, 0, len(haystack)+1)
+
+	expr, err := ast.translateExpr(needle)
+	if err != nil {
+		return nil, err
+	}
+
+	exprs = append(exprs, expr)
+	for _, e := range haystack {
+		expr, err := ast.translateExpr(e)
+		if err != nil {
+			return nil, err
+		}
+		exprs = append(exprs, expr)
+	}
+
+	return &IntervalExpr{
+		CallExpr{
+			Arguments: exprs,
+			Method:    "INTERVAL",
+		},
+	}, nil
+}
+
+func (ast *astCompiler) translateIsExpr(left sqlparser.Expr, op sqlparser.IsExprOperator) (IR, error) {
 	expr, err := ast.translateExpr(left)
 	if err != nil {
 		return nil, err
@@ -158,35 +193,59 @@ func (ast *astCompiler) translateIsExpr(left sqlparser.Expr, op sqlparser.IsExpr
 	}, nil
 }
 
-func (ast *astCompiler) getCollation(expr sqlparser.Expr) collations.TypedCollation {
-	collation := collations.TypedCollation{
-		Coercibility: collations.CoerceCoercible,
-		Repertoire:   collations.RepertoireUnicode,
+func (ast *astCompiler) translateBindVar(arg *sqlparser.Argument) (IR, error) {
+	bvar := NewBindVar(arg.Name, NewType(arg.Type, ast.cfg.Collation))
+
+	if !bvar.typed() {
+		bvar.dynamicTypeOffset = len(ast.untyped)
+		ast.untyped = append(ast.untyped, bvar)
 	}
-	if ast.lookup != nil {
-		collation.Collation = ast.lookup.CollationForExpr(expr)
-		if collation.Collation == collations.Unknown {
-			collation.Collation = ast.lookup.DefaultCollation()
-		}
-	} else {
-		collation.Collation = collations.Default()
-	}
-	return collation
+	return bvar, nil
 }
 
-func (ast *astCompiler) translateColName(colname *sqlparser.ColName) (Expr, error) {
-	if ast.lookup == nil {
-		return nil, vterrors.Wrap(translateExprNotSupported(colname), "cannot lookup column")
+func (ast *astCompiler) translateColOffset(col *sqlparser.Offset) (IR, error) {
+	var typ Type
+	if ast.cfg.ResolveType != nil {
+		typ, _ = ast.cfg.ResolveType(col.Original)
 	}
-	idx, err := ast.lookup.ColumnLookup(colname)
+	if typ.Valid() && typ.collation == collations.Unknown {
+		typ.collation = ast.cfg.Collation
+	}
+
+	column := NewColumn(col.V, typ, col.Original)
+	if !column.typed() {
+		column.dynamicTypeOffset = len(ast.untyped)
+		ast.untyped = append(ast.untyped, column)
+	}
+	return column, nil
+}
+
+func (ast *astCompiler) translateColName(colname *sqlparser.ColName) (IR, error) {
+	if ast.cfg.ResolveColumn == nil {
+		return nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "cannot lookup column '%s' (column access not supported here)", sqlparser.String(colname))
+	}
+	idx, err := ast.cfg.ResolveColumn(colname)
 	if err != nil {
 		return nil, err
 	}
-	collation := ast.getCollation(colname)
-	return NewColumn(idx, collation), nil
+	var typ Type
+	if ast.cfg.ResolveType != nil {
+		typ, _ = ast.cfg.ResolveType(colname)
+	}
+	if typ.Valid() && typ.collation == collations.Unknown {
+		typ.collation = ast.cfg.Collation
+	}
+
+	column := NewColumn(idx, typ, colname)
+
+	if !column.typed() {
+		column.dynamicTypeOffset = len(ast.untyped)
+		ast.untyped = append(ast.untyped, column)
+	}
+	return column, nil
 }
 
-func (ast *astCompiler) translateLiteral(lit *sqlparser.Literal) (*Literal, error) {
+func translateLiteral(lit *sqlparser.Literal, collation collations.ID) (*Literal, error) {
 	switch lit.Type {
 	case sqlparser.IntVal:
 		return NewLiteralIntegralFromBytes(lit.Bytes())
@@ -195,12 +254,13 @@ func (ast *astCompiler) translateLiteral(lit *sqlparser.Literal) (*Literal, erro
 	case sqlparser.DecimalVal:
 		return NewLiteralDecimalFromBytes(lit.Bytes())
 	case sqlparser.StrVal:
-		collation := ast.getCollation(lit)
-		return NewLiteralString(lit.Bytes(), collation), nil
+		return NewLiteralString(lit.Bytes(), typedCoercionCollation(sqltypes.VarChar, collation)), nil
 	case sqlparser.HexNum:
 		return NewLiteralBinaryFromHexNum(lit.Bytes())
 	case sqlparser.HexVal:
 		return NewLiteralBinaryFromHex(lit.Bytes())
+	case sqlparser.BitNum:
+		return NewLiteralBinaryFromBit(lit.Bytes())
 	case sqlparser.DateVal:
 		return NewLiteralDateFromBytes(lit.Bytes())
 	case sqlparser.TimeVal:
@@ -212,7 +272,7 @@ func (ast *astCompiler) translateLiteral(lit *sqlparser.Literal) (*Literal, erro
 	}
 }
 
-func (ast *astCompiler) translateBinaryExpr(binary *sqlparser.BinaryExpr) (Expr, error) {
+func (ast *astCompiler) translateBinaryExpr(binary *sqlparser.BinaryExpr) (IR, error) {
 	left, err := ast.translateExpr(binary.Left)
 	if err != nil {
 		return nil, err
@@ -235,6 +295,10 @@ func (ast *astCompiler) translateBinaryExpr(binary *sqlparser.BinaryExpr) (Expr,
 		return &ArithmeticExpr{BinaryExpr: binaryExpr, Op: &opArithMul{}}, nil
 	case sqlparser.DivOp:
 		return &ArithmeticExpr{BinaryExpr: binaryExpr, Op: &opArithDiv{}}, nil
+	case sqlparser.IntDivOp:
+		return &ArithmeticExpr{BinaryExpr: binaryExpr, Op: &opArithIntDiv{}}, nil
+	case sqlparser.ModOp:
+		return &ArithmeticExpr{BinaryExpr: binaryExpr, Op: &opArithMod{}}, nil
 	case sqlparser.BitAndOp:
 		return &BitwiseExpr{BinaryExpr: binaryExpr, Op: &opBitAnd{}}, nil
 	case sqlparser.BitOrOp:
@@ -254,7 +318,7 @@ func (ast *astCompiler) translateBinaryExpr(binary *sqlparser.BinaryExpr) (Expr,
 	}
 }
 
-func (ast *astCompiler) translateTuple(tuple sqlparser.ValTuple) (Expr, error) {
+func (ast *astCompiler) translateTuple(tuple sqlparser.ValTuple) (IR, error) {
 	var exprs TupleExpr
 	for _, expr := range tuple {
 		convertedExpr, err := ast.translateExpr(expr)
@@ -266,26 +330,27 @@ func (ast *astCompiler) translateTuple(tuple sqlparser.ValTuple) (Expr, error) {
 	return exprs, nil
 }
 
-func (ast *astCompiler) translateCollateExpr(collate *sqlparser.CollateExpr) (Expr, error) {
+func (ast *astCompiler) translateCollateExpr(collate *sqlparser.CollateExpr) (IR, error) {
 	expr, err := ast.translateExpr(collate.Expr)
 	if err != nil {
 		return nil, err
 	}
-	coll := collations.Local().LookupByName(collate.Collation)
-	if coll == nil {
+	coll := ast.cfg.Environment.CollationEnv().LookupByName(collate.Collation)
+	if coll == collations.Unknown {
 		return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "Unknown collation: '%s'", collate.Collation)
 	}
 	return &CollateExpr{
 		UnaryExpr: UnaryExpr{expr},
 		TypedCollation: collations.TypedCollation{
-			Collation:    coll.ID(),
+			Collation:    coll,
 			Coercibility: collations.CoerceExplicit,
 			Repertoire:   collations.RepertoireUnicode,
 		},
+		CollationEnv: ast.cfg.Environment.CollationEnv(),
 	}, nil
 }
 
-func (ast *astCompiler) translateIntroducerExpr(introduced *sqlparser.IntroducerExpr) (Expr, error) {
+func (ast *astCompiler) translateIntroducerExpr(introduced *sqlparser.IntroducerExpr) (IR, error) {
 	expr, err := ast.translateExpr(introduced.Expr)
 	if err != nil {
 		return nil, err
@@ -295,11 +360,11 @@ func (ast *astCompiler) translateIntroducerExpr(introduced *sqlparser.Introducer
 	if strings.ToLower(introduced.CharacterSet) == "_binary" {
 		collation = collations.CollationBinaryID
 	} else {
-		defaultCollation := collations.Local().DefaultCollationForCharset(introduced.CharacterSet[1:])
-		if defaultCollation == nil {
+		defaultCollation := ast.cfg.Environment.CollationEnv().DefaultCollationForCharset(introduced.CharacterSet[1:])
+		if defaultCollation == collations.Unknown {
 			panic(fmt.Sprintf("unknown character set: %s", introduced.CharacterSet))
 		}
-		collation = defaultCollation.ID()
+		collation = defaultCollation
 	}
 
 	switch lit := expr.(type) {
@@ -313,37 +378,38 @@ func (ast *astCompiler) translateIntroducerExpr(introduced *sqlparser.Introducer
 				return nil, err
 			}
 		}
+		return expr, nil
 	case *BindVariable:
-		if lit.tuple {
+		if lit.Type == sqltypes.Tuple {
 			panic("parser allowed introducer before tuple")
 		}
 
-		switch collation {
-		case collations.CollationBinaryID:
-			lit.coerce = sqltypes.VarBinary
-			lit.col = collationBinary
-		default:
-			lit.coerce = sqltypes.VarChar
-			lit.col.Collation = collation
-		}
+		return &IntroducerExpr{
+			UnaryExpr: UnaryExpr{expr},
+			TypedCollation: collations.TypedCollation{
+				Collation:    collation,
+				Coercibility: collations.CoerceExplicit,
+				Repertoire:   collations.RepertoireUnicode,
+			},
+			CollationEnv: ast.cfg.Environment.CollationEnv(),
+		}, nil
 	default:
 		panic("character set introducers are only supported for literals and arguments")
 	}
-	return expr, nil
 }
 
 func (ast *astCompiler) translateIntegral(lit *sqlparser.Literal) (int, bool, error) {
 	if lit == nil {
 		return 0, false, nil
 	}
-	literal, err := ast.translateLiteral(lit)
+	literal, err := translateLiteral(lit, ast.cfg.Collation)
 	if err != nil {
 		return 0, false, err
 	}
-	return int(evalToNumeric(literal.inner).toUint64().u), true, nil
+	return int(evalToInt64(literal.inner).toUint64().u), true, nil
 }
 
-func (ast *astCompiler) translateUnaryExpr(unary *sqlparser.UnaryExpr) (Expr, error) {
+func (ast *astCompiler) translateUnaryExpr(unary *sqlparser.UnaryExpr) (IR, error) {
 	expr, err := ast.translateExpr(unary.Expr)
 	if err != nil {
 		return nil, err
@@ -353,17 +419,17 @@ func (ast *astCompiler) translateUnaryExpr(unary *sqlparser.UnaryExpr) (Expr, er
 	case sqlparser.UMinusOp:
 		return &NegateExpr{UnaryExpr: UnaryExpr{expr}}, nil
 	case sqlparser.BangOp:
-		return ast.translateLogicalNot(expr), nil
+		return &NotExpr{UnaryExpr{expr}}, nil
 	case sqlparser.TildaOp:
 		return &BitwiseNotExpr{UnaryExpr: UnaryExpr{expr}}, nil
 	case sqlparser.NStringOp:
-		return &ConvertExpr{UnaryExpr: UnaryExpr{expr}, Type: "NCHAR", Collation: collations.CollationUtf8ID}, nil
+		return &ConvertExpr{UnaryExpr: UnaryExpr{expr}, Type: "NCHAR", Collation: collations.CollationUtf8mb3ID, CollationEnv: ast.cfg.Environment.CollationEnv()}, nil
 	default:
 		return nil, translateExprNotSupported(unary)
 	}
 }
 
-func (ast *astCompiler) translateCaseExpr(node *sqlparser.CaseExpr) (Expr, error) {
+func (ast *astCompiler) translateCaseExpr(node *sqlparser.CaseExpr) (IR, error) {
 	var err error
 	var result CaseExpr
 
@@ -374,7 +440,7 @@ func (ast *astCompiler) translateCaseExpr(node *sqlparser.CaseExpr) (Expr, error
 		}
 	}
 
-	var cmpbase Expr
+	var cmpbase IR
 	if node.Expr != nil {
 		cmpbase, err = ast.translateExpr(node.Expr)
 		if err != nil {
@@ -383,7 +449,7 @@ func (ast *astCompiler) translateCaseExpr(node *sqlparser.CaseExpr) (Expr, error
 	}
 
 	for _, when := range node.Whens {
-		var cond, val Expr
+		var cond, val IR
 
 		cond, err = ast.translateExpr(when.Cond)
 		if err != nil {
@@ -411,7 +477,7 @@ func (ast *astCompiler) translateCaseExpr(node *sqlparser.CaseExpr) (Expr, error
 	return &result, nil
 }
 
-func (ast *astCompiler) translateBetweenExpr(node *sqlparser.BetweenExpr) (Expr, error) {
+func (ast *astCompiler) translateBetweenExpr(node *sqlparser.BetweenExpr) (IR, error) {
 	// x BETWEEN a AND b => x >= a AND x <= b
 	from := &sqlparser.ComparisonExpr{
 		Operator: sqlparser.GreaterEqualOp,
@@ -438,35 +504,30 @@ func translateExprNotSupported(e sqlparser.Expr) error {
 	return vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "%s: %s", ErrTranslateExprNotSupported, sqlparser.String(e))
 }
 
-func (ast *astCompiler) translateExpr(e sqlparser.Expr) (Expr, error) {
+func (ast *astCompiler) translateExpr(e sqlparser.Expr) (IR, error) {
 	switch node := e.(type) {
 	case sqlparser.BoolVal:
 		return NewLiteralBool(bool(node)), nil
 	case *sqlparser.ColName:
-		ast.entities.columns++
 		return ast.translateColName(node)
 	case *sqlparser.Offset:
-		ast.entities.columns++
-		return NewColumn(node.V, ast.getCollation(node)), nil
+		return ast.translateColOffset(node)
 	case *sqlparser.ComparisonExpr:
 		return ast.translateComparisonExpr(node.Operator, node.Left, node.Right)
-	case sqlparser.Argument:
-		ast.entities.bvars++
-		collation := ast.getCollation(e)
-		return NewBindVar(string(node), collation), nil
+	case *sqlparser.Argument:
+		return ast.translateBindVar(node)
 	case sqlparser.ListArg:
-		ast.entities.bvars++
-		return NewBindVarTuple(string(node)), nil
+		return NewBindVarTuple(string(node), ast.cfg.Collation), nil
 	case *sqlparser.Literal:
-		return ast.translateLiteral(node)
+		return translateLiteral(node, ast.cfg.Collation)
 	case *sqlparser.AndExpr:
-		return ast.translateLogicalExpr("AND", node.Left, node.Right)
+		return ast.translateLogicalExpr(node)
 	case *sqlparser.OrExpr:
-		return ast.translateLogicalExpr("OR", node.Left, node.Right)
+		return ast.translateLogicalExpr(node)
 	case *sqlparser.XorExpr:
-		return ast.translateLogicalExpr("XOR", node.Left, node.Right)
+		return ast.translateLogicalExpr(node)
 	case *sqlparser.NotExpr:
-		return ast.translateLogicalExpr("NOT", node.Expr, nil)
+		return ast.translateLogicalNot(node)
 	case *sqlparser.BinaryExpr:
 		return ast.translateBinaryExpr(node)
 	case sqlparser.ValTuple:
@@ -477,6 +538,8 @@ func (ast *astCompiler) translateExpr(e sqlparser.Expr) (Expr, error) {
 		return ast.translateCollateExpr(node)
 	case *sqlparser.IntroducerExpr:
 		return ast.translateIntroducerExpr(node)
+	case *sqlparser.IntervalFuncExpr:
+		return ast.translateIntervalExpr(node.Expr, node.Exprs)
 	case *sqlparser.IsExpr:
 		return ast.translateIsExpr(node.Left, node.Right)
 	case sqlparser.Callable:
@@ -495,15 +558,26 @@ func (ast *astCompiler) translateExpr(e sqlparser.Expr) (Expr, error) {
 }
 
 type astCompiler struct {
-	lookup   TranslationLookup
-	entities struct {
-		columns int
-		bvars   int
-	}
+	cfg     *Config
+	untyped []typedIR
 }
 
-func TranslateEx(e sqlparser.Expr, lookup TranslationLookup, simplify bool) (Expr, error) {
-	ast := astCompiler{lookup: lookup}
+type ColumnResolver func(name *sqlparser.ColName) (int, error)
+type TypeResolver func(expr sqlparser.Expr) (Type, bool)
+
+type Config struct {
+	ResolveColumn ColumnResolver
+	ResolveType   TypeResolver
+
+	Collation         collations.ID
+	NoConstantFolding bool
+	NoCompilation     bool
+	SQLMode           SQLMode
+	Environment       *vtenv.Environment
+}
+
+func Translate(e sqlparser.Expr, cfg *Config) (Expr, error) {
+	ast := astCompiler{cfg: cfg}
 
 	expr, err := ast.translateExpr(e)
 	if err != nil {
@@ -514,19 +588,160 @@ func TranslateEx(e sqlparser.Expr, lookup TranslationLookup, simplify bool) (Exp
 		return nil, err
 	}
 
-	if simplify {
-		var staticEnv ExpressionEnv
-		if lookup != nil {
-			staticEnv.DefaultCollation = lookup.DefaultCollation()
-		} else {
-			staticEnv.DefaultCollation = collations.Default()
+	if !cfg.NoConstantFolding {
+		staticEnv := EmptyExpressionEnv(cfg.Environment)
+		expr, err = simplifyExpr(staticEnv, expr)
+		if err != nil {
+			return nil, err
 		}
-		expr, err = simplifyExpr(&staticEnv, expr)
 	}
-	return expr, err
+
+	if expr, ok := expr.(Expr); ok {
+		return expr, nil
+	}
+
+	if len(ast.untyped) == 0 && !cfg.NoCompilation {
+		comp := compiler{collation: cfg.Collation, env: cfg.Environment, sqlmode: cfg.SQLMode}
+		return comp.compile(expr)
+	}
+
+	return &UntypedExpr{
+		env:       cfg.Environment,
+		ir:        expr,
+		collation: cfg.Collation,
+		needTypes: ast.untyped,
+	}, nil
 }
 
-// Translate translates between AST expressions and executable expressions
-func Translate(e sqlparser.Expr, lookup TranslationLookup) (Expr, error) {
-	return TranslateEx(e, lookup, true)
+// typedExpr is a lazily compiled expression from an UntypedExpr. This expression
+// can only be compiled when it's evaluated with a fixed set of user-supplied types.
+// These static types are stored in the types slice so the next time the expression
+// is evaluated with the same set of types, we can match this typedExpr and not have
+// to compile it again.
+type typedExpr struct {
+	once     sync.Once
+	types    []ctype
+	compiled *CompiledExpr
+	err      error
+}
+
+func (typed *typedExpr) compile(env *vtenv.Environment, expr IR, collation collations.ID, sqlmode SQLMode) (*CompiledExpr, error) {
+	typed.once.Do(func() {
+		comp := compiler{
+			env:          env,
+			collation:    collation,
+			dynamicTypes: typed.types,
+			sqlmode:      sqlmode,
+		}
+		typed.compiled, typed.err = comp.compile(expr)
+	})
+	return typed.compiled, typed.err
+}
+
+type typedIR interface {
+	IR
+	typeof(env *ExpressionEnv) (ctype, error)
+}
+
+// UntypedExpr is a translated expression that cannot be compiled ahead of time because it
+// contains dynamic types.
+type UntypedExpr struct {
+	env *vtenv.Environment
+	// ir is the translated IR for the expression
+	ir IR
+	// collation is the default collation for the translated expression
+	collation collations.ID
+	// needTypes are the IR nodes in ir that could not be typed ahead of time: these must
+	// necessarily be either Column or BindVariable nodes, as all other nodes can always
+	// be statically typed. The dynamicTypeOffset field on each node is the offset of
+	// the node in this slice.
+	needTypes []typedIR
+
+	mu sync.Mutex
+	// typed contains the lazily compiled versions of ir for every type set
+	typed []*typedExpr
+}
+
+var _ Expr = (*UntypedExpr)(nil)
+
+func (u *UntypedExpr) IR() IR {
+	return u.ir
+}
+
+func (u *UntypedExpr) eval(env *ExpressionEnv) (eval, error) {
+	return u.ir.eval(env)
+}
+
+func (u *UntypedExpr) loadTypedExpression(env *ExpressionEnv) (*typedExpr, error) {
+	dynamicTypes := make([]ctype, 0, len(u.needTypes))
+	for _, expr := range u.needTypes {
+		typ, err := expr.typeof(env)
+		if err != nil {
+			return nil, err
+		}
+		dynamicTypes = append(dynamicTypes, typ)
+	}
+
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	for _, typed := range u.typed {
+		if slices.Equal(typed.types, dynamicTypes) {
+			return typed, nil
+		}
+	}
+	typed := &typedExpr{types: dynamicTypes}
+	u.typed = append(u.typed, typed)
+	return typed, nil
+}
+
+func (u *UntypedExpr) Compile(env *ExpressionEnv) (*CompiledExpr, error) {
+	typed, err := u.loadTypedExpression(env)
+	if err != nil {
+		return nil, err
+	}
+	return typed.compile(u.env, u.ir, u.collation, env.sqlmode)
+}
+
+func (u *UntypedExpr) typeof(env *ExpressionEnv) (ctype, error) {
+	compiled, err := u.Compile(env)
+	if err != nil {
+		return ctype{}, err
+	}
+	return compiled.typeof(env)
+}
+
+func (u *UntypedExpr) IsExpr() {}
+
+func (u *UntypedExpr) Format(buf *sqlparser.TrackedBuffer) {
+	u.ir.format(buf)
+}
+
+func (u *UntypedExpr) FormatFast(buf *sqlparser.TrackedBuffer) {
+	u.ir.format(buf)
+}
+
+type FieldResolver []*querypb.Field
+
+func (fields FieldResolver) Column(col *sqlparser.ColName) (int, error) {
+	name := col.CompliantName()
+	for i, f := range fields {
+		if f.Name == name {
+			return i, nil
+		}
+	}
+	return 0, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unknown column: %q", sqlparser.String(col))
+}
+
+func (fields FieldResolver) Type(expr sqlparser.Expr) (Type, bool) {
+	switch expr := expr.(type) {
+	case *sqlparser.ColName:
+		name := expr.CompliantName()
+		for _, f := range fields {
+			if f.Name == name {
+				return NewType(f.Type, collations.ID(f.Charset)), true
+			}
+		}
+	}
+	return Type{}, false
 }

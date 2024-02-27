@@ -27,11 +27,6 @@ import (
 )
 
 func TestSelectNoConnectionReservationOnSettings(t *testing.T) {
-	framework.Server.Config().EnableSettingsPool = true
-	defer func() {
-		framework.Server.Config().EnableSettingsPool = false
-	}()
-
 	client := framework.NewClient()
 	defer client.Release()
 
@@ -57,11 +52,6 @@ func TestSelectNoConnectionReservationOnSettings(t *testing.T) {
 }
 
 func TestSetttingsReuseConnWithSettings(t *testing.T) {
-	framework.Server.Config().EnableSettingsPool = true
-	defer func() {
-		framework.Server.Config().EnableSettingsPool = false
-	}()
-
 	resetTxConnPool(t)
 
 	client := framework.NewClient()
@@ -113,28 +103,15 @@ func TestSetttingsReuseConnWithSettings(t *testing.T) {
 	require.NoError(t, err)
 
 	// We iterate in a loop and try to get a connection with the same settings as before
-	// but only 1 at a time. So we expect the two connections to be reused, and we should be seeing both of them.
-	reusedConnection1 := false
-	reusedConnection2 := false
-	for i := 0; i < 100; i++ {
+	// but only 1 at a time. We're only going to see connection 2 here because the pool is LIFO
+	for i := 0; i < 8; i++ {
 		res, err = client.ReserveBeginExecute(connectionIDQuery, []string{setting}, nil, nil)
 		require.NoError(t, err)
-		if connectionIDRes.Equal(res) {
-			reusedConnection1 = true
-		} else if connectionIDRes2.Equal(res) {
-			reusedConnection2 = true
-		} else {
-			t.Fatalf("The connection should be either of the already created connections")
-		}
+		require.Truef(t, connectionIDRes2.Equal(res), "connection pool was not LIFO")
 
 		err = client.Rollback()
 		require.NoError(t, err)
-		if reusedConnection2 && reusedConnection1 {
-			break
-		}
 	}
-	require.True(t, reusedConnection1)
-	require.True(t, reusedConnection2)
 }
 
 // resetTxConnPool resets the settings pool by fetching all the connections from the pool with no settings.
@@ -155,11 +132,6 @@ func resetTxConnPool(t *testing.T) {
 }
 
 func TestDDLNoConnectionReservationOnSettings(t *testing.T) {
-	framework.Server.Config().EnableSettingsPool = true
-	defer func() {
-		framework.Server.Config().EnableSettingsPool = false
-	}()
-
 	client := framework.NewClient()
 	defer client.Release()
 
@@ -179,11 +151,6 @@ func TestDDLNoConnectionReservationOnSettings(t *testing.T) {
 }
 
 func TestDMLNoConnectionReservationOnSettings(t *testing.T) {
-	framework.Server.Config().EnableSettingsPool = true
-	defer func() {
-		framework.Server.Config().EnableSettingsPool = false
-	}()
-
 	client := framework.NewClient()
 	defer client.Release()
 
@@ -217,11 +184,6 @@ func TestDMLNoConnectionReservationOnSettings(t *testing.T) {
 }
 
 func TestSelectNoConnectionReservationOnSettingsWithTx(t *testing.T) {
-	framework.Server.Config().EnableSettingsPool = true
-	defer func() {
-		framework.Server.Config().EnableSettingsPool = false
-	}()
-
 	client := framework.NewClient()
 
 	query := "select @@sql_mode"
@@ -243,11 +205,6 @@ func TestSelectNoConnectionReservationOnSettingsWithTx(t *testing.T) {
 }
 
 func TestDDLNoConnectionReservationOnSettingsWithTx(t *testing.T) {
-	framework.Server.Config().EnableSettingsPool = true
-	defer func() {
-		framework.Server.Config().EnableSettingsPool = false
-	}()
-
 	client := framework.NewClient()
 	defer client.Release()
 
@@ -261,11 +218,6 @@ func TestDDLNoConnectionReservationOnSettingsWithTx(t *testing.T) {
 }
 
 func TestDMLNoConnectionReservationOnSettingsWithTx(t *testing.T) {
-	framework.Server.Config().EnableSettingsPool = true
-	defer func() {
-		framework.Server.Config().EnableSettingsPool = false
-	}()
-
 	client := framework.NewClient()
 
 	_, err := client.Execute("create table temp(c_date datetime)", nil)
@@ -294,11 +246,6 @@ func TestDMLNoConnectionReservationOnSettingsWithTx(t *testing.T) {
 }
 
 func TestSetQueryOnReserveApis(t *testing.T) {
-	framework.Server.Config().EnableSettingsPool = true
-	defer func() {
-		framework.Server.Config().EnableSettingsPool = false
-	}()
-
 	client := framework.NewClient()
 	defer client.Release()
 
@@ -314,11 +261,6 @@ func TestSetQueryOnReserveApis(t *testing.T) {
 }
 
 func TestGetLockQueryOnReserveExecute(t *testing.T) {
-	framework.Server.Config().EnableSettingsPool = true
-	defer func() {
-		framework.Server.Config().EnableSettingsPool = false
-	}()
-
 	client := framework.NewClient()
 	defer client.Release()
 
@@ -340,11 +282,6 @@ func TestGetLockQueryOnReserveExecute(t *testing.T) {
 }
 
 func TestTempTableOnReserveExecute(t *testing.T) {
-	framework.Server.Config().EnableSettingsPool = true
-	defer func() {
-		framework.Server.Config().EnableSettingsPool = false
-	}()
-
 	client := framework.NewClient()
 	defer client.Release()
 	defer client.Execute("drop table if exists temp", nil)
@@ -391,11 +328,6 @@ func TestTempTableOnReserveExecute(t *testing.T) {
 }
 
 func TestInfiniteSessions(t *testing.T) {
-	framework.Server.Config().EnableSettingsPool = true
-	defer func() {
-		framework.Server.Config().EnableSettingsPool = false
-	}()
-
 	client := framework.NewClient()
 	qr, err := client.Execute("select @@max_connections", nil)
 	require.NoError(t, err)
@@ -423,6 +355,7 @@ func TestInfiniteSessions(t *testing.T) {
 }
 
 func TestSetQueriesMultipleWays(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
 	client := framework.NewClient()
 	defer client.Release()
 	_, err := client.ReserveExecute("select 1", []string{"set sql_safe_updates = 1"}, nil)
@@ -432,10 +365,6 @@ func TestSetQueriesMultipleWays(t *testing.T) {
 	require.NoError(t, err)
 
 	framework.Server.Config().EnableSettingsPool = true
-	defer func() {
-		framework.Server.Config().EnableSettingsPool = false
-	}()
-
 	client2 := framework.NewClient()
 	_, err = client2.ReserveExecute("select 1", []string{"set sql_safe_updates = 1"}, nil)
 	require.NoError(t, err)
